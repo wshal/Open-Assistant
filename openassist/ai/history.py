@@ -1,0 +1,225 @@
+"""Response history with encrypted persistence and navigation."""
+
+import json
+import time
+from pathlib import Path
+from typing import List, Optional
+from dataclasses import dataclass, field, asdict
+from utils.crypto import SecureStorage
+from utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
+
+@dataclass
+class HistoryEntry:
+    query: str
+    response: str
+    provider: str
+    mode: str
+    timestamp: float = field(default_factory=time.time)
+    latency: float = 0.0
+
+
+class ResponseHistory:
+    def __init__(
+        self,
+        max_entries: int = 500,
+        max_sessions: int = 15,
+        history_dir: str = "data/history",
+    ):
+        self.entries: List[HistoryEntry] = []
+        self.max = max_entries
+        self.max_sessions = max_sessions
+        self.history_dir = Path(history_dir)
+        self.history_dir.mkdir(parents=True, exist_ok=True)
+
+        self.index_storage = SecureStorage(str(self.history_dir / "index.enc"))
+        self.current_session_id = str(int(time.time()))
+        self.current_storage = SecureStorage(
+            str(self.history_dir / f"{self.current_session_id}.enc")
+        )
+        self.current_index = -1
+
+        # Load existing sessions index if any
+        self.sessions = self.index_storage.get("sessions_index") or []
+        # No longer auto-starting session here. Wait for start_new_session.
+
+    def start_new_session(self):
+        """Starts a fresh session and archives the current one."""
+        self.save()  # Ensure current is saved
+
+        self.current_session_id = str(int(time.time()))
+        self.current_storage = SecureStorage(
+            str(self.history_dir / f"{self.current_session_id}.enc")
+        )
+        self.entries = []
+        self.current_index = -1
+
+        # Update index with new session metadata
+        session_meta = {
+            "id": self.current_session_id,
+            "created_at": time.time(),
+            "snippet": "New Conversation",
+            "entry_count": 0,
+        }
+        self.sessions.insert(0, session_meta)
+        if len(self.sessions) > self.max_sessions:
+            expired = self.sessions[self.max_sessions :]
+            self.sessions = self.sessions[: self.max_sessions]
+            for old in expired:
+                try:
+                    old_file = self.history_dir / f"{old['id']}.enc"
+                    if old_file.exists():
+                        old_file.unlink()
+                except Exception as e:
+                    logger.debug(f"Failed to delete old session file {old['id']}: {e}")
+
+        self.index_storage.set("sessions_index", self.sessions)
+        logger.info(f"🆕 Started new session: {self.current_session_id}")
+
+    def add(
+        self,
+        query: str,
+        response: str,
+        provider: str = "",
+        mode: str = "",
+        latency: float = 0,
+    ):
+        entry = HistoryEntry(
+            query=query,
+            response=response,
+            provider=provider,
+            mode=mode,
+            latency=latency,
+        )
+        self.entries.append(entry)
+        if len(self.entries) > self.max:
+            self.entries = self.entries[-self.max :]
+
+        # Auto-set current_index to latest entry
+        self.current_index = len(self.entries) - 1
+
+        # Update index snippet with first query
+        if len(self.entries) == 1:
+            for s in self.sessions:
+                if s["id"] == self.current_session_id:
+                    s["snippet"] = query[:50] + ("..." if len(query) > 50 else "")
+                    break
+
+        # Update entry count in index
+        for s in self.sessions:
+            if s["id"] == self.current_session_id:
+                s["entry_count"] = len(self.entries)
+                break
+
+        self.index_storage.set("sessions_index", self.sessions)
+        self.save()
+
+    def move_prev(self) -> bool:
+        """Moves current_index back one entry. Returns True if index changed."""
+        if self.current_index > 0:
+            self.current_index -= 1
+            return True
+        return False
+
+    def move_next(self) -> bool:
+        """Moves current_index forward one entry. Returns True if index changed."""
+        if self.current_index < len(self.entries) - 1:
+            self.current_index += 1
+            return True
+        return False
+
+    def get_state(self):
+        """Returns (index, total, entry) for UI synchronization."""
+        entry = self.get_at(self.current_index) if self.current_index >= 0 else None
+        return self.current_index, len(self.entries), entry
+
+    def get_at(self, index: int) -> Optional[dict]:
+        """Convert dataclass to dict for UI consumption."""
+        if 0 <= index < len(self.entries):
+            return asdict(self.entries[index])
+        return None
+
+    def get_last(self, n: int = 10) -> List[HistoryEntry]:
+        return self.entries[-n:]
+
+    def load_session(self, session_id: str):
+        """Loads a specific session into memory."""
+        self.save()  # Save current first
+        target_path = self.history_dir / f"{session_id}.enc"
+        if target_path.exists():
+            self.current_session_id = session_id
+            self.current_storage = SecureStorage(str(target_path))
+            data = self.current_storage.get("history_data")
+            if data and isinstance(data, list):
+                self.entries = [HistoryEntry(**e) for e in data]
+                self.current_index = len(self.entries) - 1
+                logger.info(
+                    f"📜 Loaded session {session_id} ({len(self.entries)} entries)"
+                )
+            else:
+                self.entries = []
+        else:
+            logger.error(f"Session file not found: {session_id}")
+
+    def load(self):
+        """Load current session from its encrypted storage."""
+        try:
+            data = self.current_storage.get("history_data")
+            if data and isinstance(data, list):
+                self.entries = [HistoryEntry(**e) for e in data]
+                self.current_index = len(self.entries) - 1
+        except Exception as e:
+            logger.warning(f"Failed to load history: {e}")
+
+    def save(self):
+        """Save current session to its encrypted storage."""
+        if not self.entries:
+            return
+        try:
+            data = [asdict(e) for e in self.entries]
+            self.current_storage.set("history_data", data)
+        except Exception as e:
+            logger.error(f"Failed to save history: {e}")
+
+    def clear(self):
+        """Emergency Wipe: Purge memory and ALL session files from disk."""
+        self.entries.clear()
+        self.current_index = -1
+        
+        # RESTORATION: Total Disk Purge logic
+        logger.warning("🚨 EMERGENCY DISK PURGE INITIATED")
+        try:
+            # 1. Delete all .enc files in history directory
+            for enc_file in self.history_dir.glob("*.enc"):
+                try:
+                    enc_file.unlink()
+                    logger.debug(f"Removed trace: {enc_file.name}")
+                except Exception as e:
+                    logger.error(f"Failed to remove {enc_file}: {e}")
+            
+            # 2. Re-initialize empty state
+            self.sessions = []
+            self.index_storage.set("sessions_index", [])
+            
+        except Exception as e:
+            logger.error(f"Global purge failed: {e}")
+            
+        logger.info("🗑️ Global history and disk traces cleared")
+
+    def search(self, keyword: str) -> List[HistoryEntry]:
+        kw = keyword.lower()
+        return [
+            e for e in self.entries if kw in e.query.lower() or kw in e.response.lower()
+        ]
+
+    def export_markdown(self, filepath: str):
+        lines = ["# OpenAssist AI — Response History\n"]
+        for e in self.entries:
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.timestamp))
+            lines.append(f"## {ts} [{e.mode}] via {e.provider}\n")
+            lines.append(f"**Q:** {e.query}\n")
+            lines.append(f"**A:** {e.response}\n")
+            lines.append("---\n")
+        Path(filepath).write_text("\n".join(lines), encoding="utf-8")

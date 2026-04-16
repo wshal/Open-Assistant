@@ -1,0 +1,94 @@
+# ======================================================================
+#  OpenAssist AI v4.0 - Dependencies
+#  Install: pip install -r requirements.txt
+#
+#  NOTE: Python 3.12+ compatible versions
+# ======================================================================
+
+# -- Core Framework ----------------------------------------------------
+PyQt6>=6.7.0
+
+# ── Screen Capture ────────────────────────────────────────────────────
+Pillow>=10.0.0
+mss>=9.0.0
+
+# -- OCR ----------------------------------------------------------------
+# EasyOCR - cross-platform OCR (recommended for Python 3.14)
+easyocr>=1.7.0
+# rapidocr_onnxruntime may not work with Python 3.14
+
+# -- Audio & Speech-to-Text --------------------------------------------
+sounddevice>=0.4.0
+numpy>=1.24.0
+faster-whisper>=1.0.0
+
+# WebRTC VAD for accurate speech detection
+# NOTE: May need system deps on Linux: sudo apt install python3-dev
+webrtcvad>=2.0.0
+
+# -- AI Provider SDKs --------------------------------------------------
+# Free providers
+google-genai>=1.0.0
+groq>=0.9.0
+mistralai>=1.0.0
+cohere>=5.0.0
+together>=1.0.0
+ollama>=0.3.0
+
+# Paid providers (optional but supported)
+openai>=1.40.0
+anthropic>=0.34.0
+
+# HTTP clients used by OpenAI-compatible providers
+aiohttp>=3.10.0
+httpx>=0.27.0
+
+# -- RAG & Knowledge Base ----------------------------------------------
+chromadb>=0.5.0
+
+# Embeddings - fastembed may fail on Python 3.14 (py-rust-stemmers build issue)
+# Sentence-transformers is used as fallback
+sentence-transformers>=3.0.0
+
+# Text splitting
+langchain-text-splitters>=0.2.0
+
+# PDF support
+PyMuPDF>=1.24.0
+pdfplumber>=0.11.0
+
+# DOCX support
+python-docx>=1.0.0
+
+# -- Encryption & Security ---------------------------------------------
+cryptography>=43.0.0
+
+# -- Configuration -----------------------------------------------------
+pyyaml>=6.0.0
+python-dotenv>=1.0.0
+
+# -- Input & System ----------------------------------------------------
+pynput>=1.7.0
+pyperclip>=1.8.0
+psutil>=6.0.0
+
+# -- Caching --------------------------------------------------------------
+cachetools>=5.5.0
+
+# -- Token Counting (optional but improves accuracy) -------------------
+tiktoken>=0.7.0
+
+# -- Retry logic -------------------------------------------------------
+tenacity>=9.0.0
+
+# ── Logging (pretty console output) ───────────────────────────────────
+rich>=13.0.0
+
+# -- Version comparison (updater) ---------------------------------------
+packaging>=24.0
+
+# ======================================================================
+# BUILD DEPENDENCIES (for EXE packaging — not needed at runtime)
+# ======================================================================
+# pyinstaller>=6.10.0
+# nuitka>=2.0
