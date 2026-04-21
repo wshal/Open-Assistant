@@ -19,7 +19,27 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint
-from PyQt6.QtGui import QTextCursor
+from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor
+from ui.markdown_renderer import MarkdownRenderer
+from ui.standby_view import StandbyView
+from ui.settings_view import SettingsView
+from ui.history_feed import HistoryFeedView
+from ui.onboarding_wizard import OnboardingWizard
+from utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
+
+class OverlayWindow(QMainWindow):
+    user_query = pyqtSignal(str)
+
+    def __init__(self, config, app):
+        super().__init__()
+        self.config = config
+        self.app = app
+        self._drag = False
+        self._drag_pos = QPoint()
+        self._current_query = ""
 from ui.markdown_renderer import MarkdownRenderer
 from ui.standby_view import StandbyView
 from ui.settings_view import SettingsView
@@ -47,9 +67,14 @@ class OverlayWindow(QMainWindow):
         self._prev_stack_widget = None
 
         self.md = MarkdownRenderer()
+
+        # ── Streaming render strategy ──────────────────────────────────────
+        # During streaming we append raw text directly to QTextEdit for
+        # zero-latency display. A periodic 300ms timer re-renders the
+        # accumulated buffer as Markdown without blocking chunk display.
+        # On completion we do a final full markdown render.
         self._render_timer = QTimer(self)
-        self._render_timer.setSingleShot(True)
-        self._render_timer.setInterval(150)
+        self._render_timer.setInterval(300)          # periodic during stream
         self._render_timer.timeout.connect(self._render_markdown_now)
         self._analyze_timer = QTimer(self)
         self._analyze_timer.setInterval(220)
@@ -98,7 +123,7 @@ class OverlayWindow(QMainWindow):
         self._session_timer.start(1000)
 
     def end_session_ui(self):
-        """Called when session ends - hide timer and end button"""
+        """Called when session ends - hide timer, reset standby view to ready state."""
         self._session_start_time = None
         self.session_timer.setVisible(False)
         self.audio_status.setVisible(False)
@@ -108,6 +133,15 @@ class OverlayWindow(QMainWindow):
         self._session_timer.stop()
         self.session_timer.setText("00:00")
         self.set_analysis_provider_badge()
+
+        # Reset standby subtitle so user knows the slate is clean and ready
+        if hasattr(self, "standby_view"):
+            sv = self.standby_view
+            sv.subtitle.setText("SESSION ENDED — READY TO START")
+            sv.start_btn.setText("START NEW SESSION")
+            sv.start_btn.setEnabled(True)
+            sv.start_btn.setStyleSheet(sv.START_BUTTON_READY_STYLE)
+            sv.progress_bar.setValue(100)
 
     def _connect_state(self):
         self.app.state.muted_changed.connect(self.update_audio_state)
@@ -368,17 +402,10 @@ class OverlayWindow(QMainWindow):
         self._user_is_scrolling = not at_bottom
 
     def _render_markdown_now(self):
+        """Full markdown re-render of the accumulated buffer."""
         content = self._raw_buffer
-
-        # PERFORMANCE GUARD:
-        # Skip render if content hasn't changed enough to justify a full reflow,
-        # unless first/last tokens or long delay.
-        if hasattr(self, "_last_rendered_content"):
-            delta = len(content) - len(self._last_rendered_content)
-            if delta < 30 and self._is_streaming:
-                # Still start timer for next check
-                self._render_timer.start()
-                return
+        if not content:
+            return
 
         self._last_rendered_content = content
 
@@ -387,29 +414,59 @@ class OverlayWindow(QMainWindow):
             if self._current_query
             else ""
         )
-
-        # CPU-Heavy Operation: Markdown -> HTML
         rendered = self.md.render(content)
-
-        # DOM-Heavy Operation: HTML -> Widget
         self.response_area.setHtml(q_html + rendered)
 
         if not self._user_is_scrolling:
             self.response_area.moveCursor(QTextCursor.MoveOperation.End)
 
     def append_response(self, text: str):
+        """Called on every streaming chunk from AIEngine.response_chunk.
+
+        Strategy:
+        - Append the raw chunk directly to the QTextEdit for zero-latency display.
+          The user sees every token the moment it arrives from the provider.
+        - Accumulate in _raw_buffer for the periodic Markdown re-render (300ms).
+        - On the very first chunk, clear the widget and start the periodic timer.
+        """
         if not self._is_streaming:
+            # First chunk: switch into streaming mode
             self._is_streaming = True
             self._raw_buffer = ""
+            self.response_area.clear()
+            # Show query header immediately so user sees their question reflected
+            if self._current_query:
+                self.response_area.setHtml(
+                    f"<div style='color: #64748b; font-size: 10px; margin-bottom: 5px;'>"
+                    f"<b>QUERY:</b> {self._current_query}</div>"
+                )
+            # Start periodic markdown re-render every 300ms
+            self._render_timer.start()
+
         self._raw_buffer += text
-        self._render_timer.start()
+
+        # Immediate plaintext append — character-level, zero lag.
+        # Use QTextCharFormat to keep text in the correct colour (#d0d0e8)
+        # even after a prior setHtml() call switched the document to rich-text mode.
+        cursor = self.response_area.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#d0d0e8"))
+        cursor.setCharFormat(fmt)
+        cursor.insertText(text)
+        self.response_area.setTextCursor(cursor)
+
+        if not self._user_is_scrolling:
+            self.response_area.moveCursor(QTextCursor.MoveOperation.End)
 
     def on_complete(self, full_text: str, query: str = None):
+        """Called when streaming finishes. Does a final full Markdown render."""
+        self._render_timer.stop()    # stop the periodic timer
         self._is_streaming = False
         if query:
             self._current_query = query
         self._raw_buffer = full_text
-        self._render_markdown_now()
+        self._render_markdown_now()  # final full render with proper markdown
 
     def update_warmup_status(self, m, p, r):
         self.standby_view.set_warmup_status(m, p, r)
@@ -455,10 +512,34 @@ class OverlayWindow(QMainWindow):
         self._status_snapshot = " | ".join(parts)
 
     # --- RESTORED BRIDGES ---
-    def update_transcript(self, text):
-        self.transcript_lbl.setText(text[:80] + ("..." if len(text) > 80 else ""))
+    def update_transcript(self, text: str, state: str = "auto"):
+        """Update the transcript/status label.
+
+        state:
+          'auto'       → infer colour from text content
+          'listening'  → green
+          'processing' → amber
+          'error'      → red
+          'idle'       → grey
+        """
+        display = text[:80] + ("..." if len(text) > 80 else "")
+        self.transcript_lbl.setText(display)
+
+        if state == "listening" or (state == "auto" and ("🌐" in text or "Listening" in text)):
+            colour = "#4ade80"   # green
+            italic = False
+        elif state == "processing" or (state == "auto" and ("⏳" in text or "Processing" in text)):
+            colour = "#f59e0b"   # amber
+            italic = True
+        elif state == "error" or (state == "auto" and ("🟡" in text or "Error" in text or "failed" in text.lower())):
+            colour = "#ef4444"   # red
+            italic = False
+        else:
+            colour = "#64748b"   # default grey
+            italic = True
+
         self.transcript_lbl.setStyleSheet(
-            "color: #4ade80; font-size: 10px; font-style: normal;"
+            f"color: {colour}; font-size: 10px; font-style: {'italic' if italic else 'normal'};"
         )
 
     def set_analysis_provider_badge(self, provider: str = None, pending: bool = False):
@@ -571,6 +652,17 @@ class OverlayWindow(QMainWindow):
         if q:
             self.input.clear()
             self._user_is_scrolling = False
+            # ── Immediately reflect the query in the response area ──────────────
+            # The user typed this — show it instantly without waiting for the
+            # first streaming chunk or on_complete to set _current_query.
+            self._current_query = q
+            self.response_area.clear()
+            self.response_area.setHtml(
+                f"<div style='color: #64748b; font-size: 10px; margin-bottom: 5px;'>"
+                f"<b>QUERY:</b> {q}</div>"
+                f"<div style='color: #4ade80; font-size: 11px; font-style: italic;'>⏳ Thinking...</div>"
+            )
+            self.show_chat_view()
             self.user_query.emit(q)
 
     def _analyze_screen(self):

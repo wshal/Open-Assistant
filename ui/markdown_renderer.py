@@ -266,24 +266,30 @@ class MarkdownRenderer:
         """Render a fenced code block with syntax highlighting."""
         highlighted = self._syntax_highlight(code, language)
 
-        lang_badge = ""
+        # Language label is a SIBLING div placed above the code block — NOT nested
+        # inside it. QTextEdit's HTML engine leaks text-align from nested children
+        # into the parent block, which was right-aligning all the code content.
+        # Keeping them as siblings gives each its own independent text-align scope.
+        lang_label = ""
         if language:
-            lang_badge = (
-                f'<span style="position: relative; float: right; '
-                f"color: #555588; font-size: 10px; padding: 2px 6px; "
-                f'background: rgba(40,40,70,100); border-radius: 3px;">'
-                f"{language}</span>"
+            lang_label = (
+                f'<div style="text-align: right; color: #7777aa; font-size: 10px; '
+                f'font-family: {self.font_family}, sans-serif; '
+                f'margin: 8px 0 0 0; padding: 0 2px;">'
+                f"{language}</div>"
             )
 
-        return (
+        code_block = (
             f'<div style="background: rgba(8,8,18,220); border: 1px solid rgba(80,80,140,60); '
-            f"border-radius: 8px; margin: 12px 0; padding: 14px; "
+            f"border-radius: 8px; margin: 2px 0 12px 0; padding: 14px; "
             f"font-family: {self.code_font}; font-size: 12px; "
-            f'line-height: 1.5; white-space: pre;">'
-            f"{lang_badge}"
+            f'line-height: 1.5; white-space: pre; text-align: left;">'
             f"{highlighted}"
             f"</div>"
         )
+
+        return lang_label + code_block
+
 
     def _apply_highlight(self, chunks, regex, style: str):
         highlighted = []

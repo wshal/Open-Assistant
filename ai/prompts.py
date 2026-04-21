@@ -1,52 +1,86 @@
-"""Prompt templates for all modes — Optimized for speed & weight."""
+"""Prompt templates for all modes — fully mode-profile-aware."""
 
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, List, Dict, Union
 
 
 class ContextRanker:
-    """Ranks context importance for prompt inclusion."""
+    """
+    Ranks context sources for prompt inclusion.
 
-    PRIORITY = {
-        "screen": 3,  # Highest - most current
-        "audio": 2,  # Medium - recent speech
-        "rag": 1,  # Low - knowledge base
+    Accepts either a mode name string (backward-compat) or a Mode object.
+    When a Mode object is provided, it reads context_weights and context_limits
+    directly from the profile — no scattered if/else.
+    """
+
+    # Fallback static priority (used when no mode object is available)
+    _DEFAULT_WEIGHTS = {
+        "screen": 2,
+        "audio":  2,
+        "rag":    1,
+    }
+    _DEFAULT_LIMITS = {
+        "screen": 4000,
+        "audio":  2500,
+        "rag":    2000,
     }
 
+    # Legacy string-based priority table (kept for backward compatibility)
     MODE_PRIORITY = {
         "interview": {"audio": 3, "screen": 2, "rag": 1},
-        "meeting": {"audio": 3, "screen": 2, "rag": 1},
-        "coding": {"screen": 3, "rag": 2, "audio": 1},
-    }
-
-    LIMITS = {
-        "screen": 4000,
-        "audio": 2500,
-        "rag": 2000,
+        "meeting":   {"audio": 3, "screen": 1, "rag": 1},
+        "coding":    {"screen": 3, "rag": 2, "audio": 1},
+        "writing":   {"screen": 3, "rag": 2, "audio": 1},
+        "exam":      {"screen": 3, "rag": 2, "audio": 1},
     }
 
     @classmethod
-    def rank(cls, contexts: List[str], mode: str = None) -> List[tuple]:
-        """Return ranked (source, content, priority) tuples."""
-        ranked = []
+    def _resolve_weights(cls, mode) -> Dict[str, int]:
+        """Resolve priority weights from a Mode object or string."""
+        if mode is None:
+            return cls._DEFAULT_WEIGHTS
+        if hasattr(mode, "context_weights"):
+            return mode.context_weights
+        # Fallback: mode is a string
+        return cls.MODE_PRIORITY.get(str(mode).lower(), cls._DEFAULT_WEIGHTS)
+
+    @classmethod
+    def _resolve_limits(cls, mode) -> Dict[str, int]:
+        """Resolve char limits from a Mode object or string."""
+        if mode is None:
+            return cls._DEFAULT_LIMITS
+        if hasattr(mode, "context_limits"):
+            return mode.context_limits
+        return cls._DEFAULT_LIMITS
+
+    @classmethod
+    def rank(cls, contexts: List[str], mode=None) -> List[tuple]:
+        """
+        Return ranked (source, content, priority) tuples.
+        `mode` can be a Mode object or a string mode name.
+        """
+        weights = cls._resolve_weights(mode)
         source_map = {
             "screen": contexts[0] if len(contexts) > 0 else "",
-            "audio": contexts[1] if len(contexts) > 1 else "",
-            "rag": contexts[2] if len(contexts) > 2 else "",
+            "audio":  contexts[1] if len(contexts) > 1 else "",
+            "rag":    contexts[2] if len(contexts) > 2 else "",
         }
-        priorities = cls.MODE_PRIORITY.get((mode or "").lower(), cls.PRIORITY)
-
-        for src, content in source_map.items():
-            if content:
-                ranked.append((src, content, priorities.get(src, cls.PRIORITY.get(src, 0))))
-
+        ranked = [
+            (src, content, weights.get(src, 1))
+            for src, content in source_map.items()
+            if content
+        ]
         ranked.sort(key=lambda x: x[2], reverse=True)
         return ranked
 
     @classmethod
-    def limit(cls, source: str, content: str) -> str:
-        """Apply token limits per source."""
-        limit = cls.LIMITS.get(source, 1000)
-        return content[:limit]
+    def limit(cls, source: str, content: str, mode=None) -> str:
+        """
+        Apply char limits per source.
+        `mode` can be a Mode object or None.
+        """
+        limits = cls._resolve_limits(mode)
+        cap = limits.get(source, cls._DEFAULT_LIMITS.get(source, 1000))
+        return content[:cap]
 
 
 class PromptBuilder:
@@ -84,7 +118,6 @@ FORMAT: Answer | Explanation (brief) | Key Concept
 For MCQ: state correct answer first.""",
     }
 
-    # P2: Fine-grained prompt packs per use case
     PROMPT_PACKS = {
         "meeting": {
             "system": """You are a real-time meeting copilot.
@@ -170,11 +203,10 @@ RULES:
         },
     }
 
-    # Uncertainty markers for weak context
     UNCERTAINTY_MARKERS = {
         "screen": "[Screen may be partial or OCR may contain errors]",
-        "audio": "[Audio may be incomplete or contain ASR errors]",
-        "rag": "[Knowledge base results may be outdated]",
+        "audio":  "[Audio may be incomplete or contain ASR errors]",
+        "rag":    "[Knowledge base results may be outdated]",
     }
 
     @staticmethod
@@ -184,53 +216,26 @@ RULES:
             return False
 
         contextual_markers = (
-            "this ",
-            "current ",
-            "shown ",
-            "visible ",
-            "on screen",
-            "in this code",
-            "in the code",
-            "this code",
-            "this function",
-            "this file",
-            "line ",
-            "error",
-            "traceback",
-            "bug",
-            "fix",
-            "function do",
-            "what does this",
+            "this ", "current ", "shown ", "visible ", "on screen",
+            "in this code", "in the code", "this code", "this function",
+            "this file", "line ", "error", "traceback", "bug", "fix",
+            "function do", "what does this",
         )
         if any(marker in q for marker in contextual_markers):
             return False
 
         starters = (
-            "what is ",
-            "what are ",
-            "who is ",
-            "who are ",
-            "explain ",
-            "define ",
-            "tell me about ",
-            "give me an example",
-            "show me an example",
-            "how does ",
-            "how do ",
+            "what is ", "what are ", "who is ", "who are ",
+            "explain ", "define ", "tell me about ",
+            "give me an example", "show me an example",
+            "how does ", "how do ",
         )
         if any(q.startswith(prefix) for prefix in starters):
             return True
 
         generic_markers = (
-            "example of",
-            "context api",
-            "useeffect",
-            "react",
-            "javascript",
-            "typescript",
-            "python",
-            "api",
-            "hook",
+            "example of", "context api", "useeffect", "react",
+            "javascript", "typescript", "python", "api", "hook",
         )
         return len(q.split()) <= 10 and any(marker in q for marker in generic_markers)
 
@@ -238,9 +243,8 @@ RULES:
         if isinstance(mode, str):
             name = mode
         else:
-            name = mode.name if mode else "general"
+            name = mode.name if mode and hasattr(mode, "name") else "general"
 
-        # P2: Use fine-grained prompt pack if available
         if name in self.PROMPT_PACKS:
             return self.PROMPT_PACKS[name]["system"]
 
@@ -251,26 +255,31 @@ RULES:
 
     def build_from_pack(
         self,
-        mode: str,
+        mode,
         screen: str = "",
         audio: str = "",
         rag: str = "",
         query: str = "",
         nexus: Dict[str, Any] = None,
     ) -> tuple:
-        """P2: Build system and user prompts from prompt pack."""
-        pack = self.PROMPT_PACKS.get(mode)
+        """Build system and user prompts from prompt pack, respecting Mode limits."""
+        mode_name = mode.name if hasattr(mode, "name") else str(mode)
+        pack = self.PROMPT_PACKS.get(mode_name)
         if not pack:
             return self.system(mode), self.user(query, screen, audio, rag, nexus=nexus)
 
-        # Build user prompt from template
+        # Use mode-specific limits if available
+        screen_limit = mode.limit("screen") if hasattr(mode, "limit") else 4000
+        audio_limit  = mode.limit("audio")  if hasattr(mode, "limit") else 2500
+        rag_limit    = mode.limit("rag")    if hasattr(mode, "limit") else 2000
+
         user_prompt = pack["user_template"].format(
-            screen=screen[:4000] if screen else "",
-            audio=audio[-2500:] if audio else "",
-            rag=rag[:2000] if rag else "",
+            screen=screen[:screen_limit] if screen else "",
+            audio=audio[-audio_limit:]   if audio  else "",
+            rag=rag[:rag_limit]          if rag    else "",
             query=query,
         )
-        
+
         if nexus:
             user_prompt = f"[ACTIVE WINDOW: {nexus.get('active_window', 'Unknown')}]\n" + user_prompt
 
@@ -286,30 +295,37 @@ RULES:
         mode=None,
         origin: str = None,
         nexus: Dict[str, Any] = None,
+        history: str = "",
     ) -> str:
-        """Build user prompt with ranked context and uncertainty markers."""
+        """Build user prompt with mode-profile-aware context ranking and limits."""
         parts = []
         suppress_live_context = origin == "manual" and self._is_general_knowledge_query(query)
 
-        # Context ranking and limiting
+        # Conversation history — injected first so the model anchors on prior context
+        # before reading the current query. Critical for follow-up queries.
+        if history:
+            parts.append(f"[CONVERSATION HISTORY]\n{history}")
+
+        # Context ranking — accepts Mode object or string
         contexts = [screen, audio, rag]
-        mode_name = mode.name if hasattr(mode, "name") else mode
-        ranked = ContextRanker.rank(contexts, mode=mode_name)
-        
+        ranked = ContextRanker.rank(contexts, mode=mode)
+
         if nexus and not suppress_live_context:
-            parts.append(f"[ENVIRONMENT]\nActive Window: {nexus.get('active_window', 'Unknown')}\nHistory Depth: {nexus.get('history_depth_secs', 60)}s")
+            parts.append(
+                f"[ENVIRONMENT]\nActive Window: {nexus.get('active_window', 'Unknown')}\n"
+                f"History Depth: {nexus.get('history_depth_secs', 60)}s"
+            )
 
         for src, content, _ in ranked:
             if suppress_live_context and src in {"screen", "audio"}:
                 continue
+            # Use mode-aware limits
+            limited = ContextRanker.limit(src, content, mode=mode)
             if src == "screen":
-                limited = ContextRanker.limit("screen", content)
                 parts.append(f"[SCREEN]\n{limited}")
             elif src == "audio":
-                limited = ContextRanker.limit("audio", content)
                 parts.append(f"[AUDIO]\n{limited}")
             elif src == "rag":
-                limited = ContextRanker.limit("rag", content)
                 parts.append(f"[RAG]\n{limited}")
 
         if clipboard:
@@ -319,7 +335,7 @@ RULES:
             parts.append("(Origin: Audio. Fix ASR errors.)")
         elif origin == "screen_analysis":
             parts.append(
-                "[TASK]\nAnalyze the attached screenshot first. Treat the image as the primary source of truth. "
+                "[TASK]\nAnalyse the attached screenshot first. Treat the image as the primary source of truth. "
                 "Use [SCREEN] as OCR support, and use [AUDIO] and environment context only as support. "
                 "If the screenshot or OCR is partial, say what is visible, what it likely means, and the best next action.\n"
                 "FORMAT:\n- What I See\n- What It Means\n- What To Do Next"
@@ -337,27 +353,30 @@ RULES:
                     "If the question is generic and the live context is unrelated, answer directly without talking about the unrelated context."
                 )
         elif origin == "quick":
+            # Mode-specific quick-answer format injected here
+            fmt = ""
+            if mode and hasattr(mode, "quick_answer_format"):
+                fmt = f"\n{mode.quick_answer_format}"
             parts.append(
                 "[TASK]\nGive the fastest useful context answer using the most recent live context. "
-                "Prioritize recent audio first, then visible screen context. "
-                "Keep it extremely concise and actionable.\n"
-                "FORMAT:\n- Quick Summary\n- Best Immediate Answer\n- Next Move"
+                "Prioritise context in the order it appears above (highest weight first). "
+                f"Keep it extremely concise and actionable.{fmt}"
             )
 
         parts.append(f"Q: {query}")
         return "\n---\n".join(parts)
 
     @staticmethod
-    def format_response(mode: str, content: str) -> str:
+    def format_response(mode, content: str) -> str:
         """Apply mode-specific formatting contract to response."""
+        mode_name = mode.name if hasattr(mode, "name") else str(mode)
         contracts = {
-            "coding": "Issue | Fix | Why (1 line)",
+            "coding":    "Issue | Fix | Why (1 line)",
             "interview": "Key Points | STAR Answer | Technical Detail | Sample Phrasing",
-            "meeting": "Key Points | Action Items | Decisions | Suggested Responses",
-            "exam": "Answer | Explanation | Key Concept",
+            "meeting":   "Key Points | Action Items | Decisions | Suggested Responses",
+            "exam":      "Answer | Explanation | Key Concept",
         }
-
-        contract = contracts.get(mode, "")
+        contract = contracts.get(mode_name, "")
         if contract:
             return f"[Format: {contract}]\n\n{content}"
         return content

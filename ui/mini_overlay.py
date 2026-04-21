@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QTextEdit,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QTimer
+from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -43,8 +44,7 @@ class MiniOverlay(QMainWindow):
         self._gaze_timer.start(100)
 
         self._render_timer = QTimer(self)
-        self._render_timer.setSingleShot(True)
-        self._render_timer.setInterval(200)
+        self._render_timer.setInterval(300)  # periodic markdown re-render during streaming
         self._render_timer.timeout.connect(self._render_markdown_now)
 
         self._build()
@@ -146,6 +146,14 @@ class MiniOverlay(QMainWindow):
         q = self.input.text().strip()
         if q:
             self.input.clear()
+            # Immediately show query + thinking state before any AI response
+            self._raw_buffer = ""
+            self.response_area.clear()
+            self.response_area.setHtml(
+                f"<div style='color:#64748b;font-size:10px;'><b>Q:</b> {q}</div>"
+                f"<div style='color:#f59e0b;font-size:11px;font-style:italic;'>⏳ Thinking...</div>"
+            )
+            self._toggle_expand(True)
             self.set_thinking()
             self.user_query.emit(q)
 
@@ -162,10 +170,32 @@ class MiniOverlay(QMainWindow):
         self._adjust_height()
 
     def append_response(self, text: str):
+        """Called on every streaming chunk — immediate display + periodic markdown re-render."""
+        if not self._raw_buffer:
+            # First chunk: expand panel, clear area, start periodic timer
+            self._toggle_expand(True)
+            self.response_area.clear()
+            self.set_thinking()
+            self._render_timer.start()
+
         self._raw_buffer += text
-        self._render_timer.start()
+
+        # Immediate colour-correct text append
+        cursor = self.response_area.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#d0d0e8"))
+        cursor.setCharFormat(fmt)
+        cursor.insertText(text)
+        self.response_area.setTextCursor(cursor)
+        # Auto-scroll to bottom
+        self.response_area.verticalScrollBar().setValue(
+            self.response_area.verticalScrollBar().maximum()
+        )
 
     def on_complete(self, full_text: str, query: str = None):
+        """Streaming finished — stop timer, do final markdown render, update dot."""
+        self._render_timer.stop()
         self._raw_buffer = full_text or ""
         self._render_markdown_now()
         self.set_ready()

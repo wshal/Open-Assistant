@@ -3,6 +3,7 @@
 # Internal Technical Docs & Sensitive Assets (Private)
 ISSUES_ANALYSIS.md
 OPENASSIST_TECH_AUDIT.md
+latency_audit.md
 cheating/
 
 # Application Data & Secrets

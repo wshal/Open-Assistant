@@ -5,9 +5,16 @@ LAYER 6: Integrated restart() for hot-swapping audio modes in settings.
 """
 
 import collections
+import os
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+
+# Suppress HuggingFace symlinks warning on Windows.
+# The cache works fine without symlinks (copies files instead) — this just
+# silences the noisy warning that appears every time Whisper is loaded.
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -39,14 +46,21 @@ class AudioCapture(QObject):
 
         self.block_ms = 200
         self.block_size = int(self.sr * self.block_ms / 1000)
-        self.silence_blocks = int(1500 / self.block_ms)
+        self.silence_blocks = int(900 / self.block_ms)  # 900ms balanced default
 
         self.model = None
-        self._model_name = config.get("capture.audio.whisper_model", "base")
+        self._model_name = config.get("capture.audio.whisper_model", "tiny")
         self._model_loaded = False
         self._model_lock = threading.Lock()
         self._current_rms = 0.0
         self._last_transcription_metrics = {}
+
+        # Single-worker pool: Whisper transcription runs off the VAD thread.
+        # This means the VAD loop can immediately resume listening while the
+        # previous speech segment is being transcribed in the background.
+        self._transcribe_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="whisper"
+        )
 
         self._active_streams = []
         self._lock = threading.RLock()
@@ -76,11 +90,23 @@ class AudioCapture(QObject):
             try:
                 from faster_whisper import WhisperModel
 
+                # GPU auto-detection: CUDA float16 is 3–5x faster than CPU int8.
+                # Falls back gracefully to CPU if no CUDA-capable GPU is found.
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        device, compute = "cuda", "float16"
+                        logger.info(f"Whisper: CUDA GPU detected — using float16")
+                    else:
+                        device, compute = "cpu", "int8"
+                except ImportError:
+                    device, compute = "cpu", "int8"
+
                 self.model = WhisperModel(
-                    self._model_name, device="auto", compute_type="int8"
+                    self._model_name, device=device, compute_type=compute
                 )
                 self._model_loaded = True
-                logger.info(f"✅ Whisper Ready: {self._model_name}")
+                logger.info(f"✅ Whisper Ready: {self._model_name} on {device}")
             except Exception as e:
                 logger.error(f"Whisper Error: {e}")
                 self._model_loaded = False
@@ -308,6 +334,22 @@ class AudioCapture(QObject):
         finally:
             self._close_streams()
 
+    def set_vad_silence_ms(self, ms: int) -> None:
+        """Update the VAD silence window live (no restart needed).
+
+        Called from app.py when the mode switches so interview/meeting modes
+        get tighter silence detection without requiring an audio pipeline restart.
+
+        Args:
+            ms: Milliseconds of silence before the speech segment is sent to
+                Whisper. Clamped to [200, 2000] for safety.
+        """
+        ms = max(200, min(2000, int(ms)))
+        new_blocks = int(ms / self.block_ms)
+        if new_blocks != self.silence_blocks:
+            self.silence_blocks = new_blocks
+            logger.info(f"🎙️ VAD silence window updated → {ms}ms ({new_blocks} blocks)")
+
     def _process_loop(self):
         speech_buffer = []
         is_speaking = False
@@ -333,7 +375,13 @@ class AudioCapture(QObject):
             elif is_speaking:
                 silence_count += 1
                 if silence_count >= self.silence_blocks:
-                    self._transcribe(speech_buffer, speech_started_at=speech_started_at)
+                    # ── Dispatch transcription to pool so VAD loop is not blocked ──
+                    # Previously: self._transcribe() ran synchronously here (~300ms).
+                    # Now: submitted to a single-worker ThreadPoolExecutor so the VAD
+                    # loop returns immediately and can process the next audio frame.
+                    self._transcribe_pool.submit(
+                        self._transcribe, list(speech_buffer), speech_started_at
+                    )
                     speech_buffer = []
                     is_speaking = False
                     speech_started_at = None

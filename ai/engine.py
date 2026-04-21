@@ -1,12 +1,15 @@
 """
-AI Orchestration Engine - OpenAssist v4.1 (Midnight Hardened).
+AI Orchestration Engine - OpenAssist v4.2 (ModeProfile Edition).
 RESTORED: Async Task Control, RAG caching, and Cloud-ASR Correction.
 FIXED: Removed internal loops; App Master Loop now controls all AI execution.
 FIXED: Added latency tracking for performance monitoring.
+NEW: ModeManager wired in — engine reads live Mode objects, not bare strings.
 """
 
 import asyncio
+import re
 import time
+from functools import lru_cache
 from typing import Optional, List, Dict, Any
 from collections import OrderedDict
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -33,13 +36,15 @@ class AIEngine(QObject):
     error_occurred = pyqtSignal(str)
     provider_status = pyqtSignal(dict)  # Emits health for UI dashboard
 
-    def __init__(self, config, history: ResponseHistory, rag=None):
+    def __init__(self, config, history: ResponseHistory, rag=None, mode_manager=None):
         super().__init__()
         self.config = config
         self.history = history
         self.rag = rag
         self.prompts = PromptBuilder()
         self.detector = QuestionDetector(config)
+        # ModeManager: first-class dependency — resolves live Mode objects per request
+        self._mode_manager = mode_manager
 
         self._providers = {}
         self._active_provider_id = config.get("ai.fixed_provider", "")
@@ -50,10 +55,6 @@ class AIEngine(QObject):
         self._parallel = None
 
         # Provider speed ranking (fastest first)
-        # groq/cerebras: ~2100 tok/s (fastest)
-        # gemini: Excellent quality, moderate speed
-        # together: Variable speed
-        # ollama: Local (no API latency but limited model)
         self._provider_priority = ["groq", "cerebras", "gemini", "together", "ollama"]
 
         # Query complexity patterns
@@ -75,11 +76,20 @@ class AIEngine(QObject):
             r"\b(if\s+.+\s+then|therefore|thus|hence)\b",
         ]
 
-        # RAG Cache (Midnight Restoration)
-        self._rag_cache = OrderedDict()  # query -> (context, expiry)
+        # ── RAG Cache (Midnight Restoration) ─────────────────────────────────
+        self._rag_cache = OrderedDict()   # query → (context, expiry)
         self._cache_ttl = 60
         self._max_cache_size = 100
+
+        # ── Background RAG Prefetch ───────────────────────────────────────────
+        # Stores pre-fetched RAG results keyed by a short context fingerprint.
+        # Populated by prefetch_rag() before the user submits a query.
+        self._rag_prefetch: dict = {}          # fingerprint → (context_str, expiry)
+        self._prefetch_ttl: int = 90           # seconds a prefetch stays valid
+        self._prefetch_lock = asyncio.Lock()   # prevent concurrent prefetch storms
+
     def warmup(self):
+
         """Initializes AI providers and checks availability."""
         try:
             self._providers = init_providers(self.config)
@@ -145,26 +155,29 @@ class AIEngine(QObject):
         request_started_at = request_metadata.get("request_started_at", start_time)
         stage_timings["request_to_ai_start_ms"] = (start_time - request_started_at) * 1000
 
-        mode_id = self.config.get("ai.mode", "general")
+        # Resolve the live Mode object — use ModeManager if available
+        mode_obj = self._mode_manager.current if self._mode_manager else None
+        mode_id = mode_obj.name if mode_obj else self.config.get("ai.mode", "general")
 
-        # Smart routing: analyze query complexity and select provider
+        # Smart routing: analyse query complexity and select provider
         complexity = self._analyze_query_complexity(query)
         preferred_providers = self._preferred_providers_for_complexity(
-            complexity, mode_id
+            complexity, mode_obj or mode_id
         )
 
         # Use parallel inference if enabled
         use_parallel = self._parallel and self.config.get("ai.parallel.enabled", False)
 
         if use_parallel:
-            # Build prompts first for parallel
-            sys_prompt = self.prompts.system(mode_id)
+            # Build prompts first for parallel — pass Mode object for profile-aware limits
+            _mode_arg = mode_obj or mode_id
+            sys_prompt = self.prompts.system(_mode_arg)
             user_msg = self.prompts.user(
                 query=query,
                 screen=screen_context or "",
                 audio=audio_context or nexus_snapshot.get("recent_audio", ""),
                 rag="",
-                mode=mode_id,
+                mode=_mode_arg,
                 origin=origin,
                 nexus=nexus_snapshot
             )
@@ -203,7 +216,7 @@ class AIEngine(QObject):
                     f"Parallel inference failed, falling back to single provider: {e}"
                 )
 
-        provider, tier = self._select_provider(mode_id, complexity, preferred_providers)
+        provider, tier = self._select_provider(mode_obj or mode_id, complexity, preferred_providers)
         self._selected_tier = tier
         if not provider:
             self.error_occurred.emit("No available AI provider found.")
@@ -215,47 +228,117 @@ class AIEngine(QObject):
         )
 
         try:
-            # 1. RAG Cache / Fetch
+            # 1 & 2.  RAG + Refinement — run concurrently to hide latency
+            # ─────────────────────────────────────────────────────────────────
+            # Previously sequential: wait(RAG) + wait(refine) = ~600ms worst-case.
+            # Now parallel:           wait(max(RAG, refine))   = ~400ms worst-case.
+            # Cache / prefetch hits remain zero-latency (no coroutine created).
+
+            # ── RAG: resolve from cache or build coroutine for parallel exec ─────────
             rag_context = ""
+            rag_coro = None
             if self.rag:
                 now = time.time()
                 cache_key = query.lower().strip()[:100]
-                if cache_key in self._rag_cache and now < self._rag_cache[cache_key][1]:
+
+                # Prefetch hit: zero-latency, no coroutine needed
+                prefetch_fp = self._rag_prefetch_fingerprint(
+                    screen_context or nexus_snapshot.get("latest_ocr", ""),
+                    audio_context or nexus_snapshot.get("recent_audio", ""),
+                )
+                prefetch_hit = self._rag_prefetch.get(prefetch_fp)
+                if prefetch_hit and now < prefetch_hit[1]:
+                    rag_context = prefetch_hit[0]
+                    logger.debug("RAG: Prefetch Hit (zero-latency)")
+                # Regular cache hit: also zero-latency
+                elif cache_key in self._rag_cache and now < self._rag_cache[cache_key][1]:
                     rag_context = self._rag_cache[cache_key][0]
                     self._rag_cache.move_to_end(cache_key)
                     logger.debug("RAG: Cache Hit")
                 else:
-                    results = await self.rag.query(query)
-                    if results:
-                        rag_context = "\n".join(results)
-                        self._rag_cache[cache_key] = (rag_context, now + self._cache_ttl)
-                        if len(self._rag_cache) > self._max_cache_size:
-                            self._rag_cache.popitem(last=False)
-                stage_timings["rag_query_ms"] = (time.time() - start_time) * 1000
+                    # Miss — schedule for parallel execution
+                    rag_coro = self.rag.query(query)
 
-            # 2. Transcription Refinement (OPTIMIZED)
+            # ── Refinement: decide whether to run, build coroutine if so ────────
             refined_audio = audio_context
-            simple_query = complexity == "simple"
-            
-            if audio_context and self.config.get("capture.audio.correct_transcript", True) and not simple_query:
-                # Bypass refinement for simple queries or short transcripts to save ~500ms
-                if len(audio_context.split()) > 5:
-                    refiner_id = self.config.get("capture.audio.correction_provider", "groq")
-                    refiner = self._providers.get(refiner_id)
-                    if refiner:
-                        refined_audio = await self._refine_transcript(audio_context, refiner)
-                stage_timings["refinement_ms"] = (time.time() - start_time) * 1000 - stage_timings.get("rag_query_ms", 0)
+            refine_coro = None
+            is_general_knowledge = (
+                origin == "manual"
+                and self.prompts._is_general_knowledge_query(query)
+            )
+            skip_refinement = complexity == "simple" or is_general_knowledge
+            needs_refinement = (
+                audio_context
+                and not skip_refinement
+                and len(audio_context.split()) > 5
+                and self.config.get("capture.audio.correct_transcript", True)
+            )
+            if needs_refinement:
+                refiner_id = self.config.get("capture.audio.correction_provider", "groq")
+                refiner = self._providers.get(refiner_id)
+                if refiner:
+                    refine_coro = self._refine_transcript(audio_context, refiner)
+            elif skip_refinement:
+                logger.debug(
+                    f"Refinement skipped: complexity={complexity}, "
+                    f"origin={origin}, general_knowledge={is_general_knowledge}"
+                )
 
-            # 3. Prompt Synthesis
-            sys_prompt = self.prompts.system(mode_id)
+            # ── Parallel execution: gather only what needs a network call ────────
+            parallel_start = time.time()
+            if rag_coro and refine_coro:
+                # Both need a live call — run concurrently
+                rag_results, refined_text = await asyncio.gather(rag_coro, refine_coro)
+                if rag_results:
+                    rag_context = "\n".join(rag_results)
+                    now2 = time.time()
+                    self._rag_cache[cache_key] = (rag_context, now2 + self._cache_ttl)
+                    if len(self._rag_cache) > self._max_cache_size:
+                        self._rag_cache.popitem(last=False)
+                if refined_text:
+                    refined_audio = refined_text
+                logger.debug(
+                    f"Parallel RAG+Refine: {(time.time() - parallel_start)*1000:.0f}ms"
+                )
+            elif rag_coro:
+                # Only RAG needed
+                rag_results = await rag_coro
+                if rag_results:
+                    rag_context = "\n".join(rag_results)
+                    now2 = time.time()
+                    self._rag_cache[cache_key] = (rag_context, now2 + self._cache_ttl)
+                    if len(self._rag_cache) > self._max_cache_size:
+                        self._rag_cache.popitem(last=False)
+            elif refine_coro:
+                # Only refinement needed
+                result = await refine_coro
+                if result:
+                    refined_audio = result
+
+            stage_timings["rag_refine_parallel_ms"] = (time.time() - start_time) * 1000
+
+
+            # 3. Prompt Synthesis — pass Mode object for profile-aware context limits
+            _mode_arg = mode_obj or mode_id
+            sys_prompt = self.prompts.system(_mode_arg)
+
+            # Resolve follow-up queries using recent history so short ambiguous
+            # queries like "give me an example" inherit the previous topic context.
+            resolved_query = self._resolve_followup_query(query)
+
+            # Build conversation history block from last 3 turns (capped at 1500 chars).
+            # Injected into the prompt so the model understands what was discussed.
+            history_block = self._build_history_block(max_turns=3, max_chars=1500)
+
             user_msg = self.prompts.user(
-                query=query,
+                query=resolved_query,
                 screen=screen_context or nexus_snapshot.get("latest_ocr", ""),
                 audio=refined_audio or nexus_snapshot.get("full_audio_history", ""),
                 rag=rag_context,
-                mode=mode_id,
+                mode=_mode_arg,
                 origin=origin,
-                nexus=nexus_snapshot
+                nexus=nexus_snapshot,
+                history=history_block,
             )
 
             # 4. Streamed Generation
@@ -298,7 +381,73 @@ class AIEngine(QObject):
             logger.error(f"AI Engine Runtime Error: {e}")
             self.error_occurred.emit(str(e))
 
+    # ── Conversation memory helpers ─────────────────────────────────────────────
+
+    def _build_history_block(self, max_turns: int = 3, max_chars: int = 1500) -> str:
+        """Serialise the last N conversation turns for injection into the prompt.
+
+        Returns an empty string when there is no history yet (first query).
+        Each turn is formatted as a compact Q/A pair. The total char budget is
+        shared across all turns to avoid inflating the prompt on long sessions.
+        """
+        entries = self.history.get_last(max_turns)
+        if not entries:
+            return ""
+
+        per_turn_budget = max_chars // max(len(entries), 1)
+        lines = []
+        for e in entries:
+            q_short = e.query[:200]
+            a_budget = max(100, per_turn_budget - len(q_short) - 20)
+            a_short = e.response[:a_budget]
+            if len(e.response) > a_budget:
+                a_short += "..."
+            lines.append(f"User: {q_short}\nAssistant: {a_short}")
+
+        block = "\n\n".join(lines)
+        return block[:max_chars]
+
+    # Follow-up query patterns — short queries that need prior context to make sense
+    _FOLLOWUP_PATTERNS = [
+        "give me an example", "show me an example", "example code",
+        "example of that", "can you show", "can you give",
+        "more examples", "another example", "same for",
+        "now for", "and also", "what about", "how about",
+        "explain more", "elaborate", "tell me more", "go deeper",
+        "expand on that", "continue", "next step", "and then",
+        "how would i", "how do i do that", "how to do that",
+    ]
+
+    def _resolve_followup_query(self, query: str) -> str:
+        """Expand ambiguous follow-up queries with the previous conversation topic.
+
+        Example:
+            Previous Q: "what is react?"
+            Current Q:  "give me an example code"
+            Resolved:   "give me an example code [continuing from: what is react?]"
+        """
+        q_lower = query.lower().strip()
+        is_short = len(query.split()) <= 10
+        is_followup = any(p in q_lower for p in self._FOLLOWUP_PATTERNS)
+
+        if not (is_short and is_followup):
+            return query
+
+        entries = self.history.get_last(1)
+        if not entries:
+            return query
+
+        prev_query = entries[-1].query
+        if prev_query.lower().strip() == q_lower:
+            return query
+
+        topic = prev_query[:80] + ("..." if len(prev_query) > 80 else "")
+        resolved = f"{query} [continuing from: {topic}]"
+        logger.debug(f"Follow-up resolved: '{query}' -> '{resolved}'")
+        return resolved
+
     async def _refine_transcript(self, raw_text: str, provider) -> str:
+
         """Midnight Restoration: Uses Cloud-Speed models to fix ASR typos."""
         prompt = f"Fix common ASR typos in this text. Keep meaning exact. Output ONLY fixed text.\n\n{raw_text}"
         try:
@@ -319,19 +468,37 @@ class AIEngine(QObject):
         screen_context: str = "",
         audio_context: str = "",
     ) -> str:
-        """Fast path for hotkey-triggered context answers using cached context first."""
+        """
+        Fast path for hotkey-triggered context answers.
+        Now fully mode-aware: uses mode.quick_answer_query and mode.quick_answer_format.
+        """
         self._is_cancelled = False
         start_time = time.time()
-        mode_id = self.config.get("ai.mode", "general")
-        query = (
-            "Using the latest live context, give a quick answer. "
-            "First summarize the current audio briefly, then give the most useful immediate response in 2-4 bullets."
-        )
+
+        # Resolve Mode object for profile-aware behaviour
+        mode_obj = self._mode_manager.current if self._mode_manager else None
+        mode_id = mode_obj.name if mode_obj else self.config.get("ai.mode", "general")
+
+        # Use the mode's own quick-answer query — not a generic fallback
+        if mode_obj and hasattr(mode_obj, "quick_answer_query") and mode_obj.quick_answer_query:
+            query = mode_obj.quick_answer_query
+        else:
+            query = (
+                "Using the latest live context, give a quick answer. "
+                "First summarise the current audio briefly, then give the most useful "
+                "immediate response in 2-4 bullets."
+            )
+
+        # For quick answers, prefer the mode's own fast providers
+        if mode_obj and hasattr(mode_obj, "preferred_providers") and mode_obj.preferred_providers:
+            quick_preferred = mode_obj.preferred_providers
+        else:
+            quick_preferred = ["groq", "cerebras", "gemini", "together", "ollama"]
 
         provider, tier = self._select_provider(
-            mode_id,
+            mode_obj or mode_id,
             "simple",
-            ["groq", "cerebras", "gemini", "together", "ollama"],
+            quick_preferred,
         )
         if not provider:
             self.error_occurred.emit("No available AI provider found.")
@@ -341,13 +508,14 @@ class AIEngine(QObject):
         if len(summarized_audio.split()) > 40:
             summarized_audio = await self._summarize_audio_fast(summarized_audio)
 
-        sys_prompt = self.prompts.system(mode_id)
+        _mode_arg = mode_obj or mode_id
+        sys_prompt = self.prompts.system(_mode_arg)
         user_msg = self.prompts.user(
             query=query,
             screen=screen_context or nexus_snapshot.get("latest_ocr", ""),
             audio=summarized_audio,
             rag="",
-            mode=mode_id,
+            mode=_mode_arg,
             origin="quick",
             nexus=nexus_snapshot,
         )
@@ -377,11 +545,18 @@ class AIEngine(QObject):
             return ""
 
     async def _summarize_audio_fast(self, audio_text: str) -> str:
-        """Compress recent audio into a short summary using the fastest provider."""
+        """Compress recent audio into a short summary using the fastest available provider."""
+        # Use mode's preferred fast provider if available
+        mode_obj = self._mode_manager.current if self._mode_manager else None
+        fast_preferred = (
+            mode_obj.preferred_providers
+            if mode_obj and getattr(mode_obj, "preferred_providers", None)
+            else ["groq", "cerebras", "gemini", "together", "ollama"]
+        )
         provider, tier = self._select_provider(
-            "general",
+            mode_obj or "general",
             "simple",
-            ["groq", "cerebras", "gemini", "together", "ollama"],
+            fast_preferred,
         )
         if not provider:
             return audio_text
@@ -499,20 +674,90 @@ class AIEngine(QObject):
 
         raise Exception(str(last_error) if last_error else "Vision analysis failed.")
 
-    def _chunk_response(self, text: str, chunk_size: int = 20):
-        """Split response into chunks for streaming effect."""
-        words = text.split()
-        for i in range(0, len(words), chunk_size):
-            yield " ".join(words[i : i + chunk_size])
+    def _chunk_response(self, text: str, chunk_size: int = 3):
+        """
+        Yield text in small character-level chunks for streaming effect.
+        Default chunk_size=3 characters gives fluid perceived streaming.
+        """
+        for i in range(0, len(text), chunk_size):
+            yield text[i:i + chunk_size]
+
+    # ── Background RAG Prefetch ────────────────────────────────────────────────
+
+    @staticmethod
+    def _rag_prefetch_fingerprint(screen_text: str, audio_text: str) -> str:
+        """
+        Build a short fingerprint from current context to key the prefetch cache.
+        Uses the first 150 chars of screen + last 100 chars of audio.
+        """
+        screen_snippet = (screen_text or "")[:150].strip()
+        audio_snippet = (audio_text or "")[-100:].strip()
+        return f"{screen_snippet}||{audio_snippet}"
+
+    async def prefetch_rag(self, screen_text: str = "", audio_text: str = "") -> None:
+        """
+        Pre-fetch RAG context in the background before the user submits a query.
+        Called from app.py whenever screen or audio context meaningfully changes.
+        Results are stored in _rag_prefetch keyed by a context fingerprint.
+        When generate_response() runs, it checks this cache first (zero-latency hit).
+        """
+        if not self.rag:
+            return
+
+        # Build a representative query hint from available context
+        context_hint = " ".join([
+            (screen_text or "")[:200],
+            (audio_text or "")[-150:],
+        ]).strip()
+        if not context_hint or len(context_hint) < 10:
+            return
+
+        fingerprint = self._rag_prefetch_fingerprint(screen_text, audio_text)
+        now = time.time()
+
+        # Don’t re-prefetch if we have a fresh result for this context
+        existing = self._rag_prefetch.get(fingerprint)
+        if existing and now < existing[1]:
+            logger.debug("RAG Prefetch: already fresh, skipping")
+            return
+
+        # Debounce: only one prefetch at a time
+        if self._prefetch_lock.locked():
+            logger.debug("RAG Prefetch: lock busy, skipping this cycle")
+            return
+
+        async with self._prefetch_lock:
+            try:
+                results = await self.rag.query(context_hint)
+                if results:
+                    context_str = "\n".join(results)
+                    self._rag_prefetch[fingerprint] = (context_str, now + self._prefetch_ttl)
+                    # Also seed the regular cache with a likely query key
+                    cache_key = context_hint.lower()[:100]
+                    self._rag_cache[cache_key] = (context_str, now + self._cache_ttl)
+                    logger.debug(f"RAG Prefetch: stored ({len(results)} results)")
+            except Exception as e:
+                logger.debug(f"RAG Prefetch error (non-fatal): {e}")
+
+    def clear_rag_prefetch(self) -> None:
+        """Clear prefetch cache on session end to avoid stale context bleed."""
+        self._rag_prefetch.clear()
 
     def _analyze_query_complexity(self, query: str) -> str:
         """Analyze query complexity to route to appropriate provider/model.
 
         Returns: 'simple', 'moderate', 'complex', or 'reasoning'
-        """
-        import re
 
-        lower = query.lower()
+        Results are cached on the first 80 chars of the lowercased query so
+        repeated or near-duplicate queries skip all regex work entirely.
+        """
+        key = query.lower().strip()[:80]
+        return self._complexity_cached(key)
+
+    @lru_cache(maxsize=256)
+    def _complexity_cached(self, query_key: str) -> str:
+        """LRU-cached inner implementation. Called with the normalised key."""
+        lower = query_key
 
         # Check for reasoning patterns first (highest priority)
         for pattern in self._reasoning_patterns:
@@ -530,12 +775,10 @@ class AIEngine(QObject):
             if re.match(pattern, lower):
                 complexity_score -= 1
 
-        # Length factor
-        word_count = len(query.split())
-        if word_count > 50:
+        # Length factor (approximate from key, which is capped at 80 chars)
+        word_count = len(lower.split())
+        if word_count > 12:    # ~50 words full query maps to ~12 in 80-char key
             complexity_score += 1
-        elif word_count > 100:
-            complexity_score += 2
 
         if complexity_score >= 3:
             return "complex"
@@ -543,14 +786,51 @@ class AIEngine(QObject):
             return "moderate"
         return "simple"
 
-    def _preferred_providers_for_complexity(self, complexity: str, mode_id: str = "general") -> List[str]:
-        """Return provider preferences without bypassing the router."""
-        mode_id = (mode_id or "general").lower()
-        if mode_id in {"general", "meeting"}:
+    def _preferred_providers_for_complexity(self, complexity: str, mode=None) -> List[str]:
+        """
+        Return provider preferences without bypassing the router.
+        Now reads mode.preferred_providers from the Mode object when available.
+
+        OFFLINE-FIRST: When offline_first is enabled in config and the query is
+        simple+general, Ollama is moved to the front so trivial queries don't
+        burn cloud API rate-limits and avoid internet round-trip.
+        """
+        # Resolve mode name for fallback path
+        mode_name = (
+            mode.name if hasattr(mode, "name") else str(mode or "general")
+        ).lower()
+
+        # Offline-first fast-path: simple general query → prefer local Ollama
+        offline_first = self.config.get("ai.offline_first", False)
+        ollama_ready = (
+            "ollama" in self._providers
+            and getattr(self._providers.get("ollama"), "enabled", False)
+        )
+        if (
+            offline_first
+            and ollama_ready
+            and complexity == "simple"
+            and mode_name in {"general", "meeting"}
+        ):
+            logger.debug("Provider: offline-first routing simple query to Ollama")
+            return ["ollama"] + [p for p in self._provider_priority if p != "ollama"]
+
+        # If we have a Mode object with explicit provider preferences, honour them
+        if mode and hasattr(mode, "preferred_providers") and mode.preferred_providers:
+            base = list(mode.preferred_providers)
+            # For complex/reasoning queries, ensure quality providers are ahead
+            if complexity in {"complex", "reasoning"}:
+                quality_first = [p for p in ["gemini", "together", "sambanova"] if p in base]
+                rest = [p for p in base if p not in quality_first]
+                return quality_first + rest
+            return base
+
+        # Fallback: string-based mode heuristics (backward compat)
+        if mode_name in {"general", "meeting"}:
             if complexity in {"simple", "moderate"}:
                 return ["groq", "cerebras", "together", "gemini", "ollama"]
             return ["groq", "cerebras", "gemini", "together", "ollama"]
-        if mode_id == "interview":
+        if mode_name == "interview":
             if complexity in {"simple", "moderate"}:
                 return ["groq", "cerebras", "gemini", "together", "ollama"]
             return ["gemini", "groq", "cerebras", "together", "ollama"]
@@ -564,17 +844,30 @@ class AIEngine(QObject):
             return ["gemini", "groq", "cerebras", "together", "ollama"]
         return list(self._provider_priority)
 
-    def _select_provider(self, mode_id: str, complexity: str, preferred: List[str]):
-        """Select a provider through the router when available, otherwise use ranked fallback."""
+    def _select_provider(self, mode, complexity: str, preferred: List[str]):
+        """
+        Select a provider through the router when available, otherwise use ranked fallback.
+        Accepts a Mode object or a string mode name.
+        When a Mode object is given, its preferred_tier is passed to the router.
+        """
         prefer_speed = complexity in {"simple", "moderate"}
         prefer_quality = complexity in {"complex", "reasoning"}
 
+        # Resolve tier hint from Mode profile
+        if mode and hasattr(mode, "preferred_tier") and mode.preferred_tier:
+            tier_hint = mode.preferred_tier
+        else:
+            tier_hint = None
+
+        mode_name = mode.name if hasattr(mode, "name") else str(mode or "general")
+
         if self._router:
             provider, tier = self._router.select(
-                task=mode_id,
+                task=mode_name,
                 prefer_speed=prefer_speed,
                 prefer_quality=prefer_quality,
                 preferred=preferred,
+                tier=tier_hint,
             )
             if provider:
                 return provider, tier
@@ -582,12 +875,12 @@ class AIEngine(QObject):
         for provider_id in preferred:
             provider = self._providers.get(provider_id)
             if provider and getattr(provider, "enabled", False):
-                tier = self._router._tier_for_task(mode_id) if self._router else "balanced"
+                tier = self._router._tier_for_task(mode_name) if self._router else "balanced"
                 return provider, tier
 
         provider = self._providers.get(self._active_provider_id)
         if provider and getattr(provider, "enabled", False):
-            return provider, "balanced"
+            return provider, tier_hint or "balanced"
         return None, ""
 
     async def poll_provider_health_loop(self):

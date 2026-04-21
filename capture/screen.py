@@ -44,9 +44,15 @@ class ScreenCapture(QObject):
         self._crop_misses = 0
 
     def initialize(self):
-        """Standardized warm-up hook called by the controller."""
+        """Standardized warm-up hook called by the controller.
+
+        OCR engine is lazy-loaded on the first extract() call via _ensure_loaded().
+        We do NOT force-load it here so startup is non-blocking.
+        The deferred warmup thread calls this to pre-load OCR in the background.
+        """
         self.ocr._ensure_loaded()
         logger.info("  ✅ Screen capture pipeline ready")
+
 
     async def capture(self) -> Optional[str]:
         """Periodic capture — respects debounce interval and Smart Crop."""

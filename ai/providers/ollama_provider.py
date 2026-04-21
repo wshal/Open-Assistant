@@ -125,7 +125,8 @@ class OllamaProvider(BaseProvider):
                 self._resolved_model = target
                 self._state = self.STATE_READY
                 self.enabled = True
-                logger.info(f"  Ollama ready (model: {target})")
+                logger.debug(f"  Ollama ready (model: {target})")
+
                 return True
 
             self._state = self.STATE_MISSING

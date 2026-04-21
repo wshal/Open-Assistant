@@ -149,6 +149,7 @@ class StandbyView(QWidget):
         self.audio_btns = {}
         self._boot_sync_scheduled = False
         self._boot_sync_logged = False
+        self._warmup_done = False  # Latch: once True, no signal can revert READY state
 
         self._init_ui()
         self._connect_state()
@@ -445,10 +446,24 @@ class StandbyView(QWidget):
             btn.setStyleSheet(self.STYLE_ACTIVE if active else self.STYLE_INACTIVE)
 
     def set_warmup_status(self, message: str, progress: int = 0, ready: bool = False):
+        """Update warmup progress bar and start button state.
+
+        Once ready=True fires the latch closes: subsequent calls with ready=False
+        are ignored so deferred background tasks (Whisper, EasyOCR) completing
+        AFTER the READY signal cannot revert the 'SESSION READY' button.
+        """
+        if self._warmup_done and not ready:
+            # Background task completed after READY — just log, don't touch the UI
+            logger.debug(f"Post-READY warmup signal ignored: {message}")
+            return
+
         self.subtitle.setText(message.upper())
         self.progress_bar.setValue(progress)
         self.start_btn.setEnabled(ready)
         if ready:
+            self._warmup_done = True
+            self.subtitle.setText("ALL SYSTEMS ONLINE")
+            self.progress_bar.setValue(100)
             self.start_btn.setText("SESSION READY")
             self.start_btn.setStyleSheet(self.START_BUTTON_READY_STYLE)
         else:

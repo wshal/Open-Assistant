@@ -84,6 +84,11 @@ class OverlayStub:
         self.standby_view = "standby"
         self.visible = True
         self.opacity = 1.0
+        # Internal state fields accessed directly by start_new_session / end_session
+        self._current_query = ""
+        self._raw_buffer = ""
+        self._is_streaming = False
+        self.response_area = SimpleNamespace(clear=lambda: None)
 
     def _set_index(self, index):
         self.indices.append(index)
@@ -91,7 +96,7 @@ class OverlayStub:
     def update_mode(self, mode):
         self.mode_updates.append(mode)
 
-    def update_transcript(self, text):
+    def update_transcript(self, text, state="auto"):
         self.transcript_updates.append(text)
 
     def on_complete(self, text, query=None):
@@ -230,6 +235,36 @@ class StateStub:
             self._config.set("capture.audio.mode", value)
 
 
+class ModeManagerStub:
+    """Minimal stub for ModeManager — supports switch() and profile access."""
+    def __init__(self):
+        self._current_name = "general"
+
+    def switch(self, name):
+        self._current_name = name
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            name=name,
+            detector_sensitivity=0.5,
+            ollama_model_hint="llama3",
+            vad_silence_ms=900,
+        )
+
+    @property
+    def current(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            name=self._current_name,
+            detector_sensitivity=0.5,
+            ollama_model_hint="llama3",
+            vad_silence_ms=900,
+        )
+
+    @property
+    def current_name(self):
+        return self._current_name
+
+
 class OpenAssistAppSessionFlowTests(unittest.TestCase):
     def _build_app(self, mini_mode=False):
         app = SimpleNamespace(
@@ -246,10 +281,14 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             _screen_analysis_pending=False,
             _click_through=False,
             loop=object(),
+            modes=ModeManagerStub(),
             ai=SimpleNamespace(
                 _providers={"groq": SimpleNamespace(enabled=True)},
                 cancel=lambda: None,
                 _rag_cache={},
+                detector=SimpleNamespace(
+                    set_mode=lambda m: None,
+                ),
             ),
             rag=SimpleNamespace(_cache={}, stop=lambda: None),
             nexus=SimpleNamespace(clear=lambda: None),
