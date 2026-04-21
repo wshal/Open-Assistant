@@ -147,6 +147,8 @@ class StandbyView(QWidget):
         self.provider_status_widgets = {}
         self.mode_buttons = {}
         self.audio_btns = {}
+        self._boot_sync_scheduled = False
+        self._boot_sync_logged = False
 
         self._init_ui()
         self._connect_state()
@@ -455,7 +457,9 @@ class StandbyView(QWidget):
     def _apply_initial_highlights(self):
         """Hardened boot sync with forced defaults."""
         mode, audio = self._resolve_initial_selection()
-        logger.info("BOOT SYNC: Mode='%s', Audio='%s'", mode, audio)
+        if not self._boot_sync_logged:
+            logger.info("Boot sync: mode='%s', audio='%s'", mode, audio)
+            self._boot_sync_logged = True
         self.set_current_mode(mode)
         self.set_current_audio_source(audio)
 
@@ -484,5 +488,8 @@ class StandbyView(QWidget):
         return mode or "general", audio or "system"
 
     def _schedule_boot_sync(self):
+        if self._boot_sync_scheduled:
+            return
+        self._boot_sync_scheduled = True
         for delay_ms in (100, 500, 1500):
             QTimer.singleShot(delay_ms, self._apply_initial_highlights)

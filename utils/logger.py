@@ -90,6 +90,8 @@ def _setup_root_logger(level: int):
         "httpx",
         "httpcore",
         "aiohttp",
+        "huggingface_hub",
+        "transformers",
         "chromadb",
         "onnxruntime",
         "sentence_transformers",

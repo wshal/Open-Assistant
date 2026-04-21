@@ -7,8 +7,11 @@ cheating/
 
 # Application Data & Secrets
 config.yaml
+data/settings.enc
+data/history.enc
 data/history/
 data/vectordb/
+data/__pycache__/
 logs/
 
 # Python Environment

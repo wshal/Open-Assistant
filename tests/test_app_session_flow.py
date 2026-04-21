@@ -518,7 +518,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(cleared, [True])
         self.assertEqual(shown, [True])
 
-    def test_toggle_overlay_cycles_show_click_through_hide(self):
+    def test_toggle_overlay_hides_and_shows_without_click_through(self):
         app = self._build_app()
         toggles = []
 
@@ -529,15 +529,16 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         app.toggle_click_through = fake_toggle_click_through
 
         OpenAssistApp.toggle_overlay(app)
-        self.assertEqual(toggles, [True])
-        self.assertTrue(app.overlay.visible)
-
-        OpenAssistApp.toggle_overlay(app)
+        self.assertEqual(toggles, [])
         self.assertFalse(app.overlay.visible)
 
         OpenAssistApp.toggle_overlay(app)
-        self.assertEqual(toggles, [True, False])
+        self.assertEqual(toggles, [])
         self.assertTrue(app.overlay.visible)
+
+        OpenAssistApp.toggle_overlay(app)
+        self.assertEqual(toggles, [])
+        self.assertFalse(app.overlay.visible)
 
     def test_show_onboarding_after_reset_restarts_runtime_services(self):
         app = self._build_app()

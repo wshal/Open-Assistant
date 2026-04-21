@@ -20,6 +20,8 @@ class HotkeySignals(QObject):
 class NativeHotkeyThread(threading.Thread):
     """Windows-specific RegisterHotKey polling thread."""
 
+    MOD_NOREPEAT = 0x4000
+
     def __init__(self, manager):
         super().__init__(name="NativeHotkeyThread", daemon=True)
         self.manager = manager
@@ -41,6 +43,8 @@ class NativeHotkeyThread(threading.Thread):
             if action.startswith("move_") or action.startswith("scroll_"):
                 continue
             mods, vk = self.manager._parse_key_native(key_str)
+            if action == "toggle":
+                mods |= self.MOD_NOREPEAT
             if vk:
                 if user32.RegisterHotKey(None, current_id, mods, vk):
                     self.manager._id_to_action[current_id] = action

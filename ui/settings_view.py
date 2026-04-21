@@ -4,7 +4,7 @@ RESTORATION: Hotkey Configuration Tab & SVG Tick Icons.
 FIXED: Checkbox tick visibility with URL-encoded SVG (Safe Mode).
 """
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 import os
 from PyQt6.QtWidgets import (
     QWidget,
@@ -23,6 +23,8 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QMessageBox,
 )
+from PyQt6.QtGui import QDesktopServices
+from core.constants import PROVIDERS
 from ui.custom_widgets import PremiumCheckBox
 from utils.logger import setup_logger
 
@@ -340,6 +342,7 @@ class SettingsView(QWidget):
             ("ollama", "🏠 Local Ollama"),
         ]
         for pid, name in providers:
+            provider_meta = PROVIDERS.get(pid, {})
             box = QFrame()
             box.setStyleSheet(
                 "background: rgba(255,255,255,0.02); border-radius: 10px; padding: 10px; border: 1px solid rgba(255,255,255,0.03);"
@@ -373,7 +376,37 @@ class SettingsView(QWidget):
             tbtn.clicked.connect(lambda _, p=pid: self._test_pid(p))
             top.addWidget(tbtn)
             bl.addLayout(top)
-            
+
+            link_text = "Install Ollama" if pid == "ollama" else "Get API key"
+            link = QLabel(f'<a href="{provider_meta.get("url", "")}">{link_text}</a>')
+            link.setOpenExternalLinks(False)
+            link.linkActivated.connect(
+                lambda url, _pid=pid: QDesktopServices.openUrl(QUrl(url))
+            )
+            link.setToolTip(
+                f"Open {provider_meta.get('name', name)} to "
+                f"{'install the local engine' if pid == 'ollama' else 'create or copy an API key'}."
+            )
+            link.setStyleSheet(
+                """
+                QLabel {
+                    color: #bae6fd;
+                    font-size: 10px;
+                    font-weight: 700;
+                    background: rgba(56, 189, 248, 0.12);
+                    border: 1px solid rgba(56, 189, 248, 0.28);
+                    border-radius: 10px;
+                    padding: 4px 10px;
+                    margin: 0 0 4px 0;
+                }
+                QLabel:hover {
+                    background: rgba(56, 189, 248, 0.18);
+                    border: 1px solid rgba(125, 211, 252, 0.5);
+                }
+                """
+            )
+            bl.addWidget(link)
+             
             # Local providers like Ollama don't need API keys
             if pid != "ollama":
                 inp = QLineEdit()
@@ -428,6 +461,13 @@ class SettingsView(QWidget):
         l = QVBoxLayout(c)
         l.setContentsMargins(15, 15, 15, 15)
         l.setSpacing(2)
+
+        hint = QLabel("`Ctrl+\\` hides or shows the HUD once per press. `Ctrl+M` controls click-through.")
+        hint.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; border: none; background: transparent;"
+        )
+        l.addWidget(hint)
+
         hdr = QHBoxLayout()
         hdr.setContentsMargins(10, 0, 10, 5)
         h1 = QLabel("COMMAND")
@@ -442,7 +482,7 @@ class SettingsView(QWidget):
         hdr.addWidget(h2, 1)
         l.addLayout(hdr)
         hk_labels = {
-            "toggle": "Toggle Main HUD",
+            "toggle": "Show/Hide HUD (Single Press)",
             "quick_answer": "Quick Context Answer",
             "analyze_screen": "Analyze Current Screen",
             "history_prev": "Previous History Entry",

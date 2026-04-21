@@ -46,6 +46,7 @@ class AudioCapture(QObject):
         self._model_loaded = False
         self._model_lock = threading.Lock()
         self._current_rms = 0.0
+        self._last_transcription_metrics = {}
 
         self._active_streams = []
         self._lock = threading.RLock()
@@ -311,6 +312,7 @@ class AudioCapture(QObject):
         speech_buffer = []
         is_speaking = False
         silence_count = 0
+        speech_started_at = None
         while self._running:
             try:
                 data = self.q.get(timeout=0.5)
@@ -325,18 +327,22 @@ class AudioCapture(QObject):
                 speech_buffer.append(data)
             if has_speech:
                 silence_count = 0
+                if not is_speaking:
+                    speech_started_at = time.time()
                 is_speaking = True
             elif is_speaking:
                 silence_count += 1
                 if silence_count >= self.silence_blocks:
-                    self._transcribe(speech_buffer)
+                    self._transcribe(speech_buffer, speech_started_at=speech_started_at)
                     speech_buffer = []
                     is_speaking = False
+                    speech_started_at = None
 
-    def _transcribe(self, buffer):
+    def _transcribe(self, buffer, speech_started_at=None):
         self._ensure_whisper_loaded()
         if not self.model or len(buffer) < 5:
             return
+        transcribe_started_at = time.time()
         try:
             audio = np.concatenate(buffer, axis=0).flatten()
             segments, _ = self.model.transcribe(audio, language="en")
@@ -345,6 +351,21 @@ class AudioCapture(QObject):
             )
             if text.strip():
                 cleaned = text.strip()
+                transcribe_finished_at = time.time()
+                audio_duration_ms = (len(audio) / float(self.sr)) * 1000.0 if self.sr else 0.0
+                self._last_transcription_metrics = {
+                    "speech_started_at": speech_started_at,
+                    "transcribe_started_at": transcribe_started_at,
+                    "transcribe_finished_at": transcribe_finished_at,
+                    "speech_to_transcript_ms": (
+                        (transcribe_finished_at - speech_started_at) * 1000.0
+                        if speech_started_at
+                        else None
+                    ),
+                    "transcribe_only_ms": (transcribe_finished_at - transcribe_started_at) * 1000.0,
+                    "audio_duration_ms": audio_duration_ms,
+                    "text_length": len(cleaned),
+                }
                 self.transcripts.append(cleaned)
                 self.transcription_ready.emit(cleaned)
         except Exception as e:
@@ -355,6 +376,9 @@ class AudioCapture(QObject):
 
     def get_transcript(self):
         return " ".join(self.transcripts)
+
+    def get_last_transcription_metrics(self):
+        return dict(self._last_transcription_metrics)
 
     def clear(self):
         self.transcripts.clear()

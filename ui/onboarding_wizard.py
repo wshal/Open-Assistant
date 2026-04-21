@@ -19,7 +19,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from ui.custom_widgets import PremiumCheckBox
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QDesktopServices
+from PyQt6.QtCore import QUrl
+from core.constants import PROVIDERS
 
 STYLE_CARD = """
     QFrame {
@@ -390,6 +392,33 @@ class OnboardingWizard(QWidget):
         
         self.content_layout.addSpacing(4)
 
+        self.provider_link = QLabel()
+        self.provider_link.setOpenExternalLinks(False)
+        self.provider_link.linkActivated.connect(
+            lambda url: QDesktopServices.openUrl(QUrl(url))
+        )
+        self.provider_link.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.provider_link.setStyleSheet(
+            """
+            QLabel {
+                color: #bae6fd;
+                font-size: 10px;
+                font-weight: 700;
+                background: rgba(56, 189, 248, 0.12);
+                border: 1px solid rgba(56, 189, 248, 0.28);
+                border-radius: 10px;
+                padding: 4px 10px;
+            }
+            QLabel:hover {
+                background: rgba(56, 189, 248, 0.18);
+                border: 1px solid rgba(125, 211, 252, 0.5);
+            }
+            """
+        )
+        self.content_layout.addWidget(self.provider_link)
+
+        self.content_layout.addSpacing(4)
+
         self.api_key_input = QLineEdit()
         self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key_input.setPlaceholderText("Enter your API key...")
@@ -405,6 +434,7 @@ class OnboardingWizard(QWidget):
         is_ollama = (current_p == "ollama")
         self.lbl_key.setVisible(not is_ollama)
         self.api_key_input.setVisible(not is_ollama)
+        self._refresh_provider_link(current_p)
 
         self.content_layout.addSpacing(10)
 
@@ -684,6 +714,22 @@ class OnboardingWizard(QWidget):
         is_ollama = (p == "ollama")
         self.lbl_key.setVisible(not is_ollama)
         self.api_key_input.setVisible(not is_ollama)
+        self._refresh_provider_link(p)
+
+    def _refresh_provider_link(self, provider_id: str):
+        provider_meta = PROVIDERS.get(provider_id, {})
+        url = provider_meta.get("url", "")
+        if not url:
+            self.provider_link.clear()
+            self.provider_link.setToolTip("")
+            return
+
+        link_text = "Install Ollama" if provider_id == "ollama" else "Get API key"
+        self.provider_link.setText(f'<a href="{url}">{link_text}</a>')
+        self.provider_link.setToolTip(
+            f"Open {provider_meta.get('name', provider_id)} to "
+            f"{'install the local engine' if provider_id == 'ollama' else 'create or copy an API key'}."
+        )
 
     def _update_summary(self):
         """Refresh summary labels from in-memory wizard_state with safety guards."""

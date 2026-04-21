@@ -65,6 +65,7 @@ class OpenAssistApp(QObject):
         self._click_through = False
         self._generation_epoch = 0
         self._screen_analysis_pending = False
+        self._pending_request_metadata = None
 
         # Async Loop
         self.loop = asyncio.new_event_loop()
@@ -133,6 +134,28 @@ class OpenAssistApp(QObject):
             entry = entries[-1]
             latency_ms = getattr(entry, "latency", 0)
             provider = getattr(entry, "provider", None)
+            metadata = getattr(entry, "metadata", {}) or {}
+            stage_timings = metadata.get("stage_timings", {})
+            req_meta = metadata.get("request_metadata", {})
+            if stage_timings:
+                summary_parts = []
+                speech_to_transcript = req_meta.get("speech_to_transcript_ms")
+                if speech_to_transcript is not None:
+                    summary_parts.append(
+                        f"speech->transcript={speech_to_transcript:.0f}ms"
+                    )
+                request_to_first = stage_timings.get("request_to_first_token_ms")
+                if request_to_first is not None:
+                    summary_parts.append(
+                        f"request->first_token={request_to_first:.0f}ms"
+                    )
+                request_to_complete = stage_timings.get("request_to_complete_ms")
+                if request_to_complete is not None:
+                    summary_parts.append(
+                        f"request->complete={request_to_complete:.0f}ms"
+                    )
+                if summary_parts:
+                    logger.info("Latency summary | %s", " | ".join(summary_parts))
 
         # Get available providers
         available = []
@@ -385,13 +408,17 @@ class OpenAssistApp(QObject):
         # Start timing for instrumentation
         self._current_request_start = time.time()
         self._stage_timings = {"start": self._current_request_start}
+        request_metadata = dict(self._pending_request_metadata or {})
+        request_metadata.setdefault("request_started_at", self._current_request_start)
+        request_metadata.setdefault("origin", s)
+        self._pending_request_metadata = None
         request_epoch = self._generation_epoch
 
         asyncio.run_coroutine_threadsafe(
-            self._process_ai(q, s, c, request_epoch), self.loop
+            self._process_ai(q, s, c, request_epoch, request_metadata), self.loop
         )
 
-    async def _process_ai(self, q, s, c, request_epoch):
+    async def _process_ai(self, q, s, c, request_epoch, request_metadata):
         if request_epoch != self._generation_epoch:
             return
         async with self._ai_lock:
@@ -416,6 +443,7 @@ class OpenAssistApp(QObject):
                 screen_context=sc,
                 audio_context=au,
                 origin=s,
+                request_metadata=request_metadata,
             )
 
     def toggle_overlay(self):
@@ -427,11 +455,6 @@ class OpenAssistApp(QObject):
             v.raise_()
             v.activateWindow()
             logger.debug("👁️ HUD Shown via toggle.")
-            return
-
-        if not self._click_through:
-            self.toggle_click_through()
-            logger.debug("🖱️ HUD switched to click-through mode.")
             return
 
         v.hide()
@@ -803,6 +826,21 @@ class OpenAssistApp(QObject):
             return
         self.nexus.push("audio", t)
         self.overlay.update_transcript(t)
+        transcription_metrics = self.audio.get_last_transcription_metrics()
+        if transcription_metrics:
+            speech_to_transcript_ms = transcription_metrics.get("speech_to_transcript_ms")
+            transcribe_only_ms = transcription_metrics.get("transcribe_only_ms")
+            if speech_to_transcript_ms is not None:
+                logger.info(
+                    "Latency audio->transcript | speech->transcript=%.0fms | transcribe=%.0fms | audio=%.0fms",
+                    speech_to_transcript_ms,
+                    transcribe_only_ms or 0.0,
+                    transcription_metrics.get("audio_duration_ms") or 0.0,
+                )
+            self._pending_request_metadata = {
+                **transcription_metrics,
+                "transcript_received_at": time.time(),
+            }
         q = self.ai.detector.detect(t)
         if q:
             self.generate_response(q, "speech", {"audio": t})

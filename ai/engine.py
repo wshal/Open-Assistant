@@ -131,6 +131,7 @@ class AIEngine(QObject):
         screen_context: Optional[str] = None,
         audio_context: Optional[str] = None,
         origin: Optional[str] = None,
+        request_metadata: Optional[Dict[str, Any]] = None,
     ):
         """
         RESTORED: Main async generation task.
@@ -140,6 +141,9 @@ class AIEngine(QObject):
         start_time = time.time()
         stage_timings = {}
         first_token_time = None
+        request_metadata = dict(request_metadata or {})
+        request_started_at = request_metadata.get("request_started_at", start_time)
+        stage_timings["request_to_ai_start_ms"] = (start_time - request_started_at) * 1000
 
         mode_id = self.config.get("ai.mode", "general")
 
@@ -178,6 +182,13 @@ class AIEngine(QObject):
                     provider="parallel",
                     mode=mode_id,
                     latency=latency_ms,
+                    metadata={
+                        "stage_timings": {
+                            **stage_timings,
+                            "request_to_complete_ms": (time.time() - request_started_at) * 1000,
+                        },
+                        "request_metadata": request_metadata,
+                    },
                 )
                 # Parallel mode returns a fully-materialized answer, so emit only completion.
                 # Streaming chunks after completion duplicates content in the UI layer.
@@ -256,6 +267,9 @@ class AIEngine(QObject):
                 if not first_token_time:
                     first_token_time = time.time()
                     stage_timings["first_token_ms"] = (first_token_time - start_time) * 1000
+                    stage_timings["request_to_first_token_ms"] = (
+                        first_token_time - request_started_at
+                    ) * 1000
                 self.response_chunk.emit(chunk)
 
             # 5. Finalize
@@ -267,7 +281,13 @@ class AIEngine(QObject):
                     provider=provider.name,
                     mode=mode_id,
                     latency=latency_ms,
-                    metadata={"stage_timings": stage_timings}
+                    metadata={
+                        "stage_timings": {
+                            **stage_timings,
+                            "request_to_complete_ms": (time.time() - request_started_at) * 1000,
+                        },
+                        "request_metadata": request_metadata,
+                    }
                 )
                 self.response_complete.emit(full_response)
                 logger.info(f"AI: Response complete ({latency_ms:.0f}ms) | {stage_timings}")

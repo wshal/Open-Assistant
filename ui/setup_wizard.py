@@ -607,7 +607,7 @@ class SetupWizard(QDialog):
 
         hotkeys = QLabel(
             "â¨ï¸ Hotkeys:\n"
-            "Ctrl+\\           â Toggle / pass-through / hide\n"
+            "Ctrl+\\           â Show / hide HUD\n"
             "Ctrl+Enter       â Analyze current screen\n"
             "Ctrl+Shift+M     â Switch mode\n"
             "Ctrl+Arrow       â Glide overlay\n"

@@ -13,7 +13,7 @@ from ai.engine import AIEngine
 from capture.audio import AudioCapture
 from capture.screen import ScreenCapture
 from core.config import Config
-from core.hotkeys import HotkeyManager
+from core.hotkeys import HotkeyManager, NativeHotkeyThread
 from core.state import AppState
 from utils.platform_utils import WindowUtils
 
@@ -400,6 +400,47 @@ class HotkeyMatchingTests(unittest.TestCase):
 
         self.assertFalse(HotkeyManager._is_exact_hotkey_match(manager, move_req))
         self.assertTrue(HotkeyManager._is_exact_hotkey_match(manager, scroll_req))
+
+    def test_toggle_hotkey_native_registration_uses_no_repeat(self):
+        manager = HotkeyManager.__new__(HotkeyManager)
+        manager.config = ConfigStub({"hotkeys": {"toggle": "ctrl+\\"}})
+        manager._id_to_action = {}
+
+        class FakeUser32:
+            def __init__(self):
+                self.register_calls = []
+
+            @staticmethod
+            def UnregisterHotKey(hwnd, hotkey_id):
+                return 1
+
+            def RegisterHotKey(self, hwnd, hotkey_id, mods, vk):
+                self.register_calls.append((hotkey_id, mods, vk))
+                return 1
+
+            @staticmethod
+            def GetMessageW(msg, hwnd, min_filter, max_filter):
+                return 0
+
+            @staticmethod
+            def TranslateMessage(msg):
+                return 1
+
+            @staticmethod
+            def DispatchMessageW(msg):
+                return 1
+
+        fake_user32 = FakeUser32()
+        fake_kernel32 = Mock(GetCurrentThreadId=Mock(return_value=321))
+        thread = NativeHotkeyThread(manager)
+
+        with patch("ctypes.windll", Mock(user32=fake_user32, kernel32=fake_kernel32), create=True):
+            thread.run()
+
+        self.assertEqual(len(fake_user32.register_calls), 1)
+        _, mods, vk = fake_user32.register_calls[0]
+        self.assertEqual(vk, 0xDC)
+        self.assertTrue(mods & NativeHotkeyThread.MOD_NOREPEAT)
 
 
 class ScreenCaptureContextTests(unittest.TestCase):

@@ -16,6 +16,24 @@ from utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
+def _is_expected_offline_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    markers = [
+        "winerror 10013",
+        "forbidden by its access permissions",
+        "client has been closed",
+        "cannot send a request",
+        "connection",
+        "timeout",
+        "name resolution",
+        "proxy",
+        "network",
+        "offline",
+        "huggingface.co",
+    ]
+    return any(marker in text for marker in markers)
+
+
 class RAGEngine:
     def __init__(self, config):
         self.config = config
@@ -82,16 +100,22 @@ class RAGEngine:
                     self._embed_fn = lambda texts: [
                         e.tolist() for e in emb.embed(texts)
                     ]
-                except:
-                    from sentence_transformers import SentenceTransformer
-
-                    model = SentenceTransformer("all-MiniLM-L6-v2")
-                    self._embed_fn = lambda texts: model.encode(texts).tolist()
+                except Exception as embed_error:
+                    if _is_expected_offline_error(embed_error):
+                        raise RuntimeError(
+                            "embedding model unavailable during startup; RAG warmup skipped"
+                        ) from embed_error
+                    raise RuntimeError(
+                        "fastembed is unavailable; install local embedding support to enable RAG"
+                    ) from embed_error
 
                 self._loaded = True
                 logger.info(f"✅ RAG Ready ({self.collection.count()} chunks)")
             except Exception as e:
-                logger.error(f"RAG Load Failure: {e}")
+                if _is_expected_offline_error(e):
+                    logger.warning(f"RAG warmup skipped: {e}")
+                else:
+                    logger.warning(f"RAG warmup skipped: {e}")
                 self.enabled = False
             finally:
                 self._loading = False
