@@ -25,7 +25,7 @@ class ModeManager:
             except Exception as e:
                 logger.warning(f"Could not load mode {cls.__name__}: {e}")
 
-        default = config.get("modes.default", "general")
+        default = config.get("ai.mode", "general")
         self._current_name = default if default in self._modes else next(iter(self._modes), "general")
         logger.info(f"Modes loaded: {list(self._modes)} | active: {self._current_name}")
 

@@ -3,14 +3,18 @@ Compact floating mini-overlay — v4.1 (Cleaned & Hardened).
 FIXED: Mode icon resolution and AI response bridging.
 """
 
-import pyperclip
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QLineEdit, QFrame, QApplication, 
-    QScrollArea, QTextEdit
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QLineEdit,
+    QFrame,
+    QTextEdit,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QTimer
-from PyQt6.QtGui import QFont
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -26,23 +30,58 @@ class MiniOverlay(QMainWindow):
         self._response = ""
         self._raw_buffer = ""
         self._drag = False
-        self._drag_pos = QPoint()
         self._expanded = False
+
+        # NEURAL UX: Gaze-based transparency
+        self._gaze_timer = QTimer(self)
+        self._gaze_timer.timeout.connect(self._check_gaze)
+        self._gaze_timer.start(100)
+
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(200)
+        self._render_timer.timeout.connect(self._render_markdown_now)
+
         self._build()
+        self._connect_state()
+
+    def _connect_state(self):
+        self.app.state.muted_changed.connect(self.update_audio_state)
+        self.app.state.mode_changed.connect(self.update_mode)
+        self.app.state.hud_mode_changed.connect(self._on_hud_mode_changed)
+
+    def _on_hud_mode_changed(self, is_mini):
+        if is_mini:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        else:
+            self.hide()
 
     def _build(self):
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowOpacity(0.95)
         self.setFixedWidth(280)
         self.setFixedHeight(48)
 
-        c = QWidget(); self.setCentralWidget(c)
-        self.ml = QVBoxLayout(c); self.ml.setContentsMargins(0, 0, 0, 0); self.ml.setSpacing(4)
+        c = QWidget()
+        self.setCentralWidget(c)
+        self.ml = QVBoxLayout(c)
+        self.ml.setContentsMargins(0, 0, 0, 0)
+        self.ml.setSpacing(4)
 
         self.bar = QFrame()
-        self.bar.setStyleSheet("background: rgba(20,20,35,250); border: 1px solid rgba(80,80,150,80); border-radius: 24px;")
-        bl = QHBoxLayout(self.bar); bl.setContentsMargins(12, 6, 12, 6); bl.setSpacing(6)
+        self.bar.setStyleSheet(
+            "background: rgba(20,20,35,250); border: 1px solid rgba(80,80,150,80); border-radius: 24px;"
+        )
+        bl = QHBoxLayout(self.bar)
+        bl.setContentsMargins(12, 6, 12, 6)
+        bl.setSpacing(6)
 
         self.mode_icon = QLabel("🧠")
         self.mode_icon.setStyleSheet("font-size: 15px;")
@@ -51,27 +90,44 @@ class MiniOverlay(QMainWindow):
         self.input = QLineEdit()
         self.input.setPlaceholderText("Ask anything...")
         self.input.returnPressed.connect(self._send)
-        self.input.setStyleSheet("background: transparent; color: #c0c0dd; border: none; font-size: 12px; padding: 2px;")
+        self.input.setStyleSheet(
+            "background: transparent; color: #c0c0dd; border: none; font-size: 12px; padding: 2px;"
+        )
         bl.addWidget(self.input, 1)
 
         self.dot = QLabel("●")
         self.dot.setStyleSheet("color: #4ade80; font-size: 10px;")
         bl.addWidget(self.dot)
 
+        self.btn_type = QPushButton("⌨️")
+        self.btn_type.setToolTip("Type response into Snap-Locked window")
+        self.btn_type.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_type.setFixedSize(24, 24)
+        self.btn_type.setStyleSheet(
+            "color: #f472b6; font-size: 11px; background: transparent; border: none;"
+        )
+        self.btn_type.clicked.connect(self.app.type_last_response)
+        bl.addWidget(self.btn_type)
+
         self.expand_btn = QPushButton("▲")
         self.expand_btn.setFixedSize(22, 22)
-        self.expand_btn.setStyleSheet("background: rgba(80,80,255,0.1); color: #8888bb; border: none; border-radius: 11px; font-size: 9px;")
+        self.expand_btn.setStyleSheet(
+            "background: rgba(80,80,255,0.1); color: #8888bb; border: none; border-radius: 11px; font-size: 9px;"
+        )
         self.expand_btn.clicked.connect(self._toggle_expand)
         bl.addWidget(self.expand_btn)
         self.ml.addWidget(self.bar)
 
         from ui.markdown_renderer import MarkdownRenderer
+
         self.md = MarkdownRenderer()
-        
+
         self.response_area = QTextEdit()
         self.response_area.setReadOnly(True)
         self.response_area.setVisible(False)
-        self.response_area.setStyleSheet("background: rgba(15,15,30,240); border: 1px solid rgba(80,85,255,30); border-radius: 12px; color: #d0d0e8; font-size: 11px; padding: 8px;")
+        self.response_area.setStyleSheet(
+            "background: rgba(15,15,30,240); border: 1px solid rgba(80,85,255,30); border-radius: 12px; color: #d0d0e8; font-size: 11px; padding: 8px;"
+        )
         self.ml.addWidget(self.response_area)
 
     def _send(self):
@@ -81,8 +137,12 @@ class MiniOverlay(QMainWindow):
             self.set_thinking()
             self.user_query.emit(q)
 
-    def set_response(self, text: str):
-        self._raw_buffer = text
+    def _render_markdown_now(self):
+        text = self._raw_buffer
+        if hasattr(self, "_last_rendered") and self._last_rendered == text:
+            return
+        self._last_rendered = text
+
         html = self.md.render(text or "Waiting...")
         self.response_area.setHtml(html)
         if text and not self._expanded:
@@ -91,12 +151,16 @@ class MiniOverlay(QMainWindow):
 
     def append_response(self, text: str):
         self._raw_buffer += text
-        self.set_response(self._raw_buffer)
+        self._render_timer.start()
 
     def on_complete(self, full_text: str, query: str = None):
         self._raw_buffer = full_text or ""
-        self.set_response(self._raw_buffer)
+        self._render_markdown_now()
         self.set_ready()
+
+    def set_response(self, text: str):
+        self._raw_buffer = text or ""
+        self._render_markdown_now()
 
     def show_error(self, err: str):
         self.set_error()
@@ -108,13 +172,15 @@ class MiniOverlay(QMainWindow):
         if not self._expanded:
             self.setFixedHeight(48)
             return
-        
+
         doc = self.response_area.document()
-        height = int(doc.size().height()) + 20 
+        height = int(doc.size().height()) + 20
         new_h = min(max(height + 60, 100), 320)
-            
+
         self.setFixedHeight(new_h)
-        self.response_area.verticalScrollBar().setValue(self.response_area.verticalScrollBar().maximum())
+        self.response_area.verticalScrollBar().setValue(
+            self.response_area.verticalScrollBar().maximum()
+        )
 
     def _toggle_expand(self, force=None):
         self._expanded = force if force is not None else not self._expanded
@@ -122,29 +188,101 @@ class MiniOverlay(QMainWindow):
         self.expand_btn.setText("▼" if self._expanded else "▲")
         self._adjust_height()
 
-    def update_warmup_status(self, m, p, r): self.setToolTip(f"{m} ({p}%)")
+    def update_warmup_status(self, m, p, r):
+        self.setToolTip(f"{m} ({p}%)")
+
     def update_mode(self, mode):
-        icons = {"general": "🧠", "interview": "🎯", "coding": "💻", "meeting": "🤝", "exam": "🎓", "writing": "✍️"}
+        icons = {
+            "general": "🧠",
+            "interview": "🎯",
+            "coding": "💻",
+            "meeting": "🤝",
+            "exam": "🎓",
+            "writing": "✍️",
+        }
         self.mode_icon.setText(icons.get(mode.lower(), "🤖"))
 
     def update_audio_state(self, muted: bool):
-        self.dot.setStyleSheet(f"color: {'#ef4444' if muted else '#4ade80'}; font-size: 10px;")
+        self.dot.setStyleSheet(
+            f"color: {'#ef4444' if muted else '#4ade80'}; font-size: 10px;"
+        )
 
-    def set_thinking(self): self.dot.setStyleSheet("color: #f59e0b; font-size: 10px;")
-    def set_ready(self): self.dot.setStyleSheet("color: #4ade80; font-size: 10px;")
-    def set_error(self): self.dot.setStyleSheet("color: #ef4444; font-size: 10px;")
+    def update_history_state(self, i, t, e=None):
+        if e and self._expanded:
+            self.set_response(e.get("response", ""))
+
+    def set_thinking(self):
+        self.dot.setStyleSheet("color: #f59e0b; font-size: 10px;")
+
+    def set_ready(self):
+        self.dot.setStyleSheet("color: #4ade80; font-size: 10px;")
+
+    def set_error(self):
+        self.dot.setStyleSheet("color: #ef4444; font-size: 10px;")
 
     def set_click_through(self, enabled: bool):
-        if enabled: self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
-        else: self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, False)
-        
-        if self.isVisible():
+        if enabled:
+            self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
+        else:
+            self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, False)
+
+        # Only refresh if we are the currently active HUD mode to prevent hidden window popups
+        if self.app.mini_mode and self.isVisible():
             self.show()
+
+    def scroll_up(self):
+        sb = self.response_area.verticalScrollBar()
+        sb.setValue(sb.value() - 40)
+
+    def scroll_down(self):
+        sb = self.response_area.verticalScrollBar()
+        sb.setValue(sb.value() + 40)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            self._drag = True; self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._drag = True
+            self._drag_pos = (
+                e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            )
 
     def mouseMoveEvent(self, e):
-        if self._drag: self.move(e.globalPosition().toPoint() - self._drag_pos)
-    def mouseReleaseEvent(self, e): self._drag = False
+        if self._drag:
+            self.move(e.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, e):
+        self._drag = False
+
+    def _check_gaze(self):
+        """Neural UX: Fades the mini-overlay if mouse is nearby to allow viewing background content.
+
+        Only active during an active session - not on standby/settings screens.
+        Can be disabled via config 'app.gaze_fade.enabled'.
+        """
+        # Check if gaze fade is enabled in config
+        if not self.config.get("app.gaze_fade.enabled", True):
+            return
+
+        # Only fade during active session - not on standby/settings screens
+        if not self.isVisible() or not self.app.state.is_mini:
+            return
+
+        # Check if session is active - only fade when user is in a running session
+        if not getattr(self.app, "session_active", False):
+            return
+
+        cursor_pos = self.mapFromGlobal(self.cursor().pos())
+        inside = self.rect().contains(cursor_pos)
+
+        # Use config values with sensible defaults for mini mode
+        margin = self.config.get("app.gaze_fade.margin", 30)
+        dist_x = min(abs(cursor_pos.x()), abs(cursor_pos.x() - self.width()))
+        dist_y = min(abs(cursor_pos.y()), abs(cursor_pos.y() - self.height()))
+
+        target_opa = 0.95
+        if inside or (dist_x < margin and dist_y < margin):
+            target_opa = self.config.get("app.gaze_fade.target_opacity", 0.15)
+
+        current_opa = self.windowOpacity()
+        if abs(current_opa - target_opa) > 0.01:
+            # Smooth interpolation
+            self.setWindowOpacity(current_opa + (target_opa - current_opa) * 0.3)

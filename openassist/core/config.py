@@ -97,8 +97,13 @@ class Config:
 
     def _load(self):
         if self._path.exists():
-            with open(self._path) as f:
-                self._data = yaml.safe_load(f) or {}
+            try:
+                with open(self._path) as f:
+                    self._data = yaml.safe_load(f) or {}
+            except Exception as e:
+                logger.error(f"Config: Malformed YAML in {self._path}: {e}")
+                logger.warning("Config: Reverting to empty/default state.")
+                self._data = {}
         self._resolve_env(self._data)
         self._inject_secrets()
 

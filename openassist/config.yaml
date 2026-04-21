@@ -1,6 +1,11 @@
 ai:
-  default_provider: groq
   fast_refine: true
+  fixed_provider: ollama
+  offline_first: false
+  parallel:
+    enabled: false
+    max_concurrent: 3
+    return_strategy: fastest
   providers:
     cerebras:
       api_key: csk-2vdjy3rhch56vxm94pnke2vrfyxf5vpt22nwjecp6xnchj9e
@@ -29,9 +34,14 @@ ai:
       model: meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo
       priority: 2
   strategy: priority
+  use_complexity_routing: true
 app:
   border_radius: 14
   font_size: 13
+  gaze_fade:
+    enabled: true
+    margin: 60
+    target_opacity: 0.2
   language: en
   opacity: 0.94
   theme: midnight
@@ -47,36 +57,30 @@ capture:
     change_threshold: 0.15
     enabled: true
     interval_ms: 500
+    quality: medium
     smart_crop: true
-ghost_mode:
-  auto_trigger: true
-  enabled: true
-  keywords:
-  - help
-  - what
-  - fix
-  - solve
-  - define
-  - compare
-  - '?'
-  sensitivity: 0.5
 hotkeys:
   emergency_erase: ctrl+shift+e
   history_next: ctrl+]
   history_prev: ctrl+[
   mini_mode: ctrl+alt+n
-  move_down: ctrl+down
-  move_left: ctrl+left
-  move_right: ctrl+right
-  move_up: ctrl+up
+  move_down: ctrl+shift+down
+  move_left: ctrl+shift+left
+  move_right: ctrl+shift+right
+  move_up: ctrl+shift+up
   quick_answer: ctrl+enter
-  scroll_down: ctrl+shift+down
-  scroll_up: ctrl+shift+up
+  scroll_down: ctrl+alt+down
+  scroll_up: ctrl+alt+up
   stealth: ctrl+shift+z
   switch_mode: ctrl+shift+s
   toggle: ctrl+\
   toggle_audio: ctrl+shift+a
   toggle_click_through: ctrl+m
+nexus:
+  max_age_seconds: 60
+  polling_interval_ms: 3000
+onboarding:
+  completed: true
 performance:
   debounce_ms: 150
   max_history: 50
@@ -84,3 +88,4 @@ performance:
 stealth:
   enabled: true
   protect_capture: true
+  typing_delay_ms: 25

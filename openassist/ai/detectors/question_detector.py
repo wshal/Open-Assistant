@@ -11,9 +11,36 @@ import re
 import time
 from collections import deque
 from typing import Optional, List
+from dataclasses import dataclass
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+
+@dataclass
+class DetectionResult:
+    """P2: Confidence-gated detection result with provenance."""
+
+    triggered: bool
+    confidence: float
+    trigger_type: str  # "question", "coding", "casual", "followup"
+    source: str  # "screen", "audio", "rag"
+    detected_text: str
+    auto_response_threshold: float = 0.7
+
+    def should_auto_respond(self) -> bool:
+        """Determine if auto-response should be triggered based on confidence."""
+        return self.triggered and self.confidence >= self.auto_response_threshold
+
+    def to_dict(self) -> dict:
+        return {
+            "triggered": self.triggered,
+            "confidence": self.confidence,
+            "trigger_type": self.trigger_type,
+            "source": self.source,
+            "detected_text": self.detected_text,
+            "auto_respond": self.should_auto_respond(),
+        }
 
 
 class QuestionDetector:
@@ -103,17 +130,144 @@ class QuestionDetector:
         self._last_text = ""
         self.fragment_buffer = deque(maxlen=4)
         self.question_prefixes = [
-            "what ", "how ", "why ", "where ", "when ", "who ", "is ", "are ",
-            "does ", "do ", "did ", "should ", "can ", "could ", "would ",
-            "may ", "shall ", "which ", "whom ", "whose ", "tell me", "explain", "describe"
+            "what ",
+            "how ",
+            "why ",
+            "where ",
+            "when ",
+            "who ",
+            "is ",
+            "are ",
+            "does ",
+            "do ",
+            "did ",
+            "should ",
+            "can ",
+            "could ",
+            "would ",
+            "may ",
+            "shall ",
+            "which ",
+            "whom ",
+            "whose ",
+            "tell me",
+            "explain",
+            "describe",
         ]
         self.fragment_continuations = [
-            "and ", "or ", "but ", "also ", "else ", "then ", "so ", "because ",
-            "for ", "to ", "with ", "about ", "that ", "this "
+            "and ",
+            "or ",
+            "but ",
+            "also ",
+            "else ",
+            "then ",
+            "so ",
+            "because ",
+            "for ",
+            "to ",
+            "with ",
+            "about ",
+            "that ",
+            "this ",
         ]
-        
+
         # Sensitivity: 1.0 = Max triggers, 0.1 = Strict
         self.sensitivity = config.get("detection.sensitivity", 0.5)
+
+        self.auto_response_threshold = config.get(
+            "detection.auto_response_threshold", 0.7
+        )
+        self.current_source = "screen"  # Track current detection source
+        self.current_mode = config.get("ai.mode", "general")
+        self._mode_weights = {
+            "general": {"q": 1.0, "code": 1.0, "casual": 1.0},
+            "coding": {"q": 1.0, "code": 1.5, "casual": 0.5},
+            "interview": {"q": 1.3, "code": 0.8, "casual": 0.8},
+            "meeting": {"q": 1.1, "code": 0.5, "casual": 1.1},
+            "exam": {"q": 1.5, "code": 0.5, "casual": 0.3},
+        }
+
+    def set_mode(self, mode_id: str):
+        """Update detection bias based on current Task mode."""
+        self.current_mode = mode_id
+        logger.debug(f"Detector Mode set to: {mode_id}")
+
+    def detect_with_confidence(
+        self, text: str, source: str = "screen"
+    ) -> DetectionResult:
+        """P2: Detect with confidence score and provenance tracking."""
+        self.current_source = source
+
+        # Call existing detect logic
+        result = self.detect(text)
+
+        if result:
+            # Calculate confidence based on pattern match
+            confidence = self._calculate_confidence(text)
+            trigger_type = self._classify_trigger(result)
+
+            detection = DetectionResult(
+                triggered=True,
+                confidence=confidence,
+                trigger_type=trigger_type,
+                source=source,
+                detected_text=result,
+                auto_response_threshold=self.auto_response_threshold,
+            )
+
+            logger.debug(
+                f"QuestionDetector: {trigger_type} detected "
+                f"(conf={confidence:.2f}, auto={detection.should_auto_respond()})"
+            )
+            return detection
+
+        return DetectionResult(
+            triggered=False,
+            confidence=0.0,
+            trigger_type="none",
+            source=source,
+            detected_text="",
+            auto_response_threshold=self.auto_response_threshold,
+        )
+
+    def _calculate_confidence(self, text: str) -> float:
+        """Calculate confidence score for the detection."""
+        lower = text.lower()
+        words = lower.split()
+
+        score = 0.0
+
+        # Strong signals
+        if "?" in text:
+            score += 0.3
+        if any(lower.startswith(prefix) for prefix in self.question_prefixes):
+            score += 0.2
+        if any(pattern in lower for pattern in self.question_patterns):
+            score += 0.2
+
+        # Context signals
+        if (
+            any(pattern in lower for pattern in self.coding_patterns)
+            and len(words) >= 3
+        ):
+            score += 0.15
+        if any(pattern in lower for pattern in self.followup_patterns):
+            score += 0.1
+
+        # Normalize by sensitivity (lower sensitivity = higher confidence required)
+        adjusted = score * (0.5 + self.sensitivity * 0.5)
+        return min(adjusted, 1.0)
+
+    def _classify_trigger(self, text: str) -> str:
+        """Classify the type of trigger."""
+        lower = text.lower()
+        if any(p in lower for p in self.coding_patterns):
+            return "coding"
+        if any(p in lower for p in self.followup_patterns):
+            return "followup"
+        if any(p in lower for p in self.casual_patterns):
+            return "casual"
+        return "question"
 
     def detect(self, text: str) -> Optional[str]:
         """Find interaction triggers in text.
@@ -183,36 +337,45 @@ class QuestionDetector:
         if len(words) < 2:
             return False
 
+        weights = self._mode_weights.get(self.current_mode, self._mode_weights["general"])
         score = 0.0
-        
+
         # 1. Strong Triggers (Auto-Pass or High Score)
         if "?" in text:
-            score += 0.8
+            score += 0.8 * weights["q"]
         if any(lower.startswith(prefix) for prefix in self.question_prefixes):
-            score += 0.6
+            score += 0.6 * weights["q"]
         if any(pattern in lower for pattern in self.question_patterns):
-            score += 0.5
-            
+            score += 0.5 * weights["q"]
+
         # 2. Contextual Triggers
-        if any(pattern in lower for pattern in self.coding_patterns) and len(words) >= 3:
-            score += 0.5
+        if (
+            any(pattern in lower for pattern in self.coding_patterns)
+            and len(words) >= 3
+        ):
+            score += 0.5 * weights["code"]
         if any(pattern in lower for pattern in self.followup_patterns):
-            score += 0.4
-        if any(pattern in lower for pattern in self.casual_patterns) and len(words) >= self.min_words:
-            score += 0.3
+            score += 0.4 * weights["q"]
+        if (
+            any(pattern in lower for pattern in self.casual_patterns)
+            and len(words) >= self.min_words
+        ):
+            score += 0.3 * weights["casual"]
 
         # 3. Sensitivity Moderation
         # High sensitivity (1.0) -> requires low score (0.2)
         # Low sensitivity (0.1) -> requires high score (0.9)
         required_score = 1.0 - (self.sensitivity * 0.85)
-        
+
         return score >= required_score
 
     def _should_buffer_fragment(self, text: str, lower: str, words: List[str]) -> bool:
         if self._has_question_mark(text):
             return False
 
-        if len(words) < self.min_words and any(lower.startswith(prefix) for prefix in self.question_prefixes):
+        if len(words) < self.min_words and any(
+            lower.startswith(prefix) for prefix in self.question_prefixes
+        ):
             return True
 
         return self._looks_like_continuation(text, lower)
@@ -230,7 +393,10 @@ class QuestionDetector:
 
     def _is_debounced(self, text: str) -> bool:
         now = time.time()
-        if text == self._last_text and (now - self._last_trigger_time) < self._debounce_seconds:
+        if (
+            text == self._last_text
+            and (now - self._last_trigger_time) < self._debounce_seconds
+        ):
             logger.debug("QuestionDetector: Debounced rapid trigger")
             return True
         return False

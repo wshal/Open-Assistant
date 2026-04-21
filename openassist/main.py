@@ -69,7 +69,7 @@ def main():
             config.set("ai.strategy", "fixed")
             config.set("ai.fixed_provider", "ollama")
         if args.mode:
-            config.set("modes.default", args.mode)
+            config.set("ai.mode", args.mode)
         if args.stealth:
             config.set("stealth.enabled", True)
         if args.no_audio:
@@ -100,7 +100,10 @@ def main():
         signal.signal(signal.SIGINT, lambda *_,: sys.exit(0))
 
         app = OpenAssistApp(config, mini_mode=args.mini)
-        exit_code = app.run()
+        try:
+            exit_code = app.run()
+        finally:
+            app.shutdown()
         sys.exit(exit_code)
 
     except Exception as e:

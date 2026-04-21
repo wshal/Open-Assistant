@@ -12,18 +12,31 @@ class SmartRouter:
         self.config = config
         self.providers = providers
         self.strategy = config.get("ai.strategy", "smart")
+        self.offline_first = config.get("ai.offline_first", True)  # P2: Prefer local
         self.task_map = config.get("ai.router.task_routing", {})
         self.fallback = config.get("ai.router.fallback_order", [])
         self._rr = 0
 
+    def _is_offline_available(self) -> bool:
+        """Check if local/offline provider is available."""
+        return "ollama" in self.providers and self.providers["ollama"].enabled
+
     def select(
-        self, task: str = "general", prefer_speed: bool = False,
-        prefer_quality: bool = False, tier: str = None,
-        exclude: List[str] = None
+        self,
+        task: str = "general",
+        prefer_speed: bool = False,
+        prefer_quality: bool = False,
+        tier: str = None,
+        exclude: List[str] = None,
+        preferred: List[str] = None,
     ) -> Tuple[Optional[BaseProvider], str]:
         exclude = exclude or []
-        avail = {n: p for n, p in self.providers.items()
-                 if p.enabled and p.check_rate() and n not in exclude}
+        preferred = preferred or []
+        avail = {
+            n: p
+            for n, p in self.providers.items()
+            if p.enabled and p.check_rate() and n not in exclude
+        }
 
         if not avail:
             return None, ""
@@ -66,17 +79,32 @@ class SmartRouter:
             provider = next(iter(avail.values()))
             return provider, self._selected_tier(provider, tier or "balanced")
 
-        # Smart strategy
-        return self._smart(avail, task, prefer_speed, prefer_quality, tier)
+        # P2: Offline-first strategy - prefer local (Ollama), then fastest cloud
+        if self.strategy == "offline" or (
+            self.offline_first and self.strategy == "smart"
+        ):
+            if "ollama" in avail:
+                logger.debug("Router: Using offline-first (Ollama)")
+                return avail["ollama"], self._selected_tier(
+                    avail["ollama"], tier or "balanced"
+                )
+            if self.strategy == "offline":
+                provider = max(avail.values(), key=lambda x: x.speed)
+                return provider, self._selected_tier(provider, tier or "balanced")
 
-    def _smart(self, avail, task, prefer_speed, prefer_quality, tier):
-        preferred = self.task_map.get(task, self.task_map.get("general", []))
+        # Smart strategy
+        return self._smart(avail, task, prefer_speed, prefer_quality, tier, preferred)
+
+    def _smart(self, avail, task, prefer_speed, prefer_quality, tier, preferred):
+        task_preferred = self.task_map.get(task, self.task_map.get("general", []))
         scored = []
 
         for name, p in avail.items():
             score = 0.0
             if name in preferred:
-                score += (len(preferred) - preferred.index(name)) * 10
+                score += (len(preferred) - preferred.index(name)) * 20
+            if name in task_preferred:
+                score += (len(task_preferred) - task_preferred.index(name)) * 10
             if prefer_speed:
                 score += p.speed * 5 + p.quality * 1
             elif prefer_quality:
@@ -89,7 +117,6 @@ class SmartRouter:
                 if p.stats.tps > 100:
                     score += 5
 
-            # Penalize nearly exhausted rate limit
             remaining = p.rpm - len(p._req_times)
             if remaining < p.rpm * 0.1:
                 score -= 15
@@ -99,12 +126,10 @@ class SmartRouter:
         scored.sort(key=lambda x: x[2], reverse=True)
         name, provider, score = scored[0]
 
-        # Select tier
         t = tier or self._tier_for_task(task)
         if not provider.models.get(t):
             t = provider.default_tier
 
-        logger.debug(f"Router â {name} (score={score:.0f}, tier={t})")
         return provider, t
 
     @staticmethod
@@ -116,20 +141,29 @@ class SmartRouter:
     @staticmethod
     def _tier_for_task(task):
         return {
-            "quick": "fast", "meeting": "fast",
-            "coding": "code", "reasoning": "reasoning",
-            "interview": "balanced", "exam": "balanced",
-            "writing": "balanced", "general": "balanced"
+            "quick": "fast",
+            "meeting": "fast",
+            "coding": "code",
+            "reasoning": "reasoning",
+            "interview": "balanced",
+            "exam": "balanced",
+            "writing": "balanced",
+            "general": "balanced",
         }.get(task, "balanced")
 
     def get_stats(self):
-        return {n: {
-            "requests": p.stats.requests, "errors": p.stats.errors,
-            "latency": f"{p.stats.avg_latency:.2f}s",
-            "tps": f"{p.stats.tps:.0f}",
-            "success": f"{p.stats.success_rate:.0%}",
-            "speed": p.speed, "quality": p.quality
-        } for n, p in self.providers.items()}
+        return {
+            n: {
+                "requests": p.stats.requests,
+                "errors": p.stats.errors,
+                "latency": f"{p.stats.avg_latency:.2f}s",
+                "tps": f"{p.stats.tps:.0f}",
+                "success": f"{p.stats.success_rate:.0%}",
+                "speed": p.speed,
+                "quality": p.quality,
+            }
+            for n, p in self.providers.items()
+        }
 
     def get_provider_health(self):
         health = {}

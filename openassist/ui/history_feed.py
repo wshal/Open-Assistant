@@ -4,7 +4,7 @@ Displays all conversation data in a scrollable list.
 """
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel, QFrame, QApplication, QPushButton
+    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel, QFrame, QPushButton
 )
 from PyQt6.QtCore import Qt, QTimer
 from ui.markdown_renderer import MarkdownRenderer
@@ -107,9 +107,9 @@ class HistoryFeedView(QWidget):
         self.back_btn.show()
         self.title_label.setText("💬 Session Detail")
         
-        self.history.load_session(session_id)
+        entries = self.history.read_session(session_id)
         
-        for entry in self.history.entries:
+        for entry in entries:
             # Q
             if entry.query:
                 q = QLabel(f"Q: {entry.query}")

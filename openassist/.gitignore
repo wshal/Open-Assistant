@@ -1,0 +1,37 @@
+# --- OpenAssist — GitHub Production Ignore ---
+
+# Internal Technical Docs & Sensitive Assets (Private)
+ISSUES_ANALYSIS.md
+OPENASSIST_TECH_AUDIT.md
+
+# Application Data & Secrets
+config.yaml
+data/history/
+data/vectordb/
+logs/
+
+# Python Environment
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+instance/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local Dev Artifacts
+.env
+.DS_Store
+Thumbs.db
+*.log
+*.bak
+*.tmp
+
+# Hardware/Build
+build/
+dist/
+*.spec

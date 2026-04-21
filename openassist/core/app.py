@@ -8,10 +8,12 @@ RESTORATION: Automatic Knowledge Sync (RAG) during warmup.
 import sys
 import asyncio
 import threading
-from PyQt6.QtWidgets import QApplication
+import time
+from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from core.config import Config
+from core.state import AppState
 from core.hotkeys import HotkeyManager
 from capture.screen import ScreenCapture
 from capture.audio import AudioCapture
@@ -19,9 +21,13 @@ from capture.ocr import OCREngine
 from ai.engine import AIEngine
 from ai.history import ResponseHistory
 from ai.rag import RAGEngine
+from core.nexus import ContextNexus
+from utils.platform_utils import ProcessUtils
 from ui.overlay import OverlayWindow
 from ui.mini_overlay import MiniOverlay
+from core.tray import SystemTray
 from stealth.anti_detect import StealthManager
+from stealth.input_simulator import InputSimulator
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -33,39 +39,51 @@ class OpenAssistApp(QObject):
     def __init__(self, config: Config, mini_mode: bool = False):
         super().__init__()
         self.config = config
+        self.state = AppState(config)
         self.mini_mode = mini_mode
+        self.state.is_mini = mini_mode
         self.is_running = True
         self.qt_app = QApplication.instance() or QApplication(sys.argv)
-        
+
         # Components
         self.history = ResponseHistory()
         self.rag = RAGEngine(config)
         self.ai = AIEngine(config, self.history, self.rag)
         self.ocr = OCREngine(config)
         self.screen = ScreenCapture(config, self.ocr)
-        self.audio = AudioCapture(config)
+        self.audio = AudioCapture(config, state=self.state)
+        self.nexus = ContextNexus(config)
         self.stealth = StealthManager(config)
-        
+        self.simulator = InputSimulator(config)
+
         self.session_active = False
         self._last_query = ""
+        self._last_query_time = 0.0
         self._click_through = False
-        
+
         # Async Loop
         self.loop = asyncio.new_event_loop()
         self._ai_lock_ready = threading.Event()
         self._async_thread = threading.Thread(target=self._run_master_loop, daemon=True)
-        
+
         # UI
         self.overlay = OverlayWindow(config, self)
         self.mini_overlay = MiniOverlay(config, self)
         self.hotkeys = HotkeyManager(config, self)
+        self.tray = self._create_system_tray()
 
         self._wire_signals()
-        
+        self.qt_app.aboutToQuit.connect(self.shutdown)
+
         # MOVEMENT ENGINE: RESTORED Smooth Glide (60fps)
         self._move_timer = QTimer(self)
         self._move_direction = None
         self._move_timer.timeout.connect(self._do_move)
+
+        # NEXUS ENGINE: Periodic Window Polling (3s)
+        self._nexus_timer = QTimer(self)
+        self._nexus_timer.timeout.connect(self._poll_nexus_context)
+        self._nexus_timer.start(3000)
 
     def _run_master_loop(self):
         asyncio.set_event_loop(self.loop)
@@ -78,9 +96,15 @@ class OpenAssistApp(QObject):
         self.mini_overlay.user_query.connect(self.generate_response)
         self.ai.response_chunk.connect(lambda c: self.overlay.append_response(c))
         self.ai.response_chunk.connect(lambda c: self.mini_overlay.append_response(c))
-        self.ai.response_complete.connect(lambda t: self.overlay.on_complete(t, self._last_query))
-        self.ai.response_complete.connect(lambda t: self.mini_overlay.on_complete(t, self._last_query))
-        self.ai.error_occurred.connect(lambda e: self.overlay.on_complete(f"ERROR: {e}"))
+        self.ai.response_complete.connect(
+            lambda t: self.overlay.on_complete(t, self._last_query)
+        )
+        self.ai.response_complete.connect(
+            lambda t: self.mini_overlay.on_complete(t, self._last_query)
+        )
+        self.ai.error_occurred.connect(
+            lambda e: self.overlay.on_complete(f"ERROR: {e}")
+        )
         self.ai.error_occurred.connect(lambda e: self.mini_overlay.show_error(e))
         self.audio.transcription_ready.connect(self._on_transcription)
         self.screen.text_captured.connect(self._on_screen_text)
@@ -88,18 +112,73 @@ class OpenAssistApp(QObject):
         self.ai.provider_status.connect(self.overlay.standby_view.set_provider_statuses)
         self.overlay.standby_view.start_clicked.connect(self.start_new_session)
         self.overlay.standby_view.mode_selected.connect(self.switch_mode)
-        self.overlay.standby_view.audio_source_changed.connect(self._on_audio_source_ui_change)
+        self.overlay.standby_view.audio_source_changed.connect(
+            self._on_audio_source_ui_change
+        )
+        self.ai.response_complete.connect(self._on_response_complete)
+
+    def _on_response_complete(self, full_text: str):
+        """Update overlay status bar with latency after each response."""
+        entries = self.history.get_last(1)
+        latency_ms = 0
+        provider = None
+        if entries:
+            entry = entries[-1]
+            latency_ms = getattr(entry, "latency", 0)
+            provider = getattr(entry, "provider", None)
+
+        # Get available providers
+        available = []
+        if hasattr(self.ai, "_providers"):
+            available = [
+                p
+                for p, prov in self.ai._providers.items()
+                if hasattr(prov, "enabled") and prov.enabled
+            ]
+
+        self.overlay.update_status(
+            provider=provider,
+            capture_audio=self.audio.is_capturing
+            if hasattr(self.audio, "is_capturing")
+            else False,
+            capture_screen=self.screen.is_capturing
+            if hasattr(self.screen, "is_capturing")
+            else False,
+            latency_ms=latency_ms if entries else 0,
+            available_providers=available,
+        )
 
     def _on_audio_source_ui_change(self, source):
-        self.config.set("capture.audio.mode", source)
+        self.state.audio_source = source
         self._apply_settings()
+
+    def _sync_state_from_config(self):
+        """Pull persisted config back into AppState before async subsystems catch up."""
+        self.state.mode = self.config.get("ai.mode", "general")
+        self.state.audio_source = self.config.get("capture.audio.mode", "system")
+        self.state.is_stealth = self.config.get("stealth.enabled", False)
+
+    def _poll_nexus_context(self):
+        """Polls environmental signals for the ContextNexus."""
+        title = ProcessUtils.get_active_window_title()
+        if title:
+            # Avoid self-referential capture if we are the active window
+            if "OpenAssist" not in title:
+                self.nexus.push("window", title)
 
     # --- 🛠️ FLUID HUD NAVIGATION ---
 
-    def move_up(self): self._nudge(0, -5)
-    def move_down(self): self._nudge(0, 5)
-    def move_left(self): self._nudge(-5, 0)
-    def move_right(self): self._nudge(5, 0)
+    def move_up(self):
+        self._nudge(0, -5)
+
+    def move_down(self):
+        self._nudge(0, 5)
+
+    def move_left(self):
+        self._nudge(-5, 0)
+
+    def move_right(self):
+        self._nudge(5, 0)
 
     def _nudge(self, dx, dy):
         v = self.mini_overlay if self.mini_mode else self.overlay
@@ -107,21 +186,27 @@ class OpenAssistApp(QObject):
         v.move(pos.x() + dx, pos.y() + dy)
 
     def start_move(self, direction):
-        if self._move_direction == direction: return
+        if self._move_direction == direction:
+            return
         self._move_direction = direction
-        self._move_timer.start(16) 
+        self._move_timer.start(16)
 
     def stop_move(self):
         self._move_timer.stop()
         self._move_direction = None
 
     def _do_move(self):
-        if not self._move_direction: return
+        if not self._move_direction:
+            return
         d = self._move_direction
-        if d == "up": self.move_up()
-        elif d == "down": self.move_down()
-        elif d == "left": self.move_left()
-        elif d == "right": self.move_right()
+        if d == "up":
+            self.move_up()
+        elif d == "down":
+            self.move_down()
+        elif d == "left":
+            self.move_left()
+        elif d == "right":
+            self.move_right()
 
     def toggle_click_through(self):
         self._click_through = not self._click_through
@@ -133,26 +218,30 @@ class OpenAssistApp(QObject):
     def _apply_settings(self):
         """Non-blocking hot-apply for Layer 6 stabilization. Added Master Safety Guard."""
         logger.info("⚙️ Applying Settings (Background Thread)...")
+
+        self._sync_state_from_config()
+        self.overlay.refresh_standby_state()
+
         def _apply():
             try:
                 # 1. Hardware Cooldown
                 self.audio.restart()
                 self.hotkeys.restart()
-                
+
                 # 2. Process Warmup
                 self.ai.warmup()
-                
+
                 # 3. UI Synchronization
                 QTimer.singleShot(0, self._apply_ui_only)
-                
+
                 # 4. Async Stream Recovery
                 if self.loop and self.loop.is_running():
-                    asyncio.run_coroutine_threadsafe(self.ai.poll_provider_health_loop(), self.loop)
-                
+                    self.ai.ensure_health_monitor(self.loop)
+
                 logger.info("✅ Settings Applied Successfully.")
             except Exception as e:
                 logger.error(f"❌ Settings Hot-Apply Fault (Handled): {e}")
-        
+
         # Spawn daemon thread to keep UI interactive
         t = threading.Thread(target=_apply, daemon=True)
         t.start()
@@ -161,120 +250,376 @@ class OpenAssistApp(QObject):
         opa = self.config.get("app.opacity", 0.94)
         self.overlay.setWindowOpacity(opa)
         self.mini_overlay.setWindowOpacity(opa)
-        is_stealth = self.config.get("stealth.enabled", False)
+        is_stealth = self.state.is_stealth
         self.stealth.apply_to_window(self.overlay, is_stealth)
         self.stealth.apply_to_window(self.mini_overlay, is_stealth)
-        self.overlay.update_audio_state(self.audio._muted)
-        self.mini_overlay.update_audio_state(self.audio._muted)
+
+    def _create_system_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.info("System tray unavailable; tray controls disabled.")
+            return None
+        try:
+            return SystemTray(self)
+        except Exception as e:
+            logger.warning(f"System tray initialization failed: {e}")
+            return None
+
+    def _active_view(self):
+        return self.mini_overlay if self.mini_mode else self.overlay
+
+    def _show_active_overlay(self):
+        view = self._active_view()
+        view.show()
+        if hasattr(view, "raise_"):
+            view.raise_()
+        if hasattr(view, "activateWindow"):
+            view.activateWindow()
+        return view
+
+    def open_settings(self):
+        if self.mini_mode:
+            self.mini_overlay.hide()
+        self.overlay.stack.setCurrentIndex(2)
+        self.overlay.show()
+        self.overlay.raise_()
+        self.overlay.activateWindow()
+
+    def _show_initial_window(self):
+        if not self.config.get("onboarding.completed", False):
+            self.overlay.show()
+            self.overlay.raise_()
+            self.overlay.activateWindow()
+            self.overlay.show_onboarding()
+            return
+
+        if self.config.get("app.start_minimized", False):
+            self.overlay.hide()
+            self.mini_overlay.hide()
+            logger.info("Startup minimized to system tray.")
+            return
+
+        self._show_active_overlay()
 
     def run(self) -> int:
         self._async_thread.start()
         self.audio.start()
         self.hotkeys.start()
-        self.overlay.show()
+
+        # Show overlay AFTER Qt event loop starts to ensure window is visible
+        QTimer.singleShot(100, self._show_initial_window)
+
         self._background_warmup()
         return self.qt_app.exec()
 
     def generate_response(self, q, s="manual", c=None):
-        if not q or not self._ai_lock_ready.wait(timeout=2): return
+        if not q or not self._ai_lock_ready.wait(timeout=2):
+            return
+
+        # OMEGA DEBOUNCE: Prevent double-triggers (Audio + OCR) for the same query
+        now = time.time()
+        if q == self._last_query and (now - self._last_query_time) < 3.0:
+            logger.debug(f"AI: Debouncing duplicate query: {q[:50]}...")
+            return
+
+        self._last_query = q
+        self._last_query_time = now
+        # SNAP-LOCK: Capture target window HWND at moment of query
+        # We only do this for manual/speech queries, not background auto-captures
+        if s in ["manual", "speech", "quick"]:
+            hwnd = self.simulator.get_foreground_window()
+            # Safety: Don't lock to our own overlay
+            if hwnd:
+                self.state.target_window_id = hwnd
+                logger.info(f"🔒 Snap-Lock: Target set to HWND {hwnd}")
+
+        # Start timing for instrumentation
+        self._current_request_start = time.time()
+        self._stage_timings = {"start": self._current_request_start}
+
         asyncio.run_coroutine_threadsafe(self._process_ai(q, s, c), self.loop)
 
     async def _process_ai(self, q, s, c):
         async with self._ai_lock:
             self._last_query = q
-            sc = c.get("screen") if c else self.screen.capture_context()
+            sc = c.get("screen") if c else await self.screen.capture_context()
+            if sc:
+                self.nexus.push("screen", sc)
+
             au = c.get("audio") if c else self.audio.get_transcript()
-            await self.ai.generate_response(q, sc, au)
+            # Push last transcript fragment specifically if available
+
+            snapshot = self.nexus.get_snapshot()
+            await self.ai.generate_response(
+                q, snapshot, screen_context=sc, audio_context=au
+            )
 
     def toggle_overlay(self):
         v = self.mini_overlay if self.mini_mode else self.overlay
-        if v.isVisible(): v.hide()
-        else: v.show(); v.raise_(); v.activateWindow()
+        # Layer 6 Resilience: Force sync visibility
+        if v.isVisible() and v.windowOpacity() > 0:
+            v.hide()
+            logger.debug("👻 HUD Hidden via toggle.")
+        else:
+            v.show()
+            v.raise_()
+            v.activateWindow()
+            logger.debug("👁️ HUD Shown via toggle.")
 
-    def quick_answer(self): self.generate_response("Summarize current context.", "quick")
-    
+    def quick_answer(self):
+        self.generate_response("Summarize current context.", "quick")
+
     def switch_mode(self, mode: str = None):
         if not mode:
             modes = ["general", "interview", "coding", "meeting", "exam", "writing"]
-            mode = modes[(modes.index(self.config.get("ai.mode", "general")) + 1) % len(modes)]
-        self.config.set("ai.mode", mode)
+            mode = modes[
+                (modes.index(self.config.get("ai.mode", "general")) + 1) % len(modes)
+            ]
+        self.state.mode = mode
         self.overlay.update_mode(mode)
         self.mini_overlay.update_mode(mode)
+        
+        # Propagate to detector for mode-aware sensitivity
+        ai = self.__dict__.get("ai")
+        if ai and hasattr(ai, "detector"):
+            ai.detector.set_mode(mode)
+            
         logger.info(f"🔄 Mode Switched: {mode.upper()}")
 
-    def toggle_audio(self): 
+    def toggle_audio(self):
         muted = self.audio.toggle()
-        self.overlay.update_audio_state(muted)
-        self.mini_overlay.update_audio_state(muted)
+        self.state.is_muted = muted
 
-    def scroll_up(self): 
-        self.overlay.response_area.verticalScrollBar().setValue(self.overlay.response_area.verticalScrollBar().value() - 60)
+    def scroll_up(self):
+        self.overlay.scroll_up()
         self.mini_overlay.scroll_up()
 
-    def scroll_down(self): 
-        self.overlay.response_area.verticalScrollBar().setValue(self.overlay.response_area.verticalScrollBar().value() + 60)
+    def scroll_down(self):
+        self.overlay.scroll_down()
         self.mini_overlay.scroll_down()
 
-    def history_prev(self): self.history.move_prev(); self._sync_history_ui()
-    def history_next(self): self.history.move_next(); self._sync_history_ui()
+    def history_prev(self):
+        self.history.move_prev()
+        self._sync_history_ui()
+
+    def history_next(self):
+        self.history.move_next()
+        self._sync_history_ui()
+
     def _sync_history_ui(self):
         st = self.history.get_state()
         self.overlay.update_history_state(*st)
         self.mini_overlay.update_history_state(*st)
         # Auto-expand mini HUD when navigating history
         if self.mini_mode and st[2]:
-            self.mini_overlay.on_complete(st[2].response, st[2].query)
+            self.mini_overlay.on_complete(st[2]["response"], st[2]["query"])
 
-    def emergency_erase(self): 
-        self.history.clear(); self.overlay.hide()
+    def emergency_erase(self):
+        """Action: Nukes all data and kills all hardware loops immediately."""
+        logger.warning("☣️ EMERGENCY ERASE TRIGGERED")
+        self.is_running = False
+        self.history.clear()
+        self.overlay.hide()
+        self.mini_overlay.hide()
+        
+        # Stop all timers
+        self._nexus_timer.stop()
+        self._move_timer.stop()
+        
+        # Hardware shutdown
         self.audio.stop()
+        self.audio.clear()
         self.hotkeys.stop()
-        QTimer.singleShot(500, self.qt_app.quit)
+        self.screen.stop()
+        
+        self.state.target_window_id = None
+        self._stop_background_tasks()
+        
+        # Force quit after brief delay to allow cleanup
+        QTimer.singleShot(800, self.qt_app.quit)
 
-    def start_new_session(self): 
+    def start_new_session(self):
+        self.history.start_new_session()
+        self.audio.clear()
+        self._last_query = ""
         self.session_active = True
+        self.state.is_capturing = True
         self.overlay.stack.setCurrentIndex(1)
+        self.overlay.on_complete("", "")
+        self.overlay.update_transcript("Listening for context...")
+        start_session_ui = getattr(self.overlay, "start_session_ui", None)
+        if callable(start_session_ui):
+            start_session_ui()
+        self.mini_overlay.on_complete("", "")
+        self.mini_overlay.set_ready()
         m = self.config.get("ai.mode", "general")
         self.overlay.update_mode(m)
         self.mini_overlay.update_mode(m)
         logger.info("🚀 Session Started.")
 
-    def end_session(self): self.session_active = False; self.overlay.stack.setCurrentIndex(0)
+    def end_session(self):
+        self.session_active = False
+        self.state.is_capturing = False
+        self.state.target_window_id = None
+        self.audio.clear()
+        self._last_query = ""
+        self.overlay.stack.setCurrentIndex(0)
+        end_session_ui = getattr(self.overlay, "end_session_ui", None)
+        if callable(end_session_ui):
+            end_session_ui()
+        self.overlay.update_transcript("Ready...")
+        self.overlay.on_complete("", "")
+        self.mini_overlay.on_complete("", "")
+        self.mini_overlay.set_ready()
+
+    def set_current_mode(self, name):
+        for m_name, btn in self.mode_buttons.items():
+            is_active = m_name == name
+            btn.setChecked(is_active)
+            btn.setStyleSheet(self.ACTIVE_STYLE if is_active else self.NORMAL_STYLE)
+
     def toggle_mini_mode(self):
-        if self.mini_mode: self.mini_overlay.hide(); self.overlay.show()
-        else: self.overlay.hide(); self.mini_overlay.show()
         self.mini_mode = not self.mini_mode
+        self.state.is_mini = self.mini_mode
 
     def toggle_stealth_mode(self):
-        self.config.set("stealth.enabled", not self.config.get("stealth.enabled", False))
+        self.config.set(
+            "stealth.enabled", not self.config.get("stealth.enabled", False)
+        )
         self._apply_settings()
 
+    def type_last_response(self):
+        """Action: Type the latest AI response into the Snap-Locked window."""
+        entries = self.history.get_last(1)
+        if not entries:
+            return
+
+        response = entries[-1].response
+        target = self.state.target_window_id
+
+        if target:
+            self.simulator.type_text(response, target)
+        else:
+            logger.warning("Sim: No Snap-Locked target window available.")
+
     def _on_transcription(self, t):
+        self.nexus.push("audio", t)
         self.overlay.update_transcript(t)
         q = self.ai.detector.detect(t)
-        if q: self.generate_response(q, "speech", {"audio": t})
+        if q:
+            self.generate_response(q, "speech", {"audio": t})
 
     def _on_screen_text(self, t):
         q = self.ai.detector.detect(t)
-        if q: self.generate_response(q, "auto", {"screen": t})
+        if q:
+            self.generate_response(q, "auto", {"screen": t})
 
     def _background_warmup(self):
-        def _warm():
+        """Parallelized component warmup — v5.1 (Speed Focus)."""
+
+        def _warm_audio():
             try:
-                self.warmup_status_update.emit("🎙️ Audio...", 10, False)
                 self.audio._ensure_whisper_loaded()
-                
-                self.warmup_status_update.emit("📚 Knowledge...", 30, False)
-                self.rag.add_directory("./knowledge")
-                
-                self.warmup_status_update.emit("👁️ Vision...", 50, False)
-                self.screen.initialize()
-                
-                self.warmup_status_update.emit("🧠 Brain...", 80, False)
-                self.ai.warmup()
-                asyncio.run_coroutine_threadsafe(self.ai.poll_provider_health_loop(), self.loop)
-                
-                self.warmup_status_update.emit("✅ READY", 100, True)
+                self.warmup_status_update.emit("🎙️ Audio Ready", 25, False)
             except Exception as e:
-                logger.error(f"Warmup Failed: {e}")
-        threading.Thread(target=_warm, daemon=True).start()
+                logger.error(f"Audio Warmup Fault: {e}")
+
+        def _warm_vision():
+            try:
+                self.screen.initialize()
+                self.warmup_status_update.emit("👁️ Vision Ready", 50, False)
+            except Exception as e:
+                logger.error(f"Vision Warmup Fault: {e}")
+
+        def _warm_knowledge():
+            try:
+                self.rag.add_directory("./knowledge")
+                self.warmup_status_update.emit("📚 Knowledge Ready", 75, False)
+            except Exception as e:
+                logger.error(f"RAG Warmup Fault: {e}")
+
+        def _warm_brain():
+            try:
+                self.ai.warmup()
+                self.ai.ensure_health_monitor(self.loop)
+                # Kicks off continuous capture once brain is ready
+                asyncio.run_coroutine_threadsafe(
+                    self._continuous_capture_loop(), self.loop
+                )
+            except Exception as e:
+                logger.error(f"Brain Warmup Fault: {e}")
+
+        # Dispatch all in parallel
+        threads = [
+            threading.Thread(target=_warm_audio, daemon=True),
+            threading.Thread(target=_warm_vision, daemon=True),
+            threading.Thread(target=_warm_knowledge, daemon=True),
+            threading.Thread(target=_warm_brain, daemon=True),
+        ]
+        for t in threads:
+            t.start()
+
+        # Monitoring thread for final Ready signal
+        def _monitor():
+            try:
+                for t in threads:
+                    t.join()
+                # Layer 6 Safety: Check if 'self' still exists in Qt land
+                self.warmup_status_update.emit("✅ READY", 100, True)
+                logger.info("🚀 All systems online - Initialization Complete.")
+            except (RuntimeError, AttributeError):
+                logger.warning("Monitor: UI context lost during warmup. Skipping signal.")
+
+        threading.Thread(target=_monitor, daemon=True).start()
+
+    async def _continuous_capture_loop(self):
+        """Asynchronous vision loop: periodically updates screen context for the Nexus."""
+        logger.info("👁️ Continuous Vision Loop Started.")
+        while self.is_running:
+            try:
+                # Only capture if session is active and user hasn't manually paused
+                if self.session_active and not (
+                    hasattr(self.audio, "_paused") and self.audio._paused
+                ):
+                    # Capture current screen state and push to context
+                    text = await self.screen.capture_context()
+                    if text:
+                        # self._on_screen_text(text)  # Optional: logic for auto-trigger
+                        self.nexus.push("screen", text)
+
+                # Dynamic interval based on performance settings (Default: 3s)
+                interval = self.config.get("capture.screen.interval_ms", 3000) / 1000.0
+                await asyncio.sleep(interval)
+            except Exception as e:
+                logger.error(f"Vision Loop Error: {e}")
+                await asyncio.sleep(5)
+
+    def _stop_background_tasks(self):
+        """Stops all background AI monitoring and capture tasks."""
+        self.is_running = False
+        self._nexus_timer.stop()
+        if self.loop and self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(self.ai.stop_health_monitor(), self.loop)
+
+    def shutdown(self):
+        """Proper shutdown: stops health monitor, event loop, and joins thread."""
+        logger.info("🛑 Shutting down OpenAssist...")
+        self.is_running = False  # Signal all loops to break immediately
+
+        self._stop_background_tasks()
+
+        # Stop the event loop
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+
+        # Join the async thread
+        if self._async_thread.is_alive():
+            self._async_thread.join(timeout=3)
+
+        # Stop other components
+        self.audio.stop()
+        self.hotkeys.stop()
+        self.rag.stop()
+
+        # Save history
+        self.history.save()
+        logger.info("✅ OpenAssist shutdown complete")

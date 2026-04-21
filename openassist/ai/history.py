@@ -1,7 +1,9 @@
 """Response history with encrypted persistence and navigation."""
 
 import json
+import threading
 import time
+import inspect
 from pathlib import Path
 from typing import List, Optional
 from dataclasses import dataclass, field, asdict
@@ -16,9 +18,10 @@ class HistoryEntry:
     query: str
     response: str
     provider: str
-    mode: str
-    timestamp: float = field(default_factory=time.time)
+    mode: str = "general"
     latency: float = 0.0
+    timestamp: float = field(default_factory=time.time)
+    metadata: dict = field(default_factory=dict)
 
 
 class ResponseHistory:
@@ -40,6 +43,7 @@ class ResponseHistory:
             str(self.history_dir / f"{self.current_session_id}.enc")
         )
         self.current_index = -1
+        self._lock = threading.Lock()
 
         # Load existing sessions index if any
         self.sessions = self.index_storage.get("sessions_index") or []
@@ -82,39 +86,43 @@ class ResponseHistory:
         self,
         query: str,
         response: str,
-        provider: str = "",
-        mode: str = "",
-        latency: float = 0,
+        provider: str,
+        mode: str = "general",
+        latency: float = 0.0,
+        metadata: dict = None,
     ):
+        """Add entry to current session."""
         entry = HistoryEntry(
             query=query,
             response=response,
             provider=provider,
             mode=mode,
             latency=latency,
+            metadata=metadata or {},
         )
-        self.entries.append(entry)
-        if len(self.entries) > self.max:
-            self.entries = self.entries[-self.max :]
+        with self._lock:
+            self.entries.append(entry)
+            if len(self.entries) > self.max:
+                self.entries = self.entries[-self.max :]
 
-        # Auto-set current_index to latest entry
-        self.current_index = len(self.entries) - 1
+            # Auto-set current_index to latest entry
+            self.current_index = len(self.entries) - 1
 
-        # Update index snippet with first query
-        if len(self.entries) == 1:
+            # Update index snippet with first query
+            if len(self.entries) == 1:
+                for s in self.sessions:
+                    if s["id"] == self.current_session_id:
+                        s["snippet"] = query[:50] + ("..." if len(query) > 50 else "")
+                        break
+
+            # Update entry count in index
             for s in self.sessions:
                 if s["id"] == self.current_session_id:
-                    s["snippet"] = query[:50] + ("..." if len(query) > 50 else "")
+                    s["entry_count"] = len(self.entries)
                     break
 
-        # Update entry count in index
-        for s in self.sessions:
-            if s["id"] == self.current_session_id:
-                s["entry_count"] = len(self.entries)
-                break
-
-        self.index_storage.set("sessions_index", self.sessions)
-        self.save()
+            self.index_storage.set("sessions_index", self.sessions)
+            self._save_unlocked()
 
     def move_prev(self) -> bool:
         """Moves current_index back one entry. Returns True if index changed."""
@@ -142,39 +150,66 @@ class ResponseHistory:
         return None
 
     def get_last(self, n: int = 10) -> List[HistoryEntry]:
-        return self.entries[-n:]
+        with self._lock:
+            return self.entries[-n:]
 
     def load_session(self, session_id: str):
         """Loads a specific session into memory."""
         self.save()  # Save current first
         target_path = self.history_dir / f"{session_id}.enc"
         if target_path.exists():
-            self.current_session_id = session_id
-            self.current_storage = SecureStorage(str(target_path))
-            data = self.current_storage.get("history_data")
-            if data and isinstance(data, list):
-                self.entries = [HistoryEntry(**e) for e in data]
-                self.current_index = len(self.entries) - 1
-                logger.info(
-                    f"📜 Loaded session {session_id} ({len(self.entries)} entries)"
-                )
-            else:
-                self.entries = []
+            with self._lock:
+                self.current_session_id = session_id
+                self.current_storage = SecureStorage(str(target_path))
+                self._load_unlocked()
         else:
             logger.error(f"Session file not found: {session_id}")
 
+    def read_session(self, session_id: str) -> List[HistoryEntry]:
+        """Read a session without mutating the active in-memory session."""
+        target_path = self.history_dir / f"{session_id}.enc"
+        if not target_path.exists():
+            logger.error(f"Session file not found: {session_id}")
+            return []
+
+        try:
+            storage = SecureStorage(str(target_path))
+            return self._entries_from_storage(storage)
+        except Exception as e:
+            logger.warning(f"Failed to read session {session_id}: {e}")
+            return []
+
     def load(self):
         """Load current session from its encrypted storage."""
+        with self._lock:
+            self._load_unlocked()
+
+    def _load_unlocked(self):
+        """Internal load logic, resilient to schema changes."""
         try:
-            data = self.current_storage.get("history_data")
-            if data and isinstance(data, list):
-                self.entries = [HistoryEntry(**e) for e in data]
-                self.current_index = len(self.entries) - 1
+            self.entries = self._entries_from_storage(self.current_storage)
+            self.current_index = len(self.entries) - 1
         except Exception as e:
             logger.warning(f"Failed to load history: {e}")
 
+    def _entries_from_storage(self, storage: SecureStorage) -> List[HistoryEntry]:
+        data = storage.get("history_data")
+        if not data or not isinstance(data, list):
+            return []
+
+        valid_fields = set(inspect.signature(HistoryEntry).parameters.keys())
+        entries = []
+        for e in data:
+            filtered = {k: v for k, v in e.items() if k in valid_fields}
+            entries.append(HistoryEntry(**filtered))
+        return entries
+
     def save(self):
         """Save current session to its encrypted storage."""
+        with self._lock:
+            self._save_unlocked()
+
+    def _save_unlocked(self):
         if not self.entries:
             return
         try:
@@ -187,7 +222,7 @@ class ResponseHistory:
         """Emergency Wipe: Purge memory and ALL session files from disk."""
         self.entries.clear()
         self.current_index = -1
-        
+
         # RESTORATION: Total Disk Purge logic
         logger.warning("🚨 EMERGENCY DISK PURGE INITIATED")
         try:
@@ -198,14 +233,14 @@ class ResponseHistory:
                     logger.debug(f"Removed trace: {enc_file.name}")
                 except Exception as e:
                     logger.error(f"Failed to remove {enc_file}: {e}")
-            
+
             # 2. Re-initialize empty state
             self.sessions = []
             self.index_storage.set("sessions_index", [])
-            
+
         except Exception as e:
             logger.error(f"Global purge failed: {e}")
-            
+
         logger.info("🗑️ Global history and disk traces cleared")
 
     def search(self, keyword: str) -> List[HistoryEntry]:

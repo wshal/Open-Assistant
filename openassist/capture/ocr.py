@@ -3,13 +3,14 @@ Multi-backend OCR - OpenAssist v4.1 (Midnight Hardened).
 RESTORATION: Implemented native Windows OCR (WinRT) fallback.
 """
 
-from typing import Optional
-import threading
 import asyncio
-from PIL import Image
-from utils.logger import setup_logger
-import numpy as np
 import io
+import threading
+from typing import List, Optional, Tuple
+
+from PIL import Image
+
+from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -26,60 +27,61 @@ class OCREngine:
             if self._loaded:
                 return
 
-            # 1. Preferred: EasyOCR (High Accuracy)
+            # 1. Preferred: Windows Native WinRT OCR (High Speed, Sub-100ms)
+            try:
+                import winrt.windows.media.ocr as ocr
+                from winrt.windows.globalization import Language
+                
+                if ocr.OcrEngine.is_language_supported(Language("en-US")):
+                    self.engine = ocr.OcrEngine.try_create_from_user_profile_languages()
+                    self.name = "winrt"
+                    self._loaded = True
+                    logger.info("  ✅ Windows Native OCR ready (Primary)")
+                    return
+            except Exception as e:
+                logger.debug(f"WinRT load failed: {e}")
+
+            # 2. Fallback: EasyOCR (High Accuracy, slower)
             try:
                 import easyocr
                 self.engine = easyocr.Reader(["en"], gpu=False, verbose=False)
                 self.name = "easyocr"
                 self._loaded = True
-                logger.info("  ✅ EasyOCR ready (lazy loaded)")
+                logger.info("  ✅ EasyOCR ready (Fallback)")
                 return
-            except ImportError:
-                pass
-
-            # 2. Fallback: Windows Native WinRT OCR
-            try:
-                import winrt.windows.media.ocr as ocr
-                import winrt.windows.graphics.imaging as imaging
-                import winrt.windows.storage.streams as streams
-                
-                # Check for English support
-                from winrt.windows.globalization import Language
-                if ocr.OcrEngine.is_language_supported(Language("en-US")):
-                    self.engine = ocr.OcrEngine.try_create_from_user_profile_languages()
-                    self.name = "winrt"
-                    self._loaded = True
-                    logger.info("  ✅ Windows Native OCR ready (fallback)")
-                    return
             except ImportError:
                 pass
 
             logger.warning("  No OCR engine detected. Run: pip install easyocr")
 
-    def extract(self, img: Image.Image) -> Tuple[Optional[str], List[Tuple[int, int, int, int]]]:
+    async def extract(self, img: Image.Image) -> Tuple[Optional[str], List[Tuple[int, int, int, int]]]:
         """EXTRACT: Extracts text and bounding boxes (Vision Focus)."""
         self._ensure_loaded()
         if not self._loaded: return None, []
 
         try:
-            if self.name == "easyocr" and self.engine:
-                arr = np.array(img)
-                result = self.engine.readtext(arr)
-                if not result: return None, []
-                text = "\n".join(r[1] for r in result)
-                # Box: [ [x,y], [x,y], [x,y], [x,y] ] -> (min_x, min_y, max_x, max_y)
-                boxes = []
-                for res in result:
-                    pts = res[0]
-                    boxes.append((int(pts[0][0]), int(pts[0][1]), int(pts[2][0]), int(pts[2][1])))
-                return text, boxes
+            if self.name == "winrt" and self.engine:
+                return await self._extract_winrt(img)
             
-            elif self.name == "winrt" and self.engine:
-                return asyncio.run(self._extract_winrt(img))
+            elif self.name == "easyocr" and self.engine:
+                import numpy as np
+                arr = np.array(img)
+                # Note: EasyOCR is sync, but we wrap it in a thread to keep extract() consistent
+                return await asyncio.to_thread(self._extract_sync_easyocr, arr)
                 
         except Exception as e:
             logger.debug(f"OCR Runtime Error ({self.name}): {e}")
         return None, []
+
+    def _extract_sync_easyocr(self, arr):
+        result = self.engine.readtext(arr)
+        if not result: return None, []
+        text = "\n".join(r[1] for r in result)
+        boxes = []
+        for res in result:
+            pts = res[0]
+            boxes.append((int(pts[0][0]), int(pts[0][1]), int(pts[2][0]), int(pts[2][1])))
+        return text, boxes
 
     async def _extract_winrt(self, img: Image.Image) -> Tuple[Optional[str], List[Tuple[int, int, int, int]]]:
         """NATIVE RESTORATION: Windows.Media.Ocr logic with box tracking."""
