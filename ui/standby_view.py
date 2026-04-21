@@ -1,25 +1,25 @@
 """
-Premium Standby View - OpenAssist AI v4.1 (Midnight Hardened).
-RESTORATION: High-density horizontal grid, Active Model Dashboard.
-ENHANCEMENT: Borderless status pills for a cleaner 'flat' aesthetic.
-FIXED: Removed square borders from audio/stealth indicators.
+Premium Standby View - OpenAssist AI.
+
+Refined for:
+- safer icon handling via Unicode escape sequences
+- cleaner, centralized UI constants
+- more responsive footer/button sizing
+- clearer provider dashboard empty state
 """
 
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QGridLayout,
-    QLabel,
-    QPushButton,
     QFrame,
+    QHBoxLayout,
+    QLabel,
     QProgressBar,
-    QSpacerItem,
+    QPushButton,
     QSizePolicy,
-    QScrollArea,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QColor, QFont
+
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -30,35 +30,115 @@ class StandbyView(QWidget):
     mode_selected = pyqtSignal(str)
     audio_source_changed = pyqtSignal(str)
 
-    # MASTER SELECTION STYLES (Explicit Injection)
+    HERO_ICON = "\U0001F9E0"
+    MODE_OPTIONS = [
+        [("\U0001F9E0", "GENERAL"), ("\U0001F3AF", "INTERVIEW")],
+        [("\U0001F4BB", "CODING"), ("\U0001F91D", "MEETING")],
+        [("\U0001F393", "EXAM"), ("\u270D\uFE0F", "WRITING")],
+    ]
+    AUDIO_OPTIONS = [
+        ("\U0001F399\uFE0F MIC", "mic"),
+        ("\U0001F50A SYSTEM", "system"),
+        ("\U0001F310 BOTH", "both"),
+    ]
+    STATUS_ITEMS = [
+        ("\U0001F399\uFE0F", "STABLE"),
+        ("\u2728", "SYNCED"),
+        ("\U0001F6E1\uFE0F", "ACTIVE"),
+    ]
+
     STYLE_INACTIVE = """
         QPushButton {
-            color: #94a3b8; 
-            background: rgba(30,32,45,180); 
-            border: 1px solid rgba(80,85,255,15); 
-            border-radius: 8px; 
-            padding: 8px 12px; 
+            color: #94a3b8;
+            background: rgba(28, 30, 43, 210);
+            border: 1px solid rgba(99, 102, 241, 18);
+            border-radius: 12px;
+            padding: 8px 14px;
             font-size: 10px;
             font-weight: 700;
-            letter-spacing: 1px;
+            letter-spacing: 1.2px;
         }
         QPushButton:hover {
-            background: rgba(45,50,90,240);
-            border: 1px solid rgba(120,130,255,40);
+            background: rgba(42, 45, 68, 240);
+            border: 1px solid rgba(129, 140, 248, 42);
             color: white;
         }
     """
 
     STYLE_ACTIVE = """
         QPushButton {
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #4f46e5, stop:1 #7c3aed); 
-            color: white; 
-            border: 1px solid rgba(255,255,255,60);
-            border-radius: 8px; 
-            padding: 8px 12px; 
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:1,
+                stop:0 #5b4cf1,
+                stop:0.55 #6d4cf6,
+                stop:1 #8b5cf6
+            );
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 72);
+            border-radius: 12px;
+            padding: 8px 14px;
             font-size: 10px;
-            font-weight: 800; 
-            letter-spacing: 1px;
+            font-weight: 800;
+            letter-spacing: 1.2px;
+        }
+    """
+
+    START_BUTTON_STYLE = """
+        QPushButton {
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:1,
+                stop:0 #5b4cf1,
+                stop:0.55 #7047f5,
+                stop:1 #8b5cf6
+            );
+            color: white;
+            border-radius: 26px;
+            font-weight: 900;
+            font-size: 13px;
+            letter-spacing: 3px;
+            border: 1px solid rgba(255, 255, 255, 18);
+        }
+        QPushButton:hover:enabled {
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:1,
+                stop:0 #6a68ff,
+                stop:1 #9b6bff
+            );
+            border: 1px solid rgba(255, 255, 255, 40);
+        }
+        QPushButton:disabled {
+            background: rgba(255, 255, 255, 0.03);
+            color: rgba(255, 255, 255, 0.10);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+    """
+
+    START_BUTTON_READY_STYLE = """
+        QPushButton {
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:1,
+                stop:0 #10b981,
+                stop:1 #059669
+            );
+            color: white;
+            border-radius: 26px;
+            font-weight: 900;
+            font-size: 13px;
+            letter-spacing: 3px;
+            border: 1px solid rgba(255, 255, 255, 18);
+        }
+        QPushButton:hover:enabled {
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:1,
+                stop:0 #34d399,
+                stop:1 #10b981
+            );
+            border: 1px solid rgba(255, 255, 255, 40);
+        }
+        QPushButton:disabled {
+            background: rgba(255, 255, 255, 0.03);
+            color: rgba(255, 255, 255, 0.10);
+            border: 1px solid rgba(255, 255, 255, 0.05);
         }
     """
 
@@ -67,19 +147,18 @@ class StandbyView(QWidget):
         self.provider_status_widgets = {}
         self.mode_buttons = {}
         self.audio_btns = {}
-        
+
         self._init_ui()
         self._connect_state()
-        
-        # MASTER SYNC SEQUENCE: Multiple intervals with forced defaults
         self._schedule_boot_sync()
 
     def _connect_state(self):
-        if hasattr(self.parent(), "app"):
-            self.parent().app.state.mode_changed.connect(self.set_current_mode)
-            self.parent().app.state.audio_source_changed.connect(
-                self.set_current_audio_source
-            )
+        parent = self.parent()
+        app = getattr(parent, "app", None)
+        state = getattr(app, "state", None)
+        if state is not None:
+            state.mode_changed.connect(self.set_current_mode)
+            state.audio_source_changed.connect(self.set_current_audio_source)
 
     def showEvent(self, event):
         """Final UI sync trigger on window mapping."""
@@ -87,153 +166,193 @@ class StandbyView(QWidget):
         self._schedule_boot_sync()
 
     def _init_ui(self):
-        # MASTER LAYOUT: Global spacing 0; total control via hard spacers
         self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(30, 45, 30, 45)
-        self.main_layout.setSpacing(0) 
+        self.main_layout.setContentsMargins(25, 18, 25, 30)
+        self.main_layout.setSpacing(0)
 
         layout = self.main_layout
 
-        # 1. Hero
-        self.hero_label = QLabel("🧠")
-        self.hero_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.hero_label.setStyleSheet("font-size: 70px; background: transparent; margin-bottom: 2px;")
-        layout.addWidget(self.hero_label)
-
-        layout.addSpacing(10)
-
-        self.subtitle = QLabel("NEURAL ENGINE INITIALIZING...")
-        self.subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.subtitle.setStyleSheet(
-            "font-size: 9px; color: #6366f1; letter-spacing: 3px; font-weight: 900;"
+        self.hero_container = QFrame()
+        self.hero_container.setFixedHeight(138)
+        self.hero_container.setStyleSheet(
+            """
+            QFrame {
+                background: qradialgradient(
+                    cx:0.5, cy:0.42, radius:0.72,
+                    fx:0.5, fy:0.35,
+                    stop:0 rgba(167, 139, 250, 72),
+                    stop:0.35 rgba(99, 102, 241, 26),
+                    stop:1 rgba(0, 0, 0, 0)
+                );
+                border: none;
+                border-radius: 28px;
+            }
+            """
         )
-        layout.addWidget(self.subtitle)
+        hero_layout = QVBoxLayout(self.hero_container)
+        hero_layout.setContentsMargins(0, 0, 0, 16)
+        hero_layout.setSpacing(0)
 
-        layout.addSpacing(25)
-
-        # 2. Status Row
-        status_layout = QHBoxLayout()
-        status_layout.setSpacing(12)
-        self.mic_pill = self._create_status_pill("🎙️", "STABLE")
-        self.ai_pill = self._create_status_pill("✨", "SYNCED")
-        self.stealth_pill = self._create_status_pill("🛡️", "ACTIVE")
-        status_layout.addWidget(self.mic_pill)
-        status_layout.addWidget(self.ai_pill)
-        status_layout.addWidget(self.stealth_pill)
-        layout.addLayout(status_layout)
+        self.hero_label = QLabel(self.HERO_ICON)
+        self.hero_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.hero_label.setStyleSheet(
+            """
+            font-size: 80px;
+            background: transparent;
+            margin-bottom: 0px;
+            color: #f3e8ff;
+            """
+        )
+        self.hero_label.setMinimumHeight(88)
+        hero_layout.addWidget(self.hero_label, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        hero_layout.addStretch(1)
+        layout.addWidget(self.hero_container)
 
         layout.addSpacing(30)
 
-        # 3. Mode Selection - FORCED SPACING Rows
+        self.subtitle = QLabel("NEURAL ENGINE INITIALIZING...")
+        self.subtitle.setFixedHeight(18)
+        self.subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.subtitle.setStyleSheet(
+            """
+            font-size: 9px;
+            color: #9aa5ff;
+            letter-spacing: 3px;
+            font-weight: 900;
+            background: transparent;
+            """
+        )
+        layout.addWidget(self.subtitle)
+
+        layout.addSpacing(18)
+
+        status_layout = QHBoxLayout()
+        status_layout.setSpacing(10)
+        status_widgets = [
+            self._create_status_pill(icon, label) for icon, label in self.STATUS_ITEMS
+        ]
+        self.mic_pill, self.ai_pill, self.stealth_pill = status_widgets
+        for pill in status_widgets:
+            status_layout.addWidget(pill)
+        layout.addLayout(status_layout)
+
+        layout.addSpacing(25)
+
         lbl_m = QLabel("AI MODES")
         lbl_m.setStyleSheet(
-            "font-size: 9px; color: #475569; font-weight: 900; letter-spacing: 2.5px;"
+            "font-size: 10px; color: #64748b; font-weight: 900; letter-spacing: 3px;"
         )
         lbl_m.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(lbl_m)
 
-        layout.addSpacing(15)
+        layout.addSpacing(14)
 
-        modes = [
-            [("🧠", "GENERAL"), ("🎯", "INTERVIEW")],
-            [("💻", "CODING"), ("🤝", "MEETING")],
-            [("🎓", "EXAM"), ("✍️", "WRITING")]
-        ]
-        
-        for row_data in modes:
+        for row_data in self.MODE_OPTIONS:
             row_layout = QHBoxLayout()
-            row_layout.setSpacing(15)
+            row_layout.setSpacing(12)
             for icon, name in row_data:
                 btn = QPushButton(f"{icon} {name}")
                 btn.setCheckable(True)
-                btn.setFixedHeight(38)
+                btn.setFixedHeight(40)
                 btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                btn.clicked.connect(lambda checked, n=name.lower(): self._on_mode_btn_clicked(n))
-                # Set initial inactive state
+                btn.clicked.connect(
+                    lambda checked=False, n=name.lower(): self._on_mode_btn_clicked(n)
+                )
                 btn.setStyleSheet(self.STYLE_INACTIVE)
                 row_layout.addWidget(btn)
-                # Map lowercase cleaned key
-                self.mode_buttons[name.strip().lower()] = btn
+                self.mode_buttons[name.lower()] = btn
             layout.addLayout(row_layout)
-            layout.addSpacing(15) # EXPLICIT: Hardcoded vertical gap
+            layout.addSpacing(14)
 
-        layout.addSpacing(10)
+        layout.addSpacing(12)
 
-        # 4. Audio Selection
         lbl_a = QLabel("CAPTURE SOURCE")
         lbl_a.setStyleSheet(
-            "font-size: 9px; color: #475569; font-weight: 900; letter-spacing: 2px;"
+            "font-size: 10px; color: #64748b; font-weight: 900; letter-spacing: 2.5px;"
         )
         lbl_a.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(lbl_a)
 
-        layout.addSpacing(15)
+        layout.addSpacing(14)
 
         audio_layout = QHBoxLayout()
-        audio_layout.setSpacing(12)
-        sources = [
-            ("🎙️ MIC", "mic"),
-            ("🔊 SYSTEM", "system"),
-            ("🌐 BOTH", "both"),
-        ]
-        for label, name in sources:
+        audio_layout.setSpacing(10)
+        for label, name in self.AUDIO_OPTIONS:
             btn = QPushButton(label)
             btn.setCheckable(True)
-            btn.setFixedHeight(38)
+            btn.setFixedHeight(40)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setStyleSheet(self.STYLE_INACTIVE)
-            btn.clicked.connect(lambda checked, n=name: self._on_audio_btn_clicked(n))
+            btn.clicked.connect(
+                lambda checked=False, n=name: self._on_audio_btn_clicked(n)
+            )
             audio_layout.addWidget(btn)
-            self.audio_btns[name.strip().lower()] = btn
+            self.audio_btns[name] = btn
         layout.addLayout(audio_layout)
 
         layout.addSpacing(25)
 
-        # 5. Active Models Dashboard
         self.model_bar = QFrame()
-        self.model_bar.setFixedHeight(32)
+        self.model_bar.setFixedHeight(34)
         self.model_bar.setStyleSheet(
-            "background: rgba(0,0,0,0.4); border-radius: 16px; border: 1px solid rgba(255,255,255,5);"
+            """
+            QFrame {
+                background: rgba(14, 16, 28, 205);
+                border-radius: 17px;
+                border: 1px solid rgba(99, 102, 241, 24);
+            }
+            """
         )
         self.model_bar_layout = QHBoxLayout(self.model_bar)
         self.model_bar_layout.setContentsMargins(15, 0, 15, 0)
-        self.model_bar_layout.setSpacing(12)
+        self.model_bar_layout.setSpacing(15)
         self.model_bar_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.model_bar)
+        self.set_provider_statuses({})
 
-        # BOTTOM STRETCH: Enforces that all items Above stay compact and spaced correctly
-        layout.addStretch(1) 
+        layout.addStretch(1)
 
         footer_container = QVBoxLayout()
-        footer_container.setSpacing(12)
+        footer_container.setSpacing(15)
         footer_container.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setFixedHeight(4)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar { background: rgba(255,255,255,0.03); border-radius: 3px; border: none; } 
-            QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #4f46e5, stop:1 #7c3aed); border-radius: 3px; }
-        """)
+        self.progress_bar.setStyleSheet(
+            """
+            QProgressBar {
+                background: rgba(255, 255, 255, 0.035);
+                border-radius: 2px;
+                border: none;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #6a68ff,
+                    stop:1 #c15cff
+                );
+                border-radius: 2px;
+            }
+            """
+        )
         footer_container.addWidget(self.progress_bar)
 
-        self.start_btn = QPushButton("SESSION READY")
-        self.start_btn.setFixedSize(320, 56)
+        self.start_btn = QPushButton("START SESSION")
+        self.start_btn.setMinimumHeight(52)
+        self.start_btn.setMinimumWidth(260)
+        self.start_btn.setMaximumWidth(420)
+        self.start_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.start_btn.setEnabled(False)
-        self.start_btn.setStyleSheet("""
-            QPushButton { 
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #4f46e5, stop:1 #7c3aed); 
-                color: white; border-radius: 28px; font-weight: 900; font-size: 12px; letter-spacing: 3px;
-                border: 1px solid rgba(255,255,255,10);
-            }
-            QPushButton:hover:enabled { background: #6366f1; border: 1px solid rgba(255,255,255,40); }
-            QPushButton:disabled { background: rgba(255,255,255,0.02); color: rgba(255, 255, 255, 0.1); border: none; }
-        """)
+        self.start_btn.setStyleSheet(self.START_BUTTON_STYLE)
         self.start_btn.clicked.connect(self.start_clicked.emit)
         footer_container.addWidget(self.start_btn, 0, Qt.AlignmentFlag.AlignCenter)
-        
+
         footer_container.addSpacing(10)
         layout.addLayout(footer_container)
 
@@ -242,6 +361,14 @@ class StandbyView(QWidget):
             item = self.model_bar_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+
+        if not statuses:
+            badge = QLabel("WAITING FOR PROVIDERS")
+            badge.setStyleSheet(
+                "color: #64748b; font-size: 9px; font-weight: 900; letter-spacing: 1.8px;"
+            )
+            self.model_bar_layout.addWidget(badge)
+            return
 
         for pid, info in statuses.items():
             state = info.get("state", "unknown")
@@ -263,15 +390,16 @@ class StandbyView(QWidget):
         self.mode_selected.emit(name)
 
     def set_current_mode(self, name):
-        """EXPLICIT STYLE INJECTION: Force-sets Indigo Glow on selection."""
-        if not name: return
+        """Force the active mode button to the highlighted style."""
+        if not name:
+            return
+
         target = str(name).strip().lower()
-        logger.debug(f"Injecting Mode Highlight: '{target}'")
-        
-        for m_name, btn in self.mode_buttons.items():
-            active = (m_name == target)
+        logger.debug("Injecting Mode Highlight: '%s'", target)
+
+        for mode_name, btn in self.mode_buttons.items():
+            active = mode_name == target
             btn.setChecked(active)
-            # DIRECT INJECTION - Deterministic and Bulletproof
             btn.setStyleSheet(self.STYLE_ACTIVE if active else self.STYLE_INACTIVE)
 
     def _on_audio_btn_clicked(self, name):
@@ -279,13 +407,15 @@ class StandbyView(QWidget):
         self.audio_source_changed.emit(name)
 
     def set_current_audio_source(self, name):
-        """EXPLICIT STYLE INJECTION: Force-sets Indigo Glow on selection."""
-        if not name: return
+        """Force the active audio source button to the highlighted style."""
+        if not name:
+            return
+
         target = str(name).strip().lower()
-        logger.debug(f"Injecting Audio Highlight: '{target}'")
-        
-        for n, btn in self.audio_btns.items():
-            active = (n == target)
+        logger.debug("Injecting Audio Highlight: '%s'", target)
+
+        for source_name, btn in self.audio_btns.items():
+            active = source_name == target
             btn.setChecked(active)
             btn.setStyleSheet(self.STYLE_ACTIVE if active else self.STYLE_INACTIVE)
 
@@ -295,43 +425,42 @@ class StandbyView(QWidget):
         self.start_btn.setEnabled(ready)
         if ready:
             self.start_btn.setText("SESSION READY")
-            curr_ss = self.start_btn.styleSheet()
-            new_ss = curr_ss.replace("#4f46e5", "#10b981").replace("#7c3aed", "#059669")
-            self.start_btn.setStyleSheet(new_ss)
+            self.start_btn.setStyleSheet(self.START_BUTTON_READY_STYLE)
         else:
             self.start_btn.setText("START SESSION")
-            curr_ss = self.start_btn.styleSheet()
-            new_ss = curr_ss.replace("#10b981", "#4f46e5").replace("#059669", "#7c3aed")
-            self.start_btn.setStyleSheet(new_ss)
+            self.start_btn.setStyleSheet(self.START_BUTTON_STYLE)
 
     def _create_status_pill(self, label, status):
-        f = QFrame()
-        f.setFixedHeight(30)
-        f.setStyleSheet(
-            "background: rgba(255,255,255,0.05); border: none; border-radius: 15px;"
+        frame = QFrame()
+        frame.setFixedHeight(30)
+        frame.setStyleSheet(
+            "background: rgba(255,255,255,0.055); border: 1px solid rgba(255,255,255,0.03); border-radius: 15px;"
         )
-        l = QHBoxLayout(f)
-        l.setContentsMargins(15, 0, 15, 0)
-        l.setSpacing(5)
-        l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        t1 = QLabel(label)
-        t2 = QLabel(status)
-        t1.setStyleSheet("font-size: 11px;")
-        t2.setStyleSheet("font-size: 10px; color: #818cf8; font-weight: 900;")
-        l.addWidget(t1)
-        l.addWidget(t2)
-        f.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        return f
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(15, 0, 15, 0)
+        layout.setSpacing(5)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        icon_label = QLabel(label)
+        text_label = QLabel(status)
+        icon_label.setStyleSheet("font-size: 11px;")
+        text_label.setStyleSheet(
+            "font-size: 10px; color: #8f9bff; font-weight: 900; letter-spacing: 1.2px;"
+        )
+        layout.addWidget(icon_label)
+        layout.addWidget(text_label)
+        frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        return frame
 
     def _apply_initial_highlights(self):
-        """Hardened Boot Sync with forced defaults."""
+        """Hardened boot sync with forced defaults."""
         mode, audio = self._resolve_initial_selection()
-        logger.info(f"BOOT SYNC: Mode='{mode}', Audio='{audio}'")
+        logger.info("BOOT SYNC: Mode='%s', Audio='%s'", mode, audio)
         self.set_current_mode(mode)
         self.set_current_audio_source(audio)
 
     def refresh_highlights(self, mode=None, audio=None):
-        """Force refresh selection pills from explicit values or resolved state."""
+        """Force refresh selection states from explicit values or resolved state."""
         resolved_mode, resolved_audio = self._resolve_initial_selection()
         self.set_current_mode(mode or resolved_mode)
         self.set_current_audio_source(audio or resolved_audio)
@@ -342,6 +471,7 @@ class StandbyView(QWidget):
 
         parent = self.parent()
         app = getattr(parent, "app", None)
+
         if app and hasattr(app, "state"):
             state = app.state
             mode = (getattr(state, "mode", None) or mode).strip().lower()
@@ -349,9 +479,7 @@ class StandbyView(QWidget):
 
         if app and hasattr(app, "config"):
             mode = (app.config.get("ai.mode", mode) or mode).strip().lower()
-            audio = (
-                app.config.get("capture.audio.mode", audio) or audio
-            ).strip().lower()
+            audio = (app.config.get("capture.audio.mode", audio) or audio).strip().lower()
 
         return mode or "general", audio or "system"
 
