@@ -3,7 +3,8 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -14,6 +15,7 @@ from capture.screen import ScreenCapture
 from core.config import Config
 from core.hotkeys import HotkeyManager
 from core.state import AppState
+from utils.platform_utils import WindowUtils
 
 
 class ConfigStub:
@@ -103,6 +105,41 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         self.assertEqual(audio.capture_mode, "mic")
         self.assertEqual(audio.last_mode, "mic")
         self.assertEqual(start_calls, ["start"])
+
+    def test_find_system_audio_source_prefers_stereo_mix_over_output_loopback(self):
+        audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
+
+        fake_devices = [
+            {
+                "name": "Speakers (Realtek(R) Audio)",
+                "hostapi": 2,
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+            },
+            {
+                "name": "Stereo Mix (Realtek(R) Audio)",
+                "hostapi": 2,
+                "max_input_channels": 2,
+                "max_output_channels": 0,
+            },
+        ]
+        fake_hostapis = [{"name": "Windows WASAPI"}]
+
+        with patch("sounddevice.query_devices", return_value=fake_devices), patch(
+            "sounddevice.query_hostapis", return_value=fake_hostapis
+        ):
+            self.assertEqual(
+                audio._find_system_audio_source(),
+                (1, "Stereo Mix (Realtek(R) Audio)", False),
+            )
+
+    def test_resample_to_target_rate_matches_configured_rate(self):
+        audio = AudioCapture(ConfigStub({"capture.audio.sample_rate": 16000}))
+        samples = np.ones((480, 2), dtype=np.float32)
+
+        resampled = audio._resample_to_target_rate(samples, 48000)
+
+        self.assertEqual(resampled.shape, (160, 2))
 
 
 class AIEngineParallelOrderingTests(unittest.TestCase):
@@ -391,6 +428,49 @@ class ScreenCaptureContextTests(unittest.TestCase):
         result = asyncio.run(ScreenCapture.capture_context(capture))
 
         self.assertEqual(result, "cached text")
+
+
+class WindowUtilsTests(unittest.TestCase):
+    def test_hide_from_taskbar_marks_window_once_on_windows(self):
+        class FakeWindow:
+            def winId(self):
+                return 101
+
+        class FakeUser32:
+            def __init__(self):
+                self.set_window_long_calls = 0
+                self.set_window_pos_calls = 0
+
+            @staticmethod
+            def GetAncestor(hwnd, flag):
+                return hwnd
+
+            @staticmethod
+            def GetWindowLongW(hwnd, index):
+                return 0x00040000
+
+            def SetWindowLongW(self, hwnd, index, style):
+                self.set_window_long_calls += 1
+                return style
+
+            def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+                self.set_window_pos_calls += 1
+                return 1
+
+        fake_user32 = FakeUser32()
+        fake_window = FakeWindow()
+
+        with patch("utils.platform_utils.PlatformInfo.IS_WINDOWS", True), patch(
+            "ctypes.windll", Mock(user32=fake_user32), create=True
+        ):
+            self.assertTrue(WindowUtils.hide_from_taskbar(fake_window))
+            self.assertTrue(fake_window._openassist_taskbar_hidden)
+            self.assertEqual(fake_user32.set_window_long_calls, 1)
+            self.assertEqual(fake_user32.set_window_pos_calls, 1)
+
+            self.assertTrue(WindowUtils.hide_from_taskbar(fake_window))
+            self.assertEqual(fake_user32.set_window_long_calls, 1)
+            self.assertEqual(fake_user32.set_window_pos_calls, 1)
 
 
 if __name__ == "__main__":

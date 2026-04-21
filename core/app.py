@@ -24,7 +24,7 @@ from ai.engine import AIEngine
 from ai.history import ResponseHistory
 from ai.rag import RAGEngine
 from core.nexus import ContextNexus
-from utils.platform_utils import ProcessUtils
+from utils.platform_utils import ProcessUtils, WindowUtils
 from ui.overlay import OverlayWindow
 from ui.mini_overlay import MiniOverlay
 from core.tray import SystemTray
@@ -286,6 +286,7 @@ class OpenAssistApp(QObject):
         is_stealth = bool(getattr(self.state, "is_stealth", False))
 
         window.setWindowOpacity(stealth_opacity if is_stealth else base_opacity)
+        WindowUtils.hide_from_taskbar(window)
         self.stealth.apply_to_window(window, is_stealth)
 
     def _create_system_tray(self):

@@ -126,6 +126,67 @@ class ScreenInfo:
         return 1.0
 
 
+class WindowUtils:
+    """Native window helpers used for packaging/runtime polish."""
+
+    @staticmethod
+    def hide_from_taskbar(window) -> bool:
+        """Hide a Qt window from the Windows taskbar.
+
+        This mirrors Electron's ``setSkipTaskbar(true)`` behavior by turning the
+        native HWND into a tool window and forcing Windows to refresh the frame.
+        Safe no-op on non-Windows platforms or before the native handle exists.
+        """
+        if not PlatformInfo.IS_WINDOWS or window is None:
+            return False
+
+        if getattr(window, "_openassist_taskbar_hidden", False):
+            return True
+
+        try:
+            import ctypes
+
+            hwnd = int(window.winId())
+            if hwnd == 0:
+                return False
+
+            user32 = ctypes.windll.user32
+            GA_ROOT = 2
+            GWL_EXSTYLE = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_APPWINDOW = 0x00040000
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+
+            root_hwnd = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+            style = user32.GetWindowLongW(root_hwnd, GWL_EXSTYLE)
+            updated_style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+            if updated_style != style:
+                user32.SetWindowLongW(root_hwnd, GWL_EXSTYLE, updated_style)
+                user32.SetWindowPos(
+                    root_hwnd,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOZORDER
+                    | SWP_NOACTIVATE
+                    | SWP_FRAMECHANGED,
+                )
+
+            window._openassist_taskbar_hidden = True
+            return True
+        except Exception as e:
+            logger.debug(f"Hide from taskbar skipped: {e}")
+            return False
+
+
 class ProcessUtils:
     """Process and system utilities."""
 

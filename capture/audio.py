@@ -167,43 +167,70 @@ class AudioCapture(QObject):
         import sounddevice as sd
 
         try:
+            devices = sd.query_devices()
+            for i, d in enumerate(devices):
+                if d["max_input_channels"] > 0 and any(
+                    x in d["name"].lower()
+                    for x in ["stereo mix", "cable", "vb-audio", "what u hear"]
+                ):
+                    return i, d["name"], False
+
             apis = sd.query_hostapis()
             wasapi_idx = next(
                 (i for i, a in enumerate(apis) if "WASAPI" in a["name"]), None
             )
-
             if wasapi_idx is not None:
-                devices = sd.query_devices()
                 for i, d in enumerate(devices):
                     if d["hostapi"] == wasapi_idx and d["max_output_channels"] > 0:
                         return i, d["name"], True
 
-            devices = sd.query_devices()
             for i, d in enumerate(devices):
                 if d["max_input_channels"] > 0 and any(
-                    x in d["name"].lower() for x in ["cable", "vb-audio", "stereo mix"]
+                    x in d["name"].lower()
+                    for x in ["microphone", "mic", "headset", "input"]
                 ):
                     return i, d["name"], False
         except Exception as e:
             logger.debug(f"Source discovery error: {e}")
         return None, "Default", False
 
+    def _resample_to_target_rate(self, indata, source_rate):
+        if source_rate == self.sr:
+            return indata.astype(np.float32, copy=False)
+
+        if indata.ndim == 1:
+            indata = indata.reshape(-1, 1)
+
+        frame_count = indata.shape[0]
+        if frame_count <= 1:
+            return indata.astype(np.float32, copy=False)
+
+        target_frames = max(1, int(round(frame_count * self.sr / source_rate)))
+        src_x = np.linspace(0.0, 1.0, frame_count, endpoint=False)
+        dst_x = np.linspace(0.0, 1.0, target_frames, endpoint=False)
+
+        resampled = np.empty((target_frames, indata.shape[1]), dtype=np.float32)
+        for ch in range(indata.shape[1]):
+            resampled[:, ch] = np.interp(dst_x, src_x, indata[:, ch])
+        return resampled
+
     def _capture_loop(self):
         import sounddevice as sd
 
-        def make_cb():
+        def make_cb(source_rate):
             def cb(indata, frames, time_info, status):
                 if status:
                     logger.debug(f"Audio Status: {status}")
                 if not self._paused and self._running:
                     try:
+                        normalized = self._resample_to_target_rate(indata, source_rate)
                         data = (
-                            np.mean(indata, axis=1, keepdims=True).astype(np.float32)
-                            if indata.shape[1] > 1
-                            else indata.copy().astype(np.float32)
+                            np.mean(normalized, axis=1, keepdims=True).astype(np.float32)
+                            if normalized.shape[1] > 1
+                            else normalized.copy().astype(np.float32)
                         )
                         self.q.put_nowait(data)
-                        self._current_rms = float(np.sqrt(np.mean(indata**2)))
+                        self._current_rms = float(np.sqrt(np.mean(normalized**2)))
                     except queue.Full:
                         logger.debug("Audio queue full; dropping frame")
 
@@ -218,8 +245,10 @@ class AudioCapture(QObject):
                         return
 
                     if mode in ["mic", "both"]:
+                        default_input = sd.query_devices(None, "input")
+                        mic_rate = int(default_input.get("default_samplerate", self.sr))
                         s_mic = sd.InputStream(
-                            samplerate=self.sr, channels=1, callback=make_cb()
+                            samplerate=mic_rate, channels=1, callback=make_cb(mic_rate)
                         )
                         self._active_streams.append(s_mic)
                         s_mic.start()
@@ -231,23 +260,27 @@ class AudioCapture(QObject):
                             logger.info(
                                 f"🎤 Binding to System Audio: {name} (Loopback: {is_loopback})"
                             )
+                            native_rate = int(d.get("default_samplerate", self.sr))
+                            input_channels = int(d.get("max_input_channels", 0))
+                            output_channels = int(d.get("max_output_channels", 0))
                             kwargs = {
                                 "device": idx,
-                                "samplerate": self.sr,
-                                "channels": 1,
-                                "callback": make_cb(),
+                                "samplerate": native_rate,
+                                "channels": max(
+                                    1, min(2, input_channels or output_channels or 1)
+                                ),
+                                "callback": make_cb(native_rate),
                             }
                             if is_loopback:
                                 try:
                                     kwargs["loopback"] = True
-                                    kwargs["channels"] = d.get("max_output_channels", 2)
+                                    kwargs["channels"] = max(
+                                        1, min(2, output_channels or 2)
+                                    )
                                     s_sys = sd.InputStream(**kwargs)
                                 except TypeError:
-                                    kwargs.pop("loopback", None)
-                                    kwargs["channels"] = d.get("max_output_channels", 2)
-                                    s_sys = sd.InputStream(**kwargs)
-                                    logger.warning(
-                                        f"Audio: Using {kwargs['channels']}ch capture fallback"
+                                    raise RuntimeError(
+                                        "Installed sounddevice build has no WASAPI loopback support"
                                     )
                             else:
                                 s_sys = sd.InputStream(**kwargs)
