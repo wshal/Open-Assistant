@@ -251,6 +251,13 @@ RULES:
                 "[TASK]\nAnswer the user's question using the current live session context. "
                 "Prefer the most recent on-screen evidence when relevant."
             )
+        elif origin == "quick":
+            parts.append(
+                "[TASK]\nGive the fastest useful context answer using the most recent live context. "
+                "Prioritize recent audio first, then visible screen context. "
+                "Keep it extremely concise and actionable.\n"
+                "FORMAT:\n- Quick Summary\n- Best Immediate Answer\n- Next Move"
+            )
 
         parts.append(f"Q: {query}")
         return "\n---\n".join(parts)

@@ -123,6 +123,25 @@ class Config:
         self._data.setdefault("ai", {})
         self._data["ai"].setdefault("vision", {})
         self._data["ai"]["vision"].setdefault("allow_paid_fallback", False)
+        self._data.setdefault("hotkeys", {})
+        hotkeys = self._data["hotkeys"]
+        hotkeys.setdefault("toggle", "ctrl+\\")
+        hotkeys.setdefault("toggle_click_through", "ctrl+m")
+        hotkeys.setdefault("analyze_screen", "ctrl+enter")
+        hotkeys.setdefault("quick_answer", "ctrl+shift+q")
+        hotkeys.setdefault("switch_mode", "ctrl+shift+m")
+        hotkeys.setdefault("move_up", "ctrl+up")
+        hotkeys.setdefault("move_down", "ctrl+down")
+        hotkeys.setdefault("move_left", "ctrl+left")
+        hotkeys.setdefault("move_right", "ctrl+right")
+        hotkeys.setdefault("scroll_up", "ctrl+shift+up")
+        hotkeys.setdefault("scroll_down", "ctrl+shift+down")
+        hotkeys.setdefault("history_prev", "ctrl+[")
+        hotkeys.setdefault("history_next", "ctrl+]")
+        hotkeys.setdefault("toggle_audio", "ctrl+shift+a")
+        hotkeys.setdefault("stealth", "ctrl+shift+z")
+        hotkeys.setdefault("mini_mode", "ctrl+alt+n")
+        hotkeys.setdefault("emergency_erase", "ctrl+shift+e")
 
     def _resolve_env(self, d):
         if isinstance(d, dict):

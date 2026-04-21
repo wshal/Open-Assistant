@@ -291,6 +291,97 @@ class AIEngine(QObject):
         except:
             return raw_text
 
+    async def generate_quick_response(
+        self,
+        nexus_snapshot: Dict[str, Any],
+        screen_context: str = "",
+        audio_context: str = "",
+    ) -> str:
+        """Fast path for hotkey-triggered context answers using cached context first."""
+        self._is_cancelled = False
+        start_time = time.time()
+        mode_id = self.config.get("ai.mode", "general")
+        query = (
+            "Using the latest live context, give a quick answer. "
+            "First summarize the current audio briefly, then give the most useful immediate response in 2-4 bullets."
+        )
+
+        provider, tier = self._select_provider(
+            mode_id,
+            "simple",
+            ["groq", "cerebras", "gemini", "together", "ollama"],
+        )
+        if not provider:
+            self.error_occurred.emit("No available AI provider found.")
+            return ""
+
+        summarized_audio = audio_context or nexus_snapshot.get("recent_audio", "")
+        if len(summarized_audio.split()) > 40:
+            summarized_audio = await self._summarize_audio_fast(summarized_audio)
+
+        sys_prompt = self.prompts.system(mode_id)
+        user_msg = self.prompts.user(
+            query=query,
+            screen=screen_context or nexus_snapshot.get("latest_ocr", ""),
+            audio=summarized_audio,
+            rag="",
+            mode=mode_id,
+            origin="quick",
+            nexus=nexus_snapshot,
+        )
+
+        try:
+            full_response = ""
+            async for chunk in provider.generate_stream(sys_prompt, user_msg):
+                if self._is_cancelled:
+                    return ""
+                full_response += chunk
+                self.response_chunk.emit(chunk)
+
+            latency_ms = (time.time() - start_time) * 1000
+            self.history.add(
+                query,
+                full_response,
+                provider=provider.name,
+                mode=mode_id,
+                latency=latency_ms,
+                metadata={"quick": True},
+            )
+            self.response_complete.emit(full_response)
+            return full_response
+        except Exception as e:
+            logger.error(f"Quick response error: {e}")
+            self.error_occurred.emit(str(e))
+            return ""
+
+    async def _summarize_audio_fast(self, audio_text: str) -> str:
+        """Compress recent audio into a short summary using the fastest provider."""
+        provider, tier = self._select_provider(
+            "general",
+            "simple",
+            ["groq", "cerebras", "gemini", "together", "ollama"],
+        )
+        if not provider:
+            return audio_text
+
+        prompt = (
+            "Summarize this recent audio in 1-2 short bullets. "
+            "Keep only the key ask, decision, or topic. No filler.\n\n"
+            f"{audio_text}"
+        )
+        try:
+            summary = ""
+            async for chunk in provider.generate_stream(
+                "You compress spoken context into very short, accurate notes.",
+                prompt,
+            ):
+                if self._is_cancelled:
+                    return audio_text
+                summary += chunk
+            return summary.strip() or audio_text
+        except Exception:
+            return audio_text
+
     async def analyze_image_response(
         self,
         query: str,

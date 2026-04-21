@@ -229,9 +229,19 @@ class OpenAssistApp(QObject):
             self.move_right()
 
     def toggle_click_through(self):
+        view = self._active_view()
+        was_visible = view.isVisible() if hasattr(view, "isVisible") else False
         self._click_through = not self._click_through
         self.overlay.set_click_through(self._click_through)
         self.mini_overlay.set_click_through(self._click_through)
+        if was_visible and hasattr(view, "show"):
+            view.show()
+        if hasattr(self.overlay, "update_transcript"):
+            self.overlay.update_transcript(
+                "Click-through enabled. Press Ctrl+M to restore interaction."
+                if self._click_through
+                else "Click-through disabled."
+            )
 
     # --- 🛠️ CONTROL BRIDGES ---
 
@@ -409,18 +419,72 @@ class OpenAssistApp(QObject):
 
     def toggle_overlay(self):
         v = self.mini_overlay if self.mini_mode else self.overlay
-        # Layer 6 Resilience: Force sync visibility
-        if v.isVisible() and v.windowOpacity() > 0:
-            v.hide()
-            logger.debug("👻 HUD Hidden via toggle.")
-        else:
+        if not v.isVisible() or v.windowOpacity() <= 0:
+            if self._click_through:
+                self.toggle_click_through()
             v.show()
             v.raise_()
             v.activateWindow()
             logger.debug("👁️ HUD Shown via toggle.")
+            return
+
+        if not self._click_through:
+            self.toggle_click_through()
+            logger.debug("🖱️ HUD switched to click-through mode.")
+            return
+
+        v.hide()
+        logger.debug("👻 HUD Hidden via toggle.")
 
     def quick_answer(self):
-        self.generate_response("Summarize current context.", "quick")
+        if not self._ai_lock_ready.wait(timeout=2):
+            return
+
+        request_epoch = self._generation_epoch
+        self.overlay.update_transcript("Preparing quick context answer...")
+
+        async def _quick_answer_flow():
+            if request_epoch != self._generation_epoch:
+                return
+
+            snapshot = self.nexus.get_snapshot()
+            audio_text = (
+                snapshot.get("recent_audio")
+                or self.audio.get_transcript()
+                or snapshot.get("full_audio_history", "")
+            )
+            screen_text = snapshot.get("latest_ocr", "")
+            using_cached_context = bool(audio_text or screen_text)
+
+            if using_cached_context:
+                context_parts = []
+                if audio_text:
+                    context_parts.append("cached audio")
+                if screen_text:
+                    context_parts.append("cached screen")
+                self.overlay.update_transcript(
+                    f"Quick answer using {' + '.join(context_parts)}..."
+                )
+
+            if not audio_text and not screen_text:
+                self.overlay.update_transcript(
+                    "Quick answer missing cached context. Refreshing screen once..."
+                )
+                screen_text = await self.screen.capture_context()
+                if screen_text and request_epoch == self._generation_epoch:
+                    self.nexus.push("screen", screen_text)
+                    snapshot = self.nexus.get_snapshot()
+
+            if request_epoch != self._generation_epoch:
+                return
+
+            await self.ai.generate_quick_response(
+                snapshot,
+                screen_context=screen_text,
+                audio_context=audio_text,
+            )
+
+        asyncio.run_coroutine_threadsafe(_quick_answer_flow(), self.loop)
 
     def analyze_current_screen(self):
         if not self.session_active:
@@ -498,18 +562,46 @@ class OpenAssistApp(QObject):
         self.state.is_muted = muted
 
     def scroll_up(self):
+        if (
+            hasattr(self.overlay, "stack")
+            and self.overlay.stack.currentWidget() is getattr(self.overlay, "settings_view", None)
+            and hasattr(self.overlay.settings_view, "scroll_up")
+        ):
+            self.overlay.settings_view.scroll_up()
+            return
         self.overlay.scroll_up()
         self.mini_overlay.scroll_up()
 
     def scroll_down(self):
+        if (
+            hasattr(self.overlay, "stack")
+            and self.overlay.stack.currentWidget() is getattr(self.overlay, "settings_view", None)
+            and hasattr(self.overlay.settings_view, "scroll_down")
+        ):
+            self.overlay.settings_view.scroll_down()
+            return
         self.overlay.scroll_down()
         self.mini_overlay.scroll_down()
 
     def history_prev(self):
+        if (
+            hasattr(self.overlay, "stack")
+            and self.overlay.stack.currentWidget() is getattr(self.overlay, "settings_view", None)
+            and hasattr(self.overlay.settings_view, "select_prev_tab")
+        ):
+            self.overlay.settings_view.select_prev_tab()
+            return
         self.history.move_prev()
         self._sync_history_ui()
 
     def history_next(self):
+        if (
+            hasattr(self.overlay, "stack")
+            and self.overlay.stack.currentWidget() is getattr(self.overlay, "settings_view", None)
+            and hasattr(self.overlay.settings_view, "select_next_tab")
+        ):
+            self.overlay.settings_view.select_next_tab()
+            return
         self.history.move_next()
         self._sync_history_ui()
 

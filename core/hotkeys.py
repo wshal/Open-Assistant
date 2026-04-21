@@ -70,6 +70,12 @@ class NativeHotkeyThread(threading.Thread):
 
 
 class HotkeyManager:
+    MODIFIER_GROUPS = {
+        "ctrl": {"key.ctrl", "key.ctrl_l", "key.ctrl_r"},
+        "shift": {"key.shift", "key.shift_l", "key.shift_r"},
+        "alt": {"key.alt", "key.alt_l", "key.alt_r", "key.alt_gr"},
+    }
+
     def __init__(self, config, app):
         self.config = config
         self.app = app
@@ -123,6 +129,7 @@ class HotkeyManager:
         bridges = {
             "toggle": self.app.toggle_overlay,
             "quick_answer": self.app.quick_answer,
+            "analyze_screen": self.app.analyze_current_screen,
             "history_prev": self.app.history_prev,
             "history_next": self.app.history_next,
             "scroll_up": self.app.scroll_up,
@@ -174,21 +181,23 @@ class HotkeyManager:
     def _on_press(self, key):
         k = self._normalize_key(key)
         self.active_keys[k] = time.time()
+        matched_actions = []
         for action, key_str in self.config.get("hotkeys", {}).items():
             if not (action.startswith("move_") or action.startswith("scroll_")):
                 continue
             req = self._parse_key_pynput(key_str)
-            if req and all(
-                any(rk in self.active_keys for rk in group) for group in req
-            ):
-                if any(k in group for group in req):
-                    # Movement uses the glide timer (started) to ensure smoothness
-                    # Scrolling uses immediate triggers (triggered) for responsiveness
-                    logger.debug(f"🔥 Hotkey detected: {action}")
-                    if action.startswith("move_"):
-                        self.signals.started.emit(action)
-                    else:
-                        self.signals.triggered.emit(action)
+            if not req:
+                continue
+            if self._is_exact_hotkey_match(req) and any(k in group for group in req):
+                matched_actions.append((len(req), action))
+
+        for _, action in sorted(matched_actions, reverse=True):
+            logger.debug(f"🔥 Hotkey detected: {action}")
+            if action.startswith("move_"):
+                self.signals.started.emit(action)
+            else:
+                self.signals.triggered.emit(action)
+            break
 
     def _on_release(self, key):
         k = self._normalize_key(key)
@@ -199,6 +208,25 @@ class HotkeyManager:
                     req = self._parse_key_pynput(key_str)
                     if any(k in g for g in req):
                         self.signals.stopped.emit(action)
+
+    def _is_exact_hotkey_match(self, required_groups):
+        active_keys = set(self.active_keys.keys())
+        if not all(any(alias in active_keys for alias in group) for group in required_groups):
+            return False
+
+        active_modifiers = set()
+        for name, aliases in self.MODIFIER_GROUPS.items():
+            if active_keys & aliases:
+                active_modifiers.add(name)
+
+        required_modifiers = set()
+        for group in required_groups:
+            for name, aliases in self.MODIFIER_GROUPS.items():
+                if group <= aliases:
+                    required_modifiers.add(name)
+                    break
+
+        return active_modifiers == required_modifiers
 
     def _normalize_key(self, key):
         if isinstance(key, keyboard.Key):

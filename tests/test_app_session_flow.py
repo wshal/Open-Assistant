@@ -55,10 +55,11 @@ class AudioStub:
 
 class OverlayStub:
     def __init__(self):
+        self.current_widget = "standby"
         self.stack = SimpleNamespace(
             setCurrentIndex=self._set_index,
             currentIndex=lambda: 0,
-            currentWidget=lambda: "standby",
+            currentWidget=lambda: self.current_widget,
         )
         self.indices = []
         self.mode_updates = []
@@ -76,6 +77,8 @@ class OverlayStub:
         self.chat_view = "chat"
         self.settings_view = "settings"
         self.standby_view = "standby"
+        self.visible = True
+        self.opacity = 1.0
 
     def _set_index(self, index):
         self.indices.append(index)
@@ -94,9 +97,11 @@ class OverlayStub:
 
     def hide(self):
         self.hide_calls += 1
+        self.visible = False
 
     def show(self):
         self.show_calls += 1
+        self.visible = True
 
     def raise_(self):
         self.raise_calls += 1
@@ -112,6 +117,13 @@ class OverlayStub:
 
     def setWindowOpacity(self, value):
         self.opacity_updates.append(value)
+        self.opacity = value
+
+    def isVisible(self):
+        return self.visible
+
+    def windowOpacity(self):
+        return self.opacity
 
     def start_session_ui(self):
         pass
@@ -208,6 +220,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             _last_query="stale query",
             _generation_epoch=0,
             _screen_analysis_pending=False,
+            _click_through=False,
             loop=object(),
             ai=SimpleNamespace(
                 _providers={"groq": SimpleNamespace(enabled=True)},
@@ -254,6 +267,82 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(len(app.mini_overlay.history_updates), 1)
         self.assertEqual(
             app.mini_overlay.completed[-1], ("example response", "example question")
+        )
+
+    def test_quick_answer_prefers_cached_context_without_fresh_capture(self):
+        app = self._build_app()
+        app._ai_lock_ready = SimpleNamespace(wait=lambda timeout=2: True)
+        app.loop = object()
+        app.nexus = SimpleNamespace(
+            get_snapshot=lambda: {
+                "recent_audio": "latest meeting question",
+                "full_audio_history": "latest meeting question",
+                "latest_ocr": "visible code",
+            }
+        )
+        app.audio = SimpleNamespace(get_transcript=lambda: "")
+        captures = []
+        app.screen = SimpleNamespace(capture_context=lambda: captures.append(True))
+        quick_calls = []
+
+        async def fake_quick(snapshot, screen_context="", audio_context=""):
+            quick_calls.append(
+                {
+                    "screen": screen_context,
+                    "audio": audio_context,
+                    "snapshot": snapshot,
+                }
+            )
+
+        app.ai = SimpleNamespace(generate_quick_response=fake_quick)
+
+        with patch(
+            "core.app.asyncio.run_coroutine_threadsafe",
+            side_effect=lambda coro, loop: __import__("asyncio").run(coro),
+        ):
+            OpenAssistApp.quick_answer(app)
+
+        self.assertEqual(captures, [])
+        self.assertEqual(quick_calls[0]["audio"], "latest meeting question")
+        self.assertEqual(quick_calls[0]["screen"], "visible code")
+        self.assertIn(
+            "Quick answer using cached audio + cached screen...",
+            app.overlay.transcript_updates,
+        )
+
+    def test_quick_answer_announces_fallback_capture_when_cached_context_missing(self):
+        app = self._build_app()
+        app._ai_lock_ready = SimpleNamespace(wait=lambda timeout=2: True)
+        app.loop = object()
+        app.nexus = SimpleNamespace(
+            get_snapshot=lambda: {
+                "recent_audio": "",
+                "full_audio_history": "",
+                "latest_ocr": "",
+            },
+            push=lambda source, value: None,
+        )
+        app.audio = SimpleNamespace(get_transcript=lambda: "")
+
+        async def fake_capture_context():
+            return "fresh screen"
+
+        app.screen = SimpleNamespace(capture_context=fake_capture_context)
+
+        async def fake_quick(snapshot, screen_context="", audio_context=""):
+            return ""
+
+        app.ai = SimpleNamespace(generate_quick_response=fake_quick)
+
+        with patch(
+            "core.app.asyncio.run_coroutine_threadsafe",
+            side_effect=lambda coro, loop: __import__("asyncio").run(coro),
+        ):
+            OpenAssistApp.quick_answer(app)
+
+        self.assertIn(
+            "Quick answer missing cached context. Refreshing screen once...",
+            app.overlay.transcript_updates,
         )
 
     def test_end_session_resets_state_and_returns_to_standby(self):
@@ -366,6 +455,34 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             {"provider": "groq", "pending": False},
         )
 
+    def test_history_navigation_switches_settings_tabs_when_settings_open(self):
+        app = self._build_app()
+        tab_moves = []
+        app.overlay.settings_view = SimpleNamespace(
+            select_prev_tab=lambda: tab_moves.append("prev"),
+            select_next_tab=lambda: tab_moves.append("next"),
+        )
+        app.overlay.current_widget = app.overlay.settings_view
+
+        OpenAssistApp.history_prev(app)
+        OpenAssistApp.history_next(app)
+
+        self.assertEqual(tab_moves, ["prev", "next"])
+
+    def test_scroll_routes_to_settings_view_when_settings_open(self):
+        app = self._build_app()
+        scrolls = []
+        app.overlay.settings_view = SimpleNamespace(
+            scroll_up=lambda: scrolls.append("up"),
+            scroll_down=lambda: scrolls.append("down"),
+        )
+        app.overlay.current_widget = app.overlay.settings_view
+
+        OpenAssistApp.scroll_up(app)
+        OpenAssistApp.scroll_down(app)
+
+        self.assertEqual(scrolls, ["up", "down"])
+
     def test_toggle_stealth_mode_updates_state_and_window_opacity(self):
         app = self._build_app()
         app.state.is_stealth = False
@@ -400,6 +517,27 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(stopped, [True])
         self.assertEqual(cleared, [True])
         self.assertEqual(shown, [True])
+
+    def test_toggle_overlay_cycles_show_click_through_hide(self):
+        app = self._build_app()
+        toggles = []
+
+        def fake_toggle_click_through():
+            app._click_through = not app._click_through
+            toggles.append(app._click_through)
+
+        app.toggle_click_through = fake_toggle_click_through
+
+        OpenAssistApp.toggle_overlay(app)
+        self.assertEqual(toggles, [True])
+        self.assertTrue(app.overlay.visible)
+
+        OpenAssistApp.toggle_overlay(app)
+        self.assertFalse(app.overlay.visible)
+
+        OpenAssistApp.toggle_overlay(app)
+        self.assertEqual(toggles, [True, False])
+        self.assertTrue(app.overlay.visible)
 
     def test_show_onboarding_after_reset_restarts_runtime_services(self):
         app = self._build_app()

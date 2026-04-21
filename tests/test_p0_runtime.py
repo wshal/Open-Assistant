@@ -12,6 +12,7 @@ from ai.engine import AIEngine
 from capture.audio import AudioCapture
 from capture.screen import ScreenCapture
 from core.config import Config
+from core.hotkeys import HotkeyManager
 from core.state import AppState
 
 
@@ -346,6 +347,22 @@ class ConfigResetTests(unittest.TestCase):
 
         if config_path.exists():
             config_path.unlink()
+
+
+class HotkeyMatchingTests(unittest.TestCase):
+    def test_exact_modifier_match_prevents_scroll_triggering_move(self):
+        manager = HotkeyManager.__new__(HotkeyManager)
+        manager.active_keys = {
+            "key.ctrl": 1.0,
+            "key.shift": 1.0,
+            "key.up": 1.0,
+        }
+
+        move_req = HotkeyManager._parse_key_pynput(manager, "ctrl+up")
+        scroll_req = HotkeyManager._parse_key_pynput(manager, "ctrl+shift+up")
+
+        self.assertFalse(HotkeyManager._is_exact_hotkey_match(manager, move_req))
+        self.assertTrue(HotkeyManager._is_exact_hotkey_match(manager, scroll_req))
 
 
 class ScreenCaptureContextTests(unittest.TestCase):

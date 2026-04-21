@@ -607,9 +607,10 @@ class SetupWizard(QDialog):
 
         hotkeys = QLabel(
             "â¨ï¸ Hotkeys:\n"
-            "Ctrl+Shift+Space â Toggle overlay\n"
-            "Ctrl+Shift+Q     â Quick screen analysis\n"
+            "Ctrl+\\           â Toggle / pass-through / hide\n"
+            "Ctrl+Enter       â Analyze current screen\n"
             "Ctrl+Shift+M     â Switch mode\n"
+            "Ctrl+Arrow       â Glide overlay\n"
             "Ctrl+Shift+Z     â Stealth mode"
         )
         hotkeys.setStyleSheet("color: #555577; font-family: monospace; font-size: 11px;")

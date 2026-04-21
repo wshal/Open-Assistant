@@ -444,6 +444,7 @@ class SettingsView(QWidget):
         hk_labels = {
             "toggle": "Toggle Main HUD",
             "quick_answer": "Quick Context Answer",
+            "analyze_screen": "Analyze Current Screen",
             "history_prev": "Previous History Entry",
             "history_next": "Next History Entry",
             "scroll_up": "Scroll Response Up",
@@ -1064,3 +1065,33 @@ class SettingsView(QWidget):
             logger.error(f"Save Fail: {e}")
             self.btn_save.setText("APPLY SETTINGS")
             self.btn_save.setEnabled(True)
+
+    def _current_tab_scroll_area(self):
+        if not hasattr(self, "tabs"):
+            return None
+        current = self.tabs.currentWidget()
+        return current if isinstance(current, QScrollArea) else None
+
+    def scroll_up(self):
+        area = self._current_tab_scroll_area()
+        if area:
+            sb = area.verticalScrollBar()
+            sb.setValue(sb.value() - 80)
+
+    def scroll_down(self):
+        area = self._current_tab_scroll_area()
+        if area:
+            sb = area.verticalScrollBar()
+            sb.setValue(sb.value() + 80)
+
+    def select_prev_tab(self):
+        if hasattr(self, "tabs"):
+            count = self.tabs.count()
+            if count:
+                self.tabs.setCurrentIndex((self.tabs.currentIndex() - 1) % count)
+
+    def select_next_tab(self):
+        if hasattr(self, "tabs"):
+            count = self.tabs.count()
+            if count:
+                self.tabs.setCurrentIndex((self.tabs.currentIndex() + 1) % count)
