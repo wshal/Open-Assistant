@@ -51,6 +51,20 @@ class OverlayWindow(QMainWindow):
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(150)
         self._render_timer.timeout.connect(self._render_markdown_now)
+        self._analyze_timer = QTimer(self)
+        self._analyze_timer.setInterval(220)
+        self._analyze_timer.timeout.connect(self._tick_analyze_button)
+        self._analyze_success_timer = QTimer(self)
+        self._analyze_success_timer.setSingleShot(True)
+        self._analyze_success_timer.setInterval(1800)
+        self._analyze_success_timer.timeout.connect(self._reset_analyze_button_idle)
+        self._analyze_frames = [
+            "ANALYZE SCREEN",
+            "ANALYZING SCREEN.",
+            "ANALYZING SCREEN..",
+            "ANALYZING SCREEN...",
+        ]
+        self._analyze_frame_index = 0
 
         # NEURAL UX: Gaze-based transparency
         self._gaze_timer = QTimer(self)
@@ -115,6 +129,7 @@ class OverlayWindow(QMainWindow):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setWindowOpacity(self.config.get("app.opacity", 0.94))
 
         # Get screen dimensions for full-height window
@@ -322,30 +337,14 @@ class OverlayWindow(QMainWindow):
                 background: rgba(56, 189, 248, 0.18);
                 color: white;
             }
+            QPushButton:disabled {
+                background: rgba(56, 189, 248, 0.10);
+                color: rgba(125, 211, 252, 0.72);
+                border: 1px solid rgba(56, 189, 248, 0.18);
+            }
         """)
         self.btn_analyze_screen.clicked.connect(self._analyze_screen)
         input_layout.addWidget(self.btn_analyze_screen)
-
-        self.btn_send = QPushButton("ASK")
-        self.btn_send.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_send.setToolTip("Ask about the current live session")
-        self.btn_send.setStyleSheet("""
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #5b4cf1, stop:1 #8b5cf6);
-                color: white;
-                border: none;
-                border-radius: 10px;
-                padding: 8px 14px;
-                font-size: 10px;
-                font-weight: 900;
-                letter-spacing: 1px;
-            }
-            QPushButton:hover {
-                background: #7367ff;
-            }
-        """)
-        self.btn_send.clicked.connect(self._send)
-        input_layout.addWidget(self.btn_send)
 
         cv_layout.addWidget(self.input_bar)
 
@@ -464,15 +463,18 @@ class OverlayWindow(QMainWindow):
 
     def set_analysis_provider_badge(self, provider: str = None, pending: bool = False):
         if pending:
+            self._start_analyze_button_animation()
             self.analysis_badge.setText("Analyzing screen...")
             self.analysis_badge.setVisible(True)
             return
 
         if provider:
+            self._show_analyze_button_success()
             self.analysis_badge.setText(f"Analyzed via {provider.capitalize()}")
             self.analysis_badge.setVisible(True)
             return
 
+        self._stop_analyze_button_animation()
         self.analysis_badge.clear()
         self.analysis_badge.setVisible(False)
 
@@ -575,6 +577,37 @@ class OverlayWindow(QMainWindow):
         if hasattr(self.app, "analyze_current_screen"):
             self._user_is_scrolling = False
             self.app.analyze_current_screen()
+
+    def _tick_analyze_button(self):
+        self._analyze_frame_index = (self._analyze_frame_index + 1) % len(self._analyze_frames)
+        self.btn_analyze_screen.setText(self._analyze_frames[self._analyze_frame_index])
+
+    def _start_analyze_button_animation(self):
+        if self._analyze_success_timer.isActive():
+            self._analyze_success_timer.stop()
+        self._analyze_frame_index = 0
+        self.btn_analyze_screen.setEnabled(False)
+        self.btn_analyze_screen.setText(self._analyze_frames[self._analyze_frame_index])
+        if not self._analyze_timer.isActive():
+            self._analyze_timer.start()
+
+    def _stop_analyze_button_animation(self):
+        if self._analyze_timer.isActive():
+            self._analyze_timer.stop()
+        if self._analyze_success_timer.isActive():
+            self._analyze_success_timer.stop()
+        self._reset_analyze_button_idle()
+
+    def _show_analyze_button_success(self):
+        if self._analyze_timer.isActive():
+            self._analyze_timer.stop()
+        self.btn_analyze_screen.setEnabled(False)
+        self.btn_analyze_screen.setText("SCREEN ANALYZED")
+        self._analyze_success_timer.start()
+
+    def _reset_analyze_button_idle(self):
+        self.btn_analyze_screen.setEnabled(True)
+        self.btn_analyze_screen.setText("ANALYZE SCREEN")
 
     def set_click_through(self, enabled: bool):
         """Toggle mouse interaction transparency."""

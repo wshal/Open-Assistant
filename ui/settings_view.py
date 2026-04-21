@@ -82,7 +82,7 @@ QPushButton:hover {{
 class ProviderTestWorker(QThread):
     """Real API test worker - sends actual requests to providers."""
 
-    result_ready = pyqtSignal(str, bool, str)
+    result_ready = pyqtSignal(str, bool, str, object)
 
     def __init__(self, provider_id, config, parent=None):
         super().__init__(parent)
@@ -94,14 +94,72 @@ class ProviderTestWorker(QThread):
         import aiohttp
 
         key = self.config.get_api_key(self.provider_id)
+        if self.provider_id == "ollama":
+            endpoint = (
+                self.config.get("ai.providers.ollama.endpoint")
+                or self.config.get_api_key("ollama")
+                or "http://localhost:11434"
+            )
+            if not str(endpoint).startswith("http"):
+                endpoint = "http://localhost:11434"
+
+            async def test_ollama():
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{endpoint}/api/tags",
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as resp:
+                        if resp.status != 200:
+                            return {"error": f"Server returned {resp.status}"}
+                        return await resp.json()
+
+            try:
+                result = asyncio.run(test_ollama())
+                if "error" in result:
+                    self.result_ready.emit(
+                        self.provider_id,
+                        False,
+                        result.get("error", "Connection failed"),
+                        None,
+                    )
+                    return
+
+                models = result.get("models", []) or []
+                model_names = [m.get("name", "") for m in models if m.get("name")]
+                if models:
+                    model_count = len(models)
+                    self.result_ready.emit(
+                        self.provider_id,
+                        True,
+                        f"Connected ({model_count} model{'s' if model_count != 1 else ''})",
+                        {"models": model_names, "endpoint": endpoint},
+                    )
+                else:
+                    self.result_ready.emit(
+                        self.provider_id,
+                        True,
+                        "Connected (no models pulled)",
+                        {"models": [], "endpoint": endpoint},
+                    )
+                return
+            except asyncio.TimeoutError:
+                self.result_ready.emit(self.provider_id, False, "Timeout", None)
+                return
+            except Exception as e:
+                self.result_ready.emit(self.provider_id, False, str(e)[:30], None)
+                return
 
         # Check key format first
-        if not key or len(key) < 10:
-            self.result_ready.emit(self.provider_id, False, "Invalid Key")
+        is_valid, validation_message = self.config.validate_key_for_ui(
+            self.provider_id, key
+        )
+        if not is_valid:
+            self.result_ready.emit(
+                self.provider_id, False, validation_message, None
+            )
             return
 
         # Test endpoints for different providers
-        ollama_model = self.config.get("ai.providers.ollama.model") or "llama3.1:8b"
         endpoints = {
             "groq": (
                 "https://api.groq.com/openai/v1/chat/completions",
@@ -131,22 +189,19 @@ class ProviderTestWorker(QThread):
                     "max_tokens": 5,
                 },
             ),
-            "ollama": (
-                "http://localhost:11434/api/generate",
-                {"model": ollama_model, "prompt": "Hi", "stream": False},
-            ),
         }
 
         if self.provider_id not in endpoints:
-            self.result_ready.emit(self.provider_id, False, "Provider not supported")
+            self.result_ready.emit(
+                self.provider_id, False, "Provider not supported", None
+            )
             return
 
         url, payload = endpoints[self.provider_id]
         headers = {"Content-Type": "application/json"}
 
         # Add auth header for most providers
-        if self.provider_id != "ollama":
-            headers["Authorization"] = f"Bearer {key}"
+        headers["Authorization"] = f"Bearer {key}"
 
         try:
             if self.provider_id == "gemini":
@@ -167,27 +222,12 @@ class ProviderTestWorker(QThread):
                         self.provider_id,
                         False,
                         result["error"].get("message", "API Error"),
+                        None,
                     )
                 else:
-                    self.result_ready.emit(self.provider_id, True, "Connected")
-            elif self.provider_id == "ollama":
-
-                async def test_ollama():
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(
-                            url, json=payload, timeout=aiohttp.ClientTimeout(total=5)
-                        ) as resp:
-                            return await resp.json()
-
-                result = asyncio.run(test_ollama())
-                if "error" in result:
                     self.result_ready.emit(
-                        self.provider_id,
-                        False,
-                        result.get("error", "Connection failed"),
+                        self.provider_id, True, "Connected", None
                     )
-                else:
-                    self.result_ready.emit(self.provider_id, True, "Connected")
             else:
 
                 async def test_api():
@@ -206,17 +246,20 @@ class ProviderTestWorker(QThread):
                         self.provider_id,
                         False,
                         result["error"].get("message", "API Error"),
+                        None,
                     )
                 elif "choices" in result or "output" in result:
-                    self.result_ready.emit(self.provider_id, True, "Connected")
+                    self.result_ready.emit(
+                        self.provider_id, True, "Connected", None
+                    )
                 else:
                     self.result_ready.emit(
-                        self.provider_id, False, "Unexpected response"
+                        self.provider_id, False, "Unexpected response", None
                     )
         except asyncio.TimeoutError:
-            self.result_ready.emit(self.provider_id, False, "Timeout")
+            self.result_ready.emit(self.provider_id, False, "Timeout", None)
         except Exception as e:
-            self.result_ready.emit(self.provider_id, False, str(e)[:30])
+            self.result_ready.emit(self.provider_id, False, str(e)[:30], None)
 
 
 class SettingsView(QWidget):
@@ -231,6 +274,8 @@ class SettingsView(QWidget):
         self.api_inputs = {}
         self.hotkey_inputs = {}
         self.status_labels = {}
+        self.provider_detail_labels = {}
+        self._test_workers = {}
         self._build()
 
     @staticmethod
@@ -273,6 +318,51 @@ class SettingsView(QWidget):
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
         combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    @staticmethod
+    def _recommended_ollama_model(models, mode: str = "general") -> str:
+        if not models:
+            return ""
+
+        model_names = [m for m in models if m]
+        mode = (mode or "general").lower()
+
+        def pick(markers):
+            for marker in markers:
+                for model in model_names:
+                    if marker in model.lower():
+                        return model
+            return ""
+
+        if mode == "coding":
+            chosen = pick(
+                [
+                    "coder",
+                    "codestral",
+                    "deepseek-coder",
+                    "codegemma",
+                    "qwen2.5-coder",
+                    "qwen2.5",
+                    "qwen2",
+                    "llama3.1",
+                    "llama3.2",
+                ]
+            )
+            if chosen:
+                return chosen
+
+        chosen = pick(
+            [
+                "llama3.2",
+                "llama3.1",
+                "qwen2.5",
+                "qwen2",
+                "mistral",
+                "gemma",
+                "phi3",
+            ]
+        )
+        return chosen or model_names[0]
 
     def _build(self):
         self.setStyleSheet(BG_DARK + SS_INPUT)
@@ -380,6 +470,8 @@ class SettingsView(QWidget):
             link_text = "Install Ollama" if pid == "ollama" else "Get API key"
             link = QLabel(f'<a href="{provider_meta.get("url", "")}">{link_text}</a>')
             link.setOpenExternalLinks(False)
+            link.setWordWrap(False)
+            link.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
             link.linkActivated.connect(
                 lambda url, _pid=pid: QDesktopServices.openUrl(QUrl(url))
             )
@@ -405,6 +497,7 @@ class SettingsView(QWidget):
                 }
                 """
             )
+            link.adjustSize()
             bl.addWidget(link)
              
             # Local providers like Ollama don't need API keys
@@ -420,6 +513,25 @@ class SettingsView(QWidget):
                 desc = QLabel("Local Engine (No API Key Required)")
                 desc.setStyleSheet(f"color: #64748b; font-size: 10px; font-style: italic; background: transparent;")
                 bl.addWidget(desc)
+
+                self.ollama_model_combo = QComboBox()
+                self._style_combo(self.ollama_model_combo)
+                self.ollama_model_combo.setEnabled(False)
+                saved_model = self.config.get("ai.providers.ollama.model", "")
+                self.ollama_model_combo.addItem(
+                    saved_model or "Test Ollama to load local models"
+                )
+                bl.addWidget(self.ollama_model_combo)
+
+                detail = QLabel(
+                    "Tests the local Ollama server and lists installed models."
+                )
+                detail.setWordWrap(True)
+                detail.setStyleSheet(
+                    f"{TEXT_MUTED} font-size: 10px; background: transparent;"
+                )
+                self.provider_detail_labels[pid] = detail
+                bl.addWidget(detail)
                 
             l.addWidget(box)
 
@@ -844,6 +956,21 @@ class SettingsView(QWidget):
         )
         l.addWidget(desc_tray)
 
+        self.chk_focus_on_show = PremiumCheckBox("Focus HUD when showing it")
+        self.chk_focus_on_show.setChecked(
+            self.config.get("app.focus_on_show", False)
+        )
+        l.addWidget(self.chk_focus_on_show)
+        desc_focus_on_show = QLabel(
+            "When enabled, showing the HUD brings it to the front and gives it keyboard focus. "
+            "When disabled, the HUD stays floating on top without interrupting the app underneath."
+        )
+        desc_focus_on_show.setWordWrap(True)
+        desc_focus_on_show.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; background: transparent;"
+        )
+        l.addWidget(desc_focus_on_show)
+
         # Detection Margin
         margin_layout = QHBoxLayout()
         lbl_margin = QLabel("Detection margin:")
@@ -979,10 +1106,60 @@ class SettingsView(QWidget):
     def _test_pid(self, pid):
         self.status_labels[pid].setText("⏳")
         worker = ProviderTestWorker(pid, self.config, self)
-        worker.result_ready.connect(
-            lambda p, s, m: self.status_labels[p].setText("✅" if s else "❌")
-        )
+        self._test_workers[pid] = worker
+        worker.result_ready.connect(self._on_provider_test_result)
+        worker.finished.connect(lambda p=pid: self._test_workers.pop(p, None))
         worker.start()
+
+    def _on_provider_test_result(self, provider_id, success, message, details):
+        self.status_labels[provider_id].setText("✅" if success else "❌")
+
+        if provider_id in self.provider_detail_labels:
+            color = "#4ade80" if success else "#fda4af"
+            self.provider_detail_labels[provider_id].setStyleSheet(
+                f"color: {color}; font-size: 10px; background: transparent;"
+            )
+            self.provider_detail_labels[provider_id].setText(message)
+
+        if provider_id != "ollama" or not hasattr(self, "ollama_model_combo"):
+            return
+
+        models = []
+        endpoint = None
+        if isinstance(details, dict):
+            models = details.get("models", []) or []
+            endpoint = details.get("endpoint")
+
+        if provider_id in self.provider_detail_labels and endpoint:
+            self.provider_detail_labels[provider_id].setText(f"{message} | {endpoint}")
+
+        self.ollama_model_combo.blockSignals(True)
+        self.ollama_model_combo.clear()
+
+        if not success:
+            self.ollama_model_combo.addItem("Ollama test failed")
+            self.ollama_model_combo.setEnabled(False)
+            self.ollama_model_combo.blockSignals(False)
+            return
+
+        if not models:
+            self.ollama_model_combo.addItem("No local models found")
+            self.ollama_model_combo.setEnabled(False)
+            self.ollama_model_combo.blockSignals(False)
+            return
+
+        self.ollama_model_combo.addItems(models)
+        saved_model = self.config.get("ai.providers.ollama.model", "")
+        selected_mode = self.config.get("ai.mode", "general")
+        target_model = (
+            saved_model
+            if saved_model in models
+            else self._recommended_ollama_model(models, selected_mode)
+        )
+        target_index = models.index(target_model) if target_model in models else 0
+        self.ollama_model_combo.setCurrentIndex(target_index)
+        self.ollama_model_combo.setEnabled(True)
+        self.ollama_model_combo.blockSignals(False)
 
     def showEvent(self, event):
         """Reset UI state when settings are opened."""
@@ -1054,6 +1231,10 @@ class SettingsView(QWidget):
             # Save parallel inference setting
             if hasattr(self, "chk_parallel"):
                 self.config.set("ai.parallel.enabled", self.chk_parallel.isChecked())
+            if hasattr(self, "ollama_model_combo") and self.ollama_model_combo.isEnabled():
+                selected_model = self.ollama_model_combo.currentText().strip()
+                if selected_model and "load local models" not in selected_model.lower():
+                    self.config.set("ai.providers.ollama.model", selected_model)
 
             if hasattr(self, "hud_opacity_slider"):
                 self.config.set(
@@ -1073,6 +1254,11 @@ class SettingsView(QWidget):
                 self.config.set(
                     "app.start_minimized",
                     self.chk_start_minimized.isChecked(),
+                )
+            if hasattr(self, "chk_focus_on_show"):
+                self.config.set(
+                    "app.focus_on_show",
+                    self.chk_focus_on_show.isChecked(),
                 )
             if hasattr(self, "margin_slider"):
                 margin_values = [20, 30, 40, 50, 60, 80]

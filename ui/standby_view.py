@@ -372,8 +372,23 @@ class StandbyView(QWidget):
             self.model_bar_layout.addWidget(badge)
             return
 
-        for pid, info in statuses.items():
+        ready_statuses = [
+            (pid, info)
+            for pid, info in statuses.items()
+            if info.get("usable") or info.get("state") in {"active", "cooldown"}
+        ]
+
+        if not ready_statuses:
+            badge = QLabel("NO PROVIDERS READY")
+            badge.setStyleSheet(
+                "color: #64748b; font-size: 9px; font-weight: 900; letter-spacing: 1.8px;"
+            )
+            self.model_bar_layout.addWidget(badge)
+            return
+
+        for pid, info in ready_statuses:
             state = info.get("state", "unknown")
+            selected = bool(info.get("selected"))
             color = (
                 "#4ade80"
                 if state == "active"
@@ -381,10 +396,18 @@ class StandbyView(QWidget):
                 if state == "cooldown"
                 else "#ef4444"
             )
-            badge = QLabel(pid.upper())
-            badge.setStyleSheet(
-                f"color: {color}; font-size: 9px; font-weight: 900; letter-spacing: 1.5px;"
-            )
+            label = f"\u25cf {pid.upper()}" if selected else pid.upper()
+            badge = QLabel(label)
+            if selected:
+                badge.setStyleSheet(
+                    f"color: {color}; font-size: 9px; font-weight: 900; letter-spacing: 1.5px; "
+                    "background: rgba(255,255,255,0.06); "
+                    f"border: 1px solid {color}33; border-radius: 10px; padding: 3px 8px;"
+                )
+            else:
+                badge.setStyleSheet(
+                    f"color: {color}; font-size: 9px; font-weight: 800; letter-spacing: 1.5px;"
+                )
             self.model_bar_layout.addWidget(badge)
 
     def _on_mode_btn_clicked(self, name):

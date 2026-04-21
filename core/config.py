@@ -124,6 +124,8 @@ class Config:
         self._data.setdefault("ai", {})
         self._data["ai"].setdefault("vision", {})
         self._data["ai"]["vision"].setdefault("allow_paid_fallback", False)
+        self._data.setdefault("app", {})
+        self._data["app"].setdefault("focus_on_show", False)
         self._data.setdefault("stealth", {})
         self._data["stealth"].setdefault("enabled", True)
         self._data["stealth"].setdefault("auto_hide_on_share", True)

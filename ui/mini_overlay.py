@@ -21,6 +21,11 @@ logger = setup_logger(__name__)
 
 
 class MiniOverlay(QMainWindow):
+    COLLAPSED_HEIGHT = 48
+    HEADER_HEIGHT = 48
+    MAX_WINDOW_HEIGHT = 360
+    MIN_VISIBLE_RESPONSE_ROWS = 10
+
     user_query = pyqtSignal(str)
 
     def __init__(self, config, app):
@@ -52,9 +57,9 @@ class MiniOverlay(QMainWindow):
 
     def _on_hud_mode_changed(self, is_mini):
         if is_mini:
+            self._sync_existing_response()
             self.show()
             self.raise_()
-            self.activateWindow()
         else:
             self.hide()
 
@@ -65,11 +70,14 @@ class MiniOverlay(QMainWindow):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setWindowOpacity(0.95)
         self.setFixedWidth(280)
-        self.setFixedHeight(48)
+        self.setFixedHeight(self.COLLAPSED_HEIGHT)
 
         c = QWidget()
+        c.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        c.setStyleSheet("background: transparent; border: none;")
         self.setCentralWidget(c)
         self.ml = QVBoxLayout(c)
         self.ml.setContentsMargins(0, 0, 0, 0)
@@ -116,9 +124,23 @@ class MiniOverlay(QMainWindow):
         self.response_area.setReadOnly(True)
         self.response_area.setVisible(False)
         self.response_area.setStyleSheet(
-            "background: rgba(15,15,30,240); border: 1px solid rgba(80,85,255,30); border-radius: 12px; color: #d0d0e8; font-size: 11px; padding: 8px;"
+            "background: rgba(15,15,30,240); border: none; border-radius: 12px; color: #d0d0e8; font-size: 11px; padding: 8px;"
         )
+        self.response_area.setFrameShape(QFrame.Shape.NoFrame)
         self.ml.addWidget(self.response_area)
+
+    def _sync_existing_response(self):
+        if self._raw_buffer.strip():
+            self._toggle_expand(True)
+            self._render_markdown_now()
+            return
+
+        if not hasattr(self.app, "history") or not hasattr(self.app.history, "get_state"):
+            return
+
+        _, _, entry = self.app.history.get_state()
+        if entry and entry.get("response"):
+            self.on_complete(entry.get("response", ""), entry.get("query", ""))
 
     def _send(self):
         q = self.input.text().strip()
@@ -160,14 +182,21 @@ class MiniOverlay(QMainWindow):
     def _adjust_height(self):
         """ADAPTIVE: Calculate required height up to 300px max."""
         if not self._expanded:
-            self.setFixedHeight(48)
+            self.setFixedHeight(self.COLLAPSED_HEIGHT)
             return
 
         doc = self.response_area.document()
-        height = int(doc.size().height()) + 20
-        new_h = min(max(height + 60, 100), 320)
+        content_height = int(doc.size().height()) + 20
+        line_height = max(14, self.response_area.fontMetrics().lineSpacing())
+        min_response_height = (line_height * self.MIN_VISIBLE_RESPONSE_ROWS) + 20
+        response_height = max(content_height, min_response_height)
+        max_response_height = self.MAX_WINDOW_HEIGHT - self.HEADER_HEIGHT
+        response_height = min(response_height, max_response_height)
+        new_h = min(self.HEADER_HEIGHT + response_height, self.MAX_WINDOW_HEIGHT)
 
         self.setFixedHeight(new_h)
+        self.response_area.setMinimumHeight(min_response_height)
+        self.response_area.setMaximumHeight(max_response_height)
         self.response_area.verticalScrollBar().setValue(
             self.response_area.verticalScrollBar().maximum()
         )

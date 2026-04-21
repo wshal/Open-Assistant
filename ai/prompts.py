@@ -12,6 +12,12 @@ class ContextRanker:
         "rag": 1,  # Low - knowledge base
     }
 
+    MODE_PRIORITY = {
+        "interview": {"audio": 3, "screen": 2, "rag": 1},
+        "meeting": {"audio": 3, "screen": 2, "rag": 1},
+        "coding": {"screen": 3, "rag": 2, "audio": 1},
+    }
+
     LIMITS = {
         "screen": 4000,
         "audio": 2500,
@@ -19,7 +25,7 @@ class ContextRanker:
     }
 
     @classmethod
-    def rank(cls, contexts: List[str]) -> List[tuple]:
+    def rank(cls, contexts: List[str], mode: str = None) -> List[tuple]:
         """Return ranked (source, content, priority) tuples."""
         ranked = []
         source_map = {
@@ -27,10 +33,11 @@ class ContextRanker:
             "audio": contexts[1] if len(contexts) > 1 else "",
             "rag": contexts[2] if len(contexts) > 2 else "",
         }
+        priorities = cls.MODE_PRIORITY.get((mode or "").lower(), cls.PRIORITY)
 
         for src, content in source_map.items():
             if content:
-                ranked.append((src, content, cls.PRIORITY.get(src, 0)))
+                ranked.append((src, content, priorities.get(src, cls.PRIORITY.get(src, 0))))
 
         ranked.sort(key=lambda x: x[2], reverse=True)
         return ranked
@@ -46,7 +53,7 @@ class PromptBuilder:
     SYSTEMS = {
         "general": """You are OpenAssist AI, a real-time assistant with screen and audio access.
 Rules:
-- Prioritize what is visible on the current screen.
+- Prefer a fast, direct answer. Use screen/audio context only when it is relevant to the question.
 - Use recent audio and session context as supporting evidence.
 - Distinguish clearly between observed facts and inference.
 - Be concise, useful, and action-oriented.
@@ -57,10 +64,15 @@ FORMAT:
 - STAR Answer (Behavioral)
 - Technical Detail (Technical)
 - Sample Phrasing (1-2 sentences)
+PRIORITY:
+- Use the most recent audio first.
+- Use the visible on-screen question as support if present.
+- Keep answer framing concise and interview-ready.
 Keep scannable for quick reading.""",
         "meeting": """You are a real-time meeting assistant.
 TRACK: Key Points | Action Items | Decisions | Suggested Responses
-Bullet points only. Ultra-concise.""",
+Bullet points only. Ultra-concise.
+Prefer fast, direct responses over long analysis.""",
         "coding": """You are a senior engineer. Screen shows code.
 Rules: Fix > explain. Code in fenced blocks. Production-ready.
 FORMAT: Issue | Fix | Why (1 line)""",
@@ -87,7 +99,7 @@ RULES:
 - Real-time appropriate (fast responses)
 - Mark confidence: HIGH/MEDIUM/LOW when uncertain
 - Flag if context is unclear""",
-            "user_template": "[Meeting Context]\n{screen}\n\n[Recent Audio]\n{audio}\n\n[Question/Topic]\n{query}",
+            "user_template": "[Recent Audio]\n{audio}\n\n[Meeting Context]\n{screen}\n\n[Question/Topic]\n{query}",
         },
         "coding": {
             "system": """You are a senior software engineer reviewing code.
@@ -118,8 +130,13 @@ CONFIDENCE MARKERS:
 - MEDIUM: Partial context, clarify if needed
 - LOW: Unclear question, ask for clarification
 
+PRIORITY:
+- Recent audio is the primary source.
+- Visible interview question on screen is secondary support.
+- Keep framing concise and easy to speak aloud.
+
 Keep responses scannable for interview pressure.""",
-            "user_template": "[Screen/Question]\n{screen}\n\n[Audio Context]\n{audio}\n\n[Query]\n{query}",
+            "user_template": "[Recent Audio]\n{audio}\n\n[Screen Question]\n{screen}\n\n[Query]\n{query}",
         },
         "writing": {
             "system": """You are a professional editor and writing coach.
@@ -159,6 +176,63 @@ RULES:
         "audio": "[Audio may be incomplete or contain ASR errors]",
         "rag": "[Knowledge base results may be outdated]",
     }
+
+    @staticmethod
+    def _is_general_knowledge_query(query: str) -> bool:
+        q = (query or "").strip().lower()
+        if not q:
+            return False
+
+        contextual_markers = (
+            "this ",
+            "current ",
+            "shown ",
+            "visible ",
+            "on screen",
+            "in this code",
+            "in the code",
+            "this code",
+            "this function",
+            "this file",
+            "line ",
+            "error",
+            "traceback",
+            "bug",
+            "fix",
+            "function do",
+            "what does this",
+        )
+        if any(marker in q for marker in contextual_markers):
+            return False
+
+        starters = (
+            "what is ",
+            "what are ",
+            "who is ",
+            "who are ",
+            "explain ",
+            "define ",
+            "tell me about ",
+            "give me an example",
+            "show me an example",
+            "how does ",
+            "how do ",
+        )
+        if any(q.startswith(prefix) for prefix in starters):
+            return True
+
+        generic_markers = (
+            "example of",
+            "context api",
+            "useeffect",
+            "react",
+            "javascript",
+            "typescript",
+            "python",
+            "api",
+            "hook",
+        )
+        return len(q.split()) <= 10 and any(marker in q for marker in generic_markers)
 
     def system(self, mode=None) -> str:
         if isinstance(mode, str):
@@ -215,15 +289,19 @@ RULES:
     ) -> str:
         """Build user prompt with ranked context and uncertainty markers."""
         parts = []
+        suppress_live_context = origin == "manual" and self._is_general_knowledge_query(query)
 
         # Context ranking and limiting
         contexts = [screen, audio, rag]
-        ranked = ContextRanker.rank(contexts)
+        mode_name = mode.name if hasattr(mode, "name") else mode
+        ranked = ContextRanker.rank(contexts, mode=mode_name)
         
-        if nexus:
+        if nexus and not suppress_live_context:
             parts.append(f"[ENVIRONMENT]\nActive Window: {nexus.get('active_window', 'Unknown')}\nHistory Depth: {nexus.get('history_depth_secs', 60)}s")
 
         for src, content, _ in ranked:
+            if suppress_live_context and src in {"screen", "audio"}:
+                continue
             if src == "screen":
                 limited = ContextRanker.limit("screen", content)
                 parts.append(f"[SCREEN]\n{limited}")
@@ -247,10 +325,17 @@ RULES:
                 "FORMAT:\n- What I See\n- What It Means\n- What To Do Next"
             )
         elif origin == "manual":
-            parts.append(
-                "[TASK]\nAnswer the user's question using the current live session context. "
-                "Prefer the most recent on-screen evidence when relevant."
-            )
+            if suppress_live_context:
+                parts.append(
+                    "[TASK]\nAnswer the user's question directly from general knowledge. "
+                    "Do not mention the current screen, codebase, active window, or live session unless the question clearly asks about them."
+                )
+            else:
+                parts.append(
+                    "[TASK]\nAnswer the user's question using the current live session context. "
+                    "Prefer the most recent on-screen evidence when relevant. "
+                    "If the question is generic and the live context is unrelated, answer directly without talking about the unrelated context."
+                )
         elif origin == "quick":
             parts.append(
                 "[TASK]\nGive the fastest useful context answer using the most recent live context. "

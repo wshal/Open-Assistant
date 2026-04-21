@@ -43,6 +43,7 @@ class AudioStub:
         self.clear_calls = 0
         self.muted = False
         self.toggle_calls = 0
+        self.restart_calls = 0
 
     def clear(self):
         self.clear_calls += 1
@@ -51,6 +52,9 @@ class AudioStub:
         self.toggle_calls += 1
         self.muted = not self.muted
         return self.muted
+
+    def restart(self):
+        self.restart_calls += 1
 
 
 class OverlayStub:
@@ -74,6 +78,7 @@ class OverlayStub:
         self.status_updates = []
         self.opacity_updates = []
         self.analysis_badges = []
+        self.refresh_calls = []
         self.chat_view = "chat"
         self.settings_view = "settings"
         self.standby_view = "standby"
@@ -146,6 +151,9 @@ class OverlayStub:
     def show_settings_view(self):
         self.indices.append(2)
 
+    def refresh_standby_state(self, mode=None, audio=None):
+        self.refresh_calls.append({"mode": mode, "audio": audio})
+
 
 class MiniOverlayStub:
     def __init__(self):
@@ -186,6 +194,7 @@ class ConfigStub:
     def __init__(self):
         self._settings = {"ai.mode": "general"}
         self.reset_calls = 0
+        self.save_calls = 0
 
     def get(self, path, default=None):
         return self._settings.get(path, default)
@@ -193,17 +202,32 @@ class ConfigStub:
     def set(self, path, value):
         self._settings[path] = value
 
+    def save(self):
+        self.save_calls += 1
+
     def reset_all(self):
         self.reset_calls += 1
 
 
 class StateStub:
-    def __init__(self):
+    def __init__(self, config=None):
+        self._config = config
         self.mode = "general"
         self.is_muted = False
         self.is_mini = False
         self.target_window_id = None
         self.is_capturing = False
+        self._audio_source = "system"
+
+    @property
+    def audio_source(self):
+        return self._audio_source
+
+    @audio_source.setter
+    def audio_source(self, value):
+        self._audio_source = value
+        if self._config:
+            self._config.set("capture.audio.mode", value)
 
 
 class OpenAssistAppSessionFlowTests(unittest.TestCase):
@@ -214,7 +238,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             overlay=OverlayStub(),
             mini_overlay=MiniOverlayStub(),
             config=ConfigStub(),
-            state=StateStub(),
+            state=None,
             mini_mode=mini_mode,
             session_active=False,
             _last_query="stale query",
@@ -234,10 +258,17 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             qt_app=SimpleNamespace(quit=lambda: None),
             stealth=SimpleNamespace(apply_to_window=lambda window, enabled: None),
         )
+        app.state = StateStub(app.config)
         app._apply_window_effects = lambda window: OpenAssistApp._apply_window_effects(
             app, window
         )
         app._apply_ui_only = lambda: OpenAssistApp._apply_ui_only(app)
+        app._active_view = lambda: OpenAssistApp._active_view(app)
+        app._hud_focus_enabled = lambda: OpenAssistApp._hud_focus_enabled(app)
+        app._present_window = lambda window, focus=False: OpenAssistApp._present_window(
+            app, window, focus
+        )
+        app._sync_history_ui = lambda: OpenAssistApp._sync_history_ui(app)
         app._stop_background_tasks = lambda: None
         app._sync_state_from_config = lambda: OpenAssistApp._sync_state_from_config(app)
         return app
@@ -365,6 +396,11 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         OpenAssistApp.toggle_mini_mode(app)
         self.assertTrue(app.mini_mode)
+        self.assertEqual(len(app.overlay.history_updates), 1)
+        self.assertEqual(len(app.mini_overlay.history_updates), 1)
+        self.assertEqual(
+            app.mini_overlay.completed[-1], ("example response", "example question")
+        )
 
         OpenAssistApp.toggle_mini_mode(app)
         self.assertFalse(app.mini_mode)
@@ -376,6 +412,16 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertEqual(app.overlay.mode_updates[-1], "coding")
         self.assertEqual(app.mini_overlay.mode_updates[-1], "coding")
+
+    def test_audio_source_ui_change_persists_and_restarts_audio(self):
+        app = self._build_app()
+
+        OpenAssistApp._on_audio_source_ui_change(app, "mic")
+
+        self.assertEqual(app.state.audio_source, "mic")
+        self.assertEqual(app.config.get("capture.audio.mode"), "mic")
+        self.assertEqual(app.config.save_calls, 1)
+        self.assertEqual(app.audio.restart_calls, 1)
 
     def test_toggle_audio_toggles_audio_state(self):
         app = self._build_app()
@@ -418,6 +464,41 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(app.overlay.indices, [2])
         self.assertEqual(app.overlay.show_calls, 1)
         self.assertEqual(app.overlay.raise_calls, 1)
+        self.assertEqual(app.overlay.activate_calls, 1)
+
+    def test_show_active_overlay_reasserts_topmost_before_raising(self):
+        app = self._build_app(mini_mode=False)
+
+        with patch("core.app.WindowUtils.ensure_topmost") as ensure_topmost:
+            result = OpenAssistApp._show_active_overlay(app)
+
+        self.assertIs(result, app.overlay)
+        ensure_topmost.assert_called_once_with(app.overlay)
+        self.assertEqual(app.overlay.show_calls, 1)
+        self.assertEqual(app.overlay.raise_calls, 1)
+        self.assertEqual(app.overlay.activate_calls, 0)
+
+    def test_present_window_only_focuses_when_requested(self):
+        app = self._build_app()
+
+        with patch("core.app.WindowUtils.ensure_topmost") as ensure_topmost:
+            OpenAssistApp._present_window(app, app.overlay, focus=False)
+            OpenAssistApp._present_window(app, app.overlay, focus=True)
+
+        self.assertEqual(ensure_topmost.call_count, 2)
+        self.assertEqual(app.overlay.show_calls, 2)
+        self.assertEqual(app.overlay.raise_calls, 2)
+        self.assertEqual(app.overlay.activate_calls, 1)
+
+    def test_show_active_overlay_respects_focus_on_show_config(self):
+        app = self._build_app(mini_mode=False)
+
+        app.config.set("app.focus_on_show", False)
+        OpenAssistApp._show_active_overlay(app)
+        self.assertEqual(app.overlay.activate_calls, 0)
+
+        app.config.set("app.focus_on_show", True)
+        OpenAssistApp._show_active_overlay(app)
         self.assertEqual(app.overlay.activate_calls, 1)
 
     def test_response_complete_uses_app_capture_state_for_status(self):
@@ -535,6 +616,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         OpenAssistApp.toggle_overlay(app)
         self.assertEqual(toggles, [])
         self.assertTrue(app.overlay.visible)
+        self.assertEqual(app.overlay.activate_calls, 0)
 
         OpenAssistApp.toggle_overlay(app)
         self.assertEqual(toggles, [])

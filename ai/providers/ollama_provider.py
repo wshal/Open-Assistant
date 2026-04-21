@@ -52,6 +52,45 @@ class OllamaProvider(BaseProvider):
         self._available_models = []
         self._connect_timeout = aiohttp.ClientTimeout(total=5)
         self._generate_timeout = aiohttp.ClientTimeout(total=180)
+        self._resolved_model = ""
+
+    def get_model(self, tier: str = None) -> str:
+        model = super().get_model(tier)
+        if model:
+            return model
+        if self._resolved_model:
+            return self._resolved_model
+        return "llama3.1:8b"
+
+    def _pick_available_model(self, requested: str = "") -> str:
+        if not self._available_models:
+            return ""
+
+        requested = (requested or "").strip()
+        if requested:
+            requested_base = requested.split(":")[0]
+            for model in self._available_models:
+                if model == requested or model.startswith(f"{requested}:"):
+                    return model
+            for model in self._available_models:
+                if model.split(":")[0] == requested_base:
+                    return model
+
+        preferred_prefixes = (
+            "llama3.1",
+            "llama3.2",
+            "qwen2.5",
+            "qwen2",
+            "mistral",
+            "phi3",
+            "gemma",
+        )
+        for prefix in preferred_prefixes:
+            for model in self._available_models:
+                if model.startswith(prefix):
+                    return model
+
+        return self._available_models[0]
 
     async def check_availability(self) -> bool:
         """
@@ -80,15 +119,10 @@ class OllamaProvider(BaseProvider):
                     ]
 
             # Step 2: Check if our target model is available
-            target = self.get_model()
-            target_base = target.split(":")[0]
-
-            model_found = any(
-                target in model or target_base in model
-                for model in self._available_models
-            )
-
-            if model_found:
+            configured_target = super().get_model()
+            target = self._pick_available_model(configured_target)
+            if target:
+                self._resolved_model = target
                 self._state = self.STATE_READY
                 self.enabled = True
                 logger.info(f"  Ollama ready (model: {target})")
@@ -98,9 +132,9 @@ class OllamaProvider(BaseProvider):
             self.enabled = False
             available_str = ", ".join(self._available_models[:5]) or "none"
             logger.warning(
-                f"  Ollama: Model '{target}' not found. "
+                f"  Ollama: Model '{configured_target or self.get_model()}' not found. "
                 f"Available: {available_str}. "
-                f"Run: ollama pull {target}"
+                f"Run: ollama pull {configured_target or self.get_model()}"
             )
             return False
 

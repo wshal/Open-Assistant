@@ -91,6 +91,11 @@ class OpenAssistApp(QObject):
         self._nexus_timer.timeout.connect(self._poll_nexus_context)
         self._nexus_timer.start(3000)
 
+        # Keep the active HUD window pinned above other apps even after focus churn.
+        self._topmost_timer = QTimer(self)
+        self._topmost_timer.timeout.connect(self._refresh_topmost_window)
+        self._topmost_timer.start(1500)
+
     def _run_master_loop(self):
         asyncio.set_event_loop(self.loop)
         self._ai_lock = asyncio.Lock()
@@ -193,7 +198,14 @@ class OpenAssistApp(QObject):
 
     def _on_audio_source_ui_change(self, source):
         self.state.audio_source = source
-        self._apply_settings()
+        if hasattr(self.config, "save"):
+            try:
+                self.config.save()
+            except Exception as e:
+                logger.debug(f"Audio source config save skipped: {e}")
+        self.overlay.refresh_standby_state(audio=source)
+        if hasattr(self.audio, "restart"):
+            self.audio.restart()
 
     def _sync_state_from_config(self):
         """Pull persisted config back into AppState before async subsystems catch up."""
@@ -310,7 +322,16 @@ class OpenAssistApp(QObject):
 
         window.setWindowOpacity(stealth_opacity if is_stealth else base_opacity)
         WindowUtils.hide_from_taskbar(window)
+        WindowUtils.ensure_topmost(window)
         self.stealth.apply_to_window(window, is_stealth)
+
+    def _refresh_topmost_window(self):
+        for window in (self.overlay, self.mini_overlay):
+            try:
+                if hasattr(window, "isVisible") and window.isVisible():
+                    WindowUtils.ensure_topmost(window)
+            except Exception as e:
+                logger.debug(f"Topmost refresh skipped: {e}")
 
     def _create_system_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -325,14 +346,24 @@ class OpenAssistApp(QObject):
     def _active_view(self):
         return self.mini_overlay if self.mini_mode else self.overlay
 
+    def _hud_focus_enabled(self) -> bool:
+        return bool(self.config.get("app.focus_on_show", False))
+
+    def _present_window(self, window, focus: bool = False):
+        if not window:
+            return None
+
+        window.show()
+        WindowUtils.ensure_topmost(window)
+        if hasattr(window, "raise_"):
+            window.raise_()
+        if focus and hasattr(window, "activateWindow"):
+            window.activateWindow()
+        return window
+
     def _show_active_overlay(self):
         view = self._active_view()
-        view.show()
-        if hasattr(view, "raise_"):
-            view.raise_()
-        if hasattr(view, "activateWindow"):
-            view.activateWindow()
-        return view
+        return self._present_window(view, focus=self._hud_focus_enabled())
 
     def open_settings(self):
         if self.mini_mode:
@@ -345,15 +376,11 @@ class OpenAssistApp(QObject):
             show_settings_view()
         else:
             self.overlay.stack.setCurrentWidget(self.overlay.settings_view)
-        self.overlay.show()
-        self.overlay.raise_()
-        self.overlay.activateWindow()
+        self._present_window(self.overlay, focus=True)
 
     def _show_initial_window(self):
         if not self.config.get("onboarding.completed", False):
-            self.overlay.show()
-            self.overlay.raise_()
-            self.overlay.activateWindow()
+            self._present_window(self.overlay, focus=True)
             self.overlay.show_onboarding()
             return
 
@@ -451,9 +478,7 @@ class OpenAssistApp(QObject):
         if not v.isVisible() or v.windowOpacity() <= 0:
             if self._click_through:
                 self.toggle_click_through()
-            v.show()
-            v.raise_()
-            v.activateWindow()
+            self._present_window(v, focus=self._hud_focus_enabled())
             logger.debug("👁️ HUD Shown via toggle.")
             return
 
@@ -656,6 +681,8 @@ class OpenAssistApp(QObject):
 
         if hasattr(self, "_nexus_timer"):
             self._nexus_timer.stop()
+        if hasattr(self, "_topmost_timer"):
+            self._topmost_timer.stop()
         if hasattr(self, "_move_timer"):
             self._move_timer.stop()
 
@@ -709,14 +736,14 @@ class OpenAssistApp(QObject):
         self._sync_state_from_config()
         if hasattr(self, "_nexus_timer"):
             self._nexus_timer.start(3000)
+        if hasattr(self, "_topmost_timer"):
+            self._topmost_timer.start(1500)
         if hasattr(self.audio, "start"):
             self.audio.start()
         if hasattr(self.hotkeys, "start"):
             self.hotkeys.start()
         self._background_warmup()
-        self.overlay.show()
-        self.overlay.raise_()
-        self.overlay.activateWindow()
+        self._present_window(self.overlay, focus=True)
         self.overlay.show_onboarding()
 
     def factory_reset(self, restart: bool = True):
@@ -797,6 +824,8 @@ class OpenAssistApp(QObject):
     def toggle_mini_mode(self):
         self.mini_mode = not self.mini_mode
         self.state.is_mini = self.mini_mode
+        if self.mini_mode:
+            self._sync_history_ui()
 
     def toggle_stealth_mode(self):
         self.state.is_stealth = True
@@ -934,6 +963,8 @@ class OpenAssistApp(QObject):
         """Stops all background AI monitoring and capture tasks."""
         self.is_running = False
         self._nexus_timer.stop()
+        if hasattr(self, "_topmost_timer"):
+            self._topmost_timer.stop()
         if self.loop and self.loop.is_running():
             asyncio.run_coroutine_threadsafe(self.ai.stop_health_monitor(), self.loop)
 

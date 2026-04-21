@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QScrollArea,
     QProgressBar,
+    QSizePolicy,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from ui.custom_widgets import PremiumCheckBox
@@ -394,6 +395,10 @@ class OnboardingWizard(QWidget):
 
         self.provider_link = QLabel()
         self.provider_link.setOpenExternalLinks(False)
+        self.provider_link.setWordWrap(False)
+        self.provider_link.setSizePolicy(
+            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
+        )
         self.provider_link.linkActivated.connect(
             lambda url: QDesktopServices.openUrl(QUrl(url))
         )
@@ -730,6 +735,7 @@ class OnboardingWizard(QWidget):
             f"Open {provider_meta.get('name', provider_id)} to "
             f"{'install the local engine' if provider_id == 'ollama' else 'create or copy an API key'}."
         )
+        self.provider_link.adjustSize()
 
     def _update_summary(self):
         """Refresh summary labels from in-memory wizard_state with safety guards."""

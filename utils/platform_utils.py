@@ -130,6 +130,52 @@ class WindowUtils:
     """Native window helpers used for packaging/runtime polish."""
 
     @staticmethod
+    def ensure_topmost(window) -> bool:
+        """Re-assert topmost status for overlay windows.
+
+        Qt's ``WindowStaysOnTopHint`` usually works, but Windows can still drop
+        the z-order in edge cases after focus changes, monitor switches, or
+        shell-level window churn. This helper refreshes the HWND to ``TOPMOST``
+        without moving or resizing the window.
+        """
+        if not PlatformInfo.IS_WINDOWS or window is None:
+            return False
+
+        try:
+            import ctypes
+
+            hwnd = int(window.winId())
+            if hwnd == 0:
+                return False
+
+            user32 = ctypes.windll.user32
+            HWND_TOPMOST = -1
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOACTIVATE = 0x0010
+            SWP_NOOWNERZORDER = 0x0200
+            SWP_NOSENDCHANGING = 0x0400
+
+            return bool(
+                user32.SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOACTIVATE
+                    | SWP_NOOWNERZORDER
+                    | SWP_NOSENDCHANGING,
+                )
+            )
+        except Exception as e:
+            logger.debug(f"Ensure topmost skipped: {e}")
+            return False
+
+    @staticmethod
     def hide_from_taskbar(window) -> bool:
         """Hide a Qt window from the Windows taskbar.
 

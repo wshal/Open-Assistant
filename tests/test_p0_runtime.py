@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 import numpy as np
+import json
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -16,6 +17,9 @@ from core.config import Config
 from core.hotkeys import HotkeyManager, NativeHotkeyThread
 from core.state import AppState
 from utils.platform_utils import WindowUtils
+from ai.providers.ollama_provider import OllamaProvider
+from ai.prompts import PromptBuilder
+from ui.settings_view import ProviderTestWorker, SettingsView
 
 
 class ConfigStub:
@@ -27,6 +31,16 @@ class ConfigStub:
 
     def set(self, path, value):
         self.settings[path] = value
+
+    def get_api_key(self, provider):
+        return self.settings.get(f"api_key.{provider}", "")
+
+    def validate_key_for_ui(self, provider, key):
+        if provider == "ollama":
+            return True, "OK"
+        if key and len(key) >= 10:
+            return True, "OK"
+        return False, "Invalid Key"
 
 
 class HistoryStub:
@@ -302,7 +316,7 @@ class AIEngineProviderSelectionTests(unittest.TestCase):
         self.assertEqual(selected[0]["task"], "general")
         self.assertFalse(selected[0]["prefer_speed"])
         self.assertTrue(selected[0]["prefer_quality"])
-        self.assertEqual(selected[0]["preferred"][0], "gemini")
+        self.assertEqual(selected[0]["preferred"][0], "groq")
 
 
 class ResponseHistoryReadOnlyTests(unittest.TestCase):
@@ -471,7 +485,206 @@ class ScreenCaptureContextTests(unittest.TestCase):
         self.assertEqual(result, "cached text")
 
 
+class OllamaProviderTests(unittest.TestCase):
+    def test_blank_model_uses_first_available_local_model(self):
+        provider = OllamaProvider(ConfigStub({}))
+        provider._available_models = ["qwen2.5:7b", "llama3.2:latest"]
+
+        picked = provider._pick_available_model("")
+
+        self.assertEqual(picked, "llama3.2:latest")
+
+    def test_check_availability_resolves_non_empty_model_when_config_missing(self):
+        provider = OllamaProvider(ConfigStub({}))
+
+        payload = {"models": [{"name": "llama3.2:latest"}]}
+
+        class FakeResponse:
+            status = 200
+
+            async def json(self):
+                return payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeSession:
+            def get(self, *args, **kwargs):
+                return FakeResponse()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        with patch("aiohttp.ClientSession", return_value=FakeSession()):
+            ok = asyncio.run(provider.check_availability())
+
+        self.assertTrue(ok)
+        self.assertTrue(provider.is_ready)
+        self.assertEqual(provider.get_model(), "llama3.2:latest")
+
+
+class PromptBuilderTests(unittest.TestCase):
+    def test_manual_general_knowledge_query_suppresses_unrelated_live_context(self):
+        builder = PromptBuilder()
+
+        prompt = builder.user(
+            query="what is react ?",
+            screen="def main():\n    print('python app')",
+            audio="we are debugging a python bug",
+            origin="manual",
+            nexus={"active_window": "VS Code", "history_depth_secs": 60},
+        )
+
+        self.assertNotIn("[SCREEN]", prompt)
+        self.assertNotIn("[AUDIO]", prompt)
+        self.assertNotIn("[ENVIRONMENT]", prompt)
+        self.assertIn("general knowledge", prompt)
+
+    def test_manual_contextual_query_keeps_live_context(self):
+        builder = PromptBuilder()
+
+        prompt = builder.user(
+            query="what does this Python function do?",
+            screen="def add(a, b):\n    return a + b",
+            audio="",
+            origin="manual",
+            nexus={"active_window": "VS Code", "history_depth_secs": 60},
+        )
+
+        self.assertIn("[SCREEN]", prompt)
+        self.assertIn("[ENVIRONMENT]", prompt)
+
+    def test_interview_mode_prioritizes_audio_before_screen(self):
+        builder = PromptBuilder()
+
+        prompt = builder.user(
+            query="How should I answer this?",
+            screen="Tell me about a time you handled conflict.",
+            audio="The interviewer just asked about conflict resolution.",
+            mode="interview",
+            origin="manual",
+            nexus={"active_window": "Zoom", "history_depth_secs": 60},
+        )
+
+        self.assertLess(prompt.index("[AUDIO]"), prompt.index("[SCREEN]"))
+
+
+class ModeAwareProviderPreferenceTests(unittest.TestCase):
+    def test_general_mode_prefers_fast_general_models(self):
+        engine = AIEngine(ConfigStub({"ai.mode": "general"}), HistoryStub(), rag=None)
+
+        preferred = engine._preferred_providers_for_complexity("moderate", "general")
+
+        self.assertEqual(preferred[:3], ["groq", "cerebras", "together"])
+
+    def test_meeting_mode_prefers_fast_general_models(self):
+        engine = AIEngine(ConfigStub({"ai.mode": "meeting"}), HistoryStub(), rag=None)
+
+        preferred = engine._preferred_providers_for_complexity("simple", "meeting")
+
+        self.assertEqual(preferred[:3], ["groq", "cerebras", "together"])
+
+    def test_interview_mode_keeps_audio_first_but_quality_for_harder_queries(self):
+        engine = AIEngine(ConfigStub({"ai.mode": "interview"}), HistoryStub(), rag=None)
+
+        preferred = engine._preferred_providers_for_complexity("complex", "interview")
+
+        self.assertEqual(preferred[:2], ["gemini", "groq"])
+
+
+class ProviderTestWorkerTests(unittest.TestCase):
+    def test_ollama_test_does_not_require_api_key(self):
+        config = ConfigStub({})
+        worker = ProviderTestWorker("ollama", config)
+        results = []
+        worker.result_ready.connect(
+            lambda pid, ok, msg, details: results.append((pid, ok, msg, details))
+        )
+
+        payload = {"models": [{"name": "llama3.2:latest"}]}
+
+        class FakeResponse:
+            status = 200
+
+            async def json(self):
+                return payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeSession:
+            def get(self, *args, **kwargs):
+                return FakeResponse()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        with patch("aiohttp.ClientSession", return_value=FakeSession()):
+            worker.run()
+
+        self.assertEqual(results[0][0], "ollama")
+        self.assertTrue(results[0][1])
+        self.assertIn("Connected", results[0][2])
+        self.assertEqual(results[0][3]["models"], ["llama3.2:latest"])
+
+    def test_cloud_provider_test_rejects_invalid_key_before_request(self):
+        config = ConfigStub({})
+        worker = ProviderTestWorker("groq", config)
+        results = []
+        worker.result_ready.connect(
+            lambda pid, ok, msg, details: results.append((pid, ok, msg, details))
+        )
+
+        worker.run()
+
+        self.assertEqual(results, [("groq", False, "Invalid Key", None)])
+
+    def test_recommended_ollama_model_prefers_coder_for_coding_mode(self):
+        models = ["llama3.2:latest", "qwen2.5-coder:7b", "mistral:7b"]
+
+        picked = SettingsView._recommended_ollama_model(models, "coding")
+
+        self.assertEqual(picked, "qwen2.5-coder:7b")
+
+
 class WindowUtilsTests(unittest.TestCase):
+    def test_ensure_topmost_refreshes_hwnd_on_windows(self):
+        class FakeWindow:
+            def winId(self):
+                return 101
+
+        class FakeUser32:
+            def __init__(self):
+                self.calls = []
+
+            def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+                self.calls.append((hwnd, insert_after, flags))
+                return 1
+
+        fake_user32 = FakeUser32()
+        fake_window = FakeWindow()
+
+        with patch("utils.platform_utils.PlatformInfo.IS_WINDOWS", True), patch(
+            "ctypes.windll", Mock(user32=fake_user32), create=True
+        ):
+            self.assertTrue(WindowUtils.ensure_topmost(fake_window))
+            self.assertEqual(len(fake_user32.calls), 1)
+            hwnd, insert_after, _ = fake_user32.calls[0]
+            self.assertEqual(hwnd, 101)
+            self.assertEqual(insert_after, -1)
+
     def test_hide_from_taskbar_marks_window_once_on_windows(self):
         class FakeWindow:
             def winId(self):

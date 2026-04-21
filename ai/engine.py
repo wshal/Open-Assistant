@@ -149,7 +149,9 @@ class AIEngine(QObject):
 
         # Smart routing: analyze query complexity and select provider
         complexity = self._analyze_query_complexity(query)
-        preferred_providers = self._preferred_providers_for_complexity(complexity)
+        preferred_providers = self._preferred_providers_for_complexity(
+            complexity, mode_id
+        )
 
         # Use parallel inference if enabled
         use_parallel = self._parallel and self.config.get("ai.parallel.enabled", False)
@@ -541,8 +543,17 @@ class AIEngine(QObject):
             return "moderate"
         return "simple"
 
-    def _preferred_providers_for_complexity(self, complexity: str) -> List[str]:
+    def _preferred_providers_for_complexity(self, complexity: str, mode_id: str = "general") -> List[str]:
         """Return provider preferences without bypassing the router."""
+        mode_id = (mode_id or "general").lower()
+        if mode_id in {"general", "meeting"}:
+            if complexity in {"simple", "moderate"}:
+                return ["groq", "cerebras", "together", "gemini", "ollama"]
+            return ["groq", "cerebras", "gemini", "together", "ollama"]
+        if mode_id == "interview":
+            if complexity in {"simple", "moderate"}:
+                return ["groq", "cerebras", "gemini", "together", "ollama"]
+            return ["gemini", "groq", "cerebras", "together", "ollama"]
         if complexity == "simple":
             return ["groq", "cerebras", "gemini", "together", "ollama"]
         if complexity == "moderate":
@@ -629,17 +640,28 @@ class AIEngine(QObject):
 
     async def poll_provider_health(self):
         """Polls providers and emits status to UI badges."""
-        results = {}
+        results = self._router.get_provider_health() if self._router else {}
         for pid, prov in list(self._providers.items()):
+            info = dict(results.get(pid, {}))
+            state = info.get("state", "unknown")
             try:
-                is_ok = False
                 if hasattr(prov, "check_availability"):
                     is_ok = await asyncio.wait_for(prov.check_availability(), timeout=5)
-                else:
-                    is_ok = True
-                results[pid] = {"state": "active" if is_ok else "down"}
+                    if is_ok:
+                        state = "active"
+                    elif getattr(prov, "state", "") == "missing":
+                        state = "missing"
+                    elif getattr(prov, "state", "") == "unavailable":
+                        state = "down"
+                    elif state not in {"cooldown", "rate_limited", "disabled"}:
+                        state = "down"
             except Exception:
-                results[pid] = {"state": "down"}
+                state = "down"
+
+            info["state"] = state
+            info["selected"] = pid == self._active_provider_id
+            info["usable"] = state in {"active", "cooldown"}
+            results[pid] = info
 
         self.provider_status.emit(results)
 
