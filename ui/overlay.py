@@ -79,6 +79,7 @@ class OverlayWindow(QMainWindow):
         self.btn_end_session.setVisible(True)
         self.btn_history.setVisible(False)
         self.btn_settings.setVisible(False)
+        self.set_analysis_provider_badge()
         self.update_audio_state(self.app.state.is_muted)
         self._session_timer.start(1000)
 
@@ -92,6 +93,7 @@ class OverlayWindow(QMainWindow):
         self.btn_settings.setVisible(True)
         self._session_timer.stop()
         self.session_timer.setText("00:00")
+        self.set_analysis_provider_badge()
 
     def _connect_state(self):
         self.app.state.muted_changed.connect(self.update_audio_state)
@@ -279,6 +281,13 @@ class OverlayWindow(QMainWindow):
         tl.addWidget(self.transcript_lbl)
         cv_layout.addWidget(self.transcript_bar)
 
+        self.analysis_badge = QLabel("")
+        self.analysis_badge.setVisible(False)
+        self.analysis_badge.setStyleSheet(
+            "background: rgba(56,189,248,0.12); color: #7dd3fc; border: 1px solid rgba(56,189,248,0.30); border-radius: 10px; padding: 5px 9px; margin: 0 5px 2px 5px; font-size: 10px; font-weight: 700;"
+        )
+        cv_layout.addWidget(self.analysis_badge)
+
         self.input = QLineEdit()
         self.input.setPlaceholderText("Ask about the live session or use Analyze Screen...")
         self.input.returnPressed.connect(self._send)
@@ -452,6 +461,20 @@ class OverlayWindow(QMainWindow):
         self.transcript_lbl.setStyleSheet(
             "color: #4ade80; font-size: 10px; font-style: normal;"
         )
+
+    def set_analysis_provider_badge(self, provider: str = None, pending: bool = False):
+        if pending:
+            self.analysis_badge.setText("Analyzing screen...")
+            self.analysis_badge.setVisible(True)
+            return
+
+        if provider:
+            self.analysis_badge.setText(f"Analyzed via {provider.capitalize()}")
+            self.analysis_badge.setVisible(True)
+            return
+
+        self.analysis_badge.clear()
+        self.analysis_badge.setVisible(False)
 
     def update_audio_state(self, muted):
         self.audio_status.setText("🔇" if muted else "🎙️")

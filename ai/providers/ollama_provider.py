@@ -190,6 +190,23 @@ class OllamaProvider(BaseProvider):
     def is_ready(self) -> bool:
         return self._state == self.STATE_READY
 
+    @staticmethod
+    def _looks_like_vision_model(model: str) -> bool:
+        model_lower = (model or "").lower()
+        markers = [
+            "vision",
+            "llava",
+            "bakllava",
+            "moondream",
+            "minicpm-v",
+            "qwen2-vl",
+            "qwen2.5-vl",
+            "llama3.2-vision",
+            "phi3.5-vision",
+            "granite3.2-vision",
+        ]
+        return any(marker in model_lower for marker in markers)
+
     async def generate(self, system: str, user: str, tier: str = None) -> str:
         """Generate response. Lazy-checks availability if state is unknown."""
         if self._state == self.STATE_UNKNOWN:
@@ -284,7 +301,7 @@ class OllamaProvider(BaseProvider):
         return await self.check_availability()
 
     def supports_vision(self) -> bool:
-        return True
+        return self._looks_like_vision_model(self.get_model())
 
     async def analyze_image(
         self,
@@ -335,3 +352,68 @@ class OllamaProvider(BaseProvider):
                 tok = data.get("eval_count", len(text) // 4)
                 self.stats.record(tok, time.time() - t0)
                 return text
+
+    def supports_vision_stream(self) -> bool:
+        return self.supports_vision()
+
+    async def analyze_image_stream(
+        self,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        tier: str = None,
+    ) -> AsyncGenerator[str, None]:
+        if self._state == self.STATE_UNKNOWN:
+            await self.check_availability()
+
+        if not self.is_ready:
+            raise Exception(
+                f"Ollama model not available (state: {self._state}). "
+                f"Pull it first: ollama pull {self.get_model(tier)}"
+            )
+
+        if not self.supports_vision():
+            raise Exception(f"Ollama model '{self.get_model(tier)}' does not appear to support vision.")
+
+        self._pre_request()
+        model = self.get_model(tier)
+        t0 = time.time()
+        tok = 0
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.endpoint}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {
+                            "role": "user",
+                            "content": user,
+                            "images": [image_b64],
+                        },
+                    ],
+                    "stream": True,
+                    "options": {"num_ctx": 8192, "temperature": 0.4},
+                },
+                timeout=self._generate_timeout,
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise Exception(f"Ollama error {resp.status}: {body[:200]}")
+
+                async for line in resp.content:
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunk = data.get("message", {}).get("content", "")
+                    if chunk:
+                        tok += 1
+                        yield chunk
+
+        self.stats.record(tok, time.time() - t0)

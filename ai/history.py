@@ -44,6 +44,7 @@ class ResponseHistory:
             str(self.history_dir / f"{self.current_session_id}.enc")
         )
         self.current_index = -1
+        self.screen_analyses: List[dict] = []
         self._lock = threading.Lock()
 
         # Load existing sessions index if any
@@ -87,6 +88,7 @@ class ResponseHistory:
         )
         self.entries = []
         self.current_index = -1
+        self.screen_analyses = []
         logger.info(f"🆕 Started new session: {self.current_session_id}")
 
     def add(
@@ -161,6 +163,31 @@ class ResponseHistory:
         with self._lock:
             return self.entries[-n:]
 
+    def add_screen_analysis(
+        self,
+        prompt: str,
+        response: str,
+        provider: str,
+        metadata: dict = None,
+    ):
+        with self._lock:
+            self._ensure_current_session_meta()
+            self.screen_analyses.append(
+                {
+                    "prompt": prompt,
+                    "response": response,
+                    "provider": provider,
+                    "timestamp": time.time(),
+                    "metadata": metadata or {},
+                }
+            )
+            self.index_storage.set("sessions_index", self.sessions)
+            self._save_unlocked()
+
+    def get_screen_analyses(self) -> List[dict]:
+        with self._lock:
+            return list(self.screen_analyses)
+
     def load_session(self, session_id: str):
         """Loads a specific session into memory."""
         self.save()  # Save current first
@@ -187,6 +214,23 @@ class ResponseHistory:
             logger.warning(f"Failed to read session {session_id}: {e}")
             return []
 
+    def read_session_bundle(self, session_id: str) -> dict:
+        """Read both chat entries and screen analyses for a session."""
+        target_path = self.history_dir / f"{session_id}.enc"
+        if not target_path.exists():
+            logger.error(f"Session file not found: {session_id}")
+            return {"entries": [], "screen_analyses": []}
+
+        try:
+            storage = SecureStorage(str(target_path))
+            return {
+                "entries": self._entries_from_storage(storage),
+                "screen_analyses": self._screen_analyses_from_storage(storage),
+            }
+        except Exception as e:
+            logger.warning(f"Failed to read session bundle {session_id}: {e}")
+            return {"entries": [], "screen_analyses": []}
+
     def load(self):
         """Load current session from its encrypted storage."""
         with self._lock:
@@ -197,6 +241,8 @@ class ResponseHistory:
         try:
             self.entries = self._entries_from_storage(self.current_storage)
             self.current_index = len(self.entries) - 1
+            analyses = self.current_storage.get("screen_analysis_data")
+            self.screen_analyses = analyses if isinstance(analyses, list) else []
         except Exception as e:
             logger.warning(f"Failed to load history: {e}")
 
@@ -212,17 +258,25 @@ class ResponseHistory:
             entries.append(HistoryEntry(**filtered))
         return entries
 
+    @staticmethod
+    def _screen_analyses_from_storage(storage: SecureStorage) -> List[dict]:
+        data = storage.get("screen_analysis_data")
+        if not data or not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)]
+
     def save(self):
         """Save current session to its encrypted storage."""
         with self._lock:
             self._save_unlocked()
 
     def _save_unlocked(self):
-        if not self.entries:
+        if not self.entries and not self.screen_analyses:
             return
         try:
             data = [asdict(e) for e in self.entries]
             self.current_storage.set("history_data", data)
+            self.current_storage.set("screen_analysis_data", self.screen_analyses)
         except Exception as e:
             logger.error(f"Failed to save history: {e}")
 
@@ -230,6 +284,7 @@ class ResponseHistory:
         """Emergency Wipe: Purge memory and ALL session files from disk."""
         self.entries.clear()
         self.current_index = -1
+        self.screen_analyses = []
 
         # RESTORATION: Total Disk Purge logic
         logger.warning("🚨 EMERGENCY DISK PURGE INITIATED")

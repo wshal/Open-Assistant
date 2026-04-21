@@ -104,6 +104,7 @@ class Config:
                 logger.error(f"Config: Malformed YAML in {self._path}: {e}")
                 logger.warning("Config: Reverting to empty/default state.")
                 self._data = {}
+        self._apply_defaults()
         self._resolve_env(self._data)
         self._inject_secrets()
 
@@ -117,6 +118,11 @@ class Config:
             logger.info(f"Config loaded ({len(validation['valid'])} valid keys)")
         else:
             logger.info("Config loaded (no API keys configured)")
+
+    def _apply_defaults(self):
+        self._data.setdefault("ai", {})
+        self._data["ai"].setdefault("vision", {})
+        self._data["ai"]["vision"].setdefault("allow_paid_fallback", False)
 
     def _resolve_env(self, d):
         if isinstance(d, dict):
@@ -338,6 +344,14 @@ class Config:
     def save(self):
         with open(self._path, 'w') as f:
             yaml.dump(self._data, f, default_flow_style=False)
+
+    def reset_all(self):
+        """Restore config to first-run state and wipe encrypted secrets."""
+        self.secrets.clear_all()
+        self._data = {}
+        self._apply_defaults()
+        self.set("onboarding.completed", False)
+        self.save()
 
     def set_api_key(self, provider: str, key: str):
         # Clean the key before saving

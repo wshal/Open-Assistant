@@ -2,6 +2,7 @@ import unittest
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -54,7 +55,11 @@ class AudioStub:
 
 class OverlayStub:
     def __init__(self):
-        self.stack = SimpleNamespace(setCurrentIndex=self._set_index)
+        self.stack = SimpleNamespace(
+            setCurrentIndex=self._set_index,
+            currentIndex=lambda: 0,
+            currentWidget=lambda: "standby",
+        )
         self.indices = []
         self.mode_updates = []
         self.transcript_updates = []
@@ -67,6 +72,10 @@ class OverlayStub:
         self.onboarding_calls = 0
         self.status_updates = []
         self.opacity_updates = []
+        self.analysis_badges = []
+        self.chat_view = "chat"
+        self.settings_view = "settings"
+        self.standby_view = "standby"
 
     def _set_index(self, index):
         self.indices.append(index)
@@ -113,6 +122,18 @@ class OverlayStub:
     def show_onboarding(self):
         self.onboarding_calls += 1
 
+    def set_analysis_provider_badge(self, provider=None, pending=False):
+        self.analysis_badges.append({"provider": provider, "pending": pending})
+
+    def show_chat_view(self):
+        self.indices.append(1)
+
+    def show_standby_view(self):
+        self.indices.append(0)
+
+    def show_settings_view(self):
+        self.indices.append(2)
+
 
 class MiniOverlayStub:
     def __init__(self):
@@ -152,12 +173,16 @@ class MiniOverlayStub:
 class ConfigStub:
     def __init__(self):
         self._settings = {"ai.mode": "general"}
+        self.reset_calls = 0
 
     def get(self, path, default=None):
         return self._settings.get(path, default)
 
     def set(self, path, value):
         self._settings[path] = value
+
+    def reset_all(self):
+        self.reset_calls += 1
 
 
 class StateStub:
@@ -171,18 +196,37 @@ class StateStub:
 
 class OpenAssistAppSessionFlowTests(unittest.TestCase):
     def _build_app(self, mini_mode=False):
-        app = OpenAssistApp.__new__(OpenAssistApp)
-        app.history = HistoryStub()
-        app.audio = AudioStub()
-        app.overlay = OverlayStub()
-        app.mini_overlay = MiniOverlayStub()
-        app.config = ConfigStub()
-        app.state = StateStub()
-        app.mini_mode = mini_mode
-        app.session_active = False
-        app._last_query = "stale query"
-        app.ai = SimpleNamespace(_providers={"groq": SimpleNamespace(enabled=True)})
-        app.stealth = SimpleNamespace(apply_to_window=lambda window, enabled: None)
+        app = SimpleNamespace(
+            history=HistoryStub(),
+            audio=AudioStub(),
+            overlay=OverlayStub(),
+            mini_overlay=MiniOverlayStub(),
+            config=ConfigStub(),
+            state=StateStub(),
+            mini_mode=mini_mode,
+            session_active=False,
+            _last_query="stale query",
+            _generation_epoch=0,
+            _screen_analysis_pending=False,
+            loop=object(),
+            ai=SimpleNamespace(
+                _providers={"groq": SimpleNamespace(enabled=True)},
+                cancel=lambda: None,
+                _rag_cache={},
+            ),
+            rag=SimpleNamespace(_cache={}, stop=lambda: None),
+            nexus=SimpleNamespace(clear=lambda: None),
+            hotkeys=SimpleNamespace(stop=lambda: None, reset_state=lambda: None),
+            screen=SimpleNamespace(),
+            qt_app=SimpleNamespace(quit=lambda: None),
+            stealth=SimpleNamespace(apply_to_window=lambda window, enabled: None),
+        )
+        app._apply_window_effects = lambda window: OpenAssistApp._apply_window_effects(
+            app, window
+        )
+        app._apply_ui_only = lambda: OpenAssistApp._apply_ui_only(app)
+        app._stop_background_tasks = lambda: None
+        app._sync_state_from_config = lambda: OpenAssistApp._sync_state_from_config(app)
         return app
 
     def test_start_new_session_resets_state_and_updates_ui(self):
@@ -301,6 +345,27 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(update["provider"], "groq")
         self.assertEqual(update["latency_ms"], 1234)
 
+    def test_screen_analysis_badge_updates_during_flow(self):
+        app = self._build_app()
+        app.session_active = True
+        app._generation_epoch = 0
+
+        with patch(
+            "core.app.asyncio.run_coroutine_threadsafe",
+            side_effect=lambda coro, loop: coro.close(),
+        ):
+            OpenAssistApp.analyze_current_screen(app)
+        self.assertEqual(
+            app.overlay.analysis_badges[-1], {"provider": None, "pending": True}
+        )
+
+        app._screen_analysis_pending = True
+        OpenAssistApp._on_response_complete(app, "done")
+        self.assertEqual(
+            app.overlay.analysis_badges[-1],
+            {"provider": "groq", "pending": False},
+        )
+
     def test_toggle_stealth_mode_updates_state_and_window_opacity(self):
         app = self._build_app()
         app.state.is_stealth = False
@@ -318,6 +383,45 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertFalse(app.state.is_stealth)
         self.assertEqual(app.overlay.opacity_updates[-1], 0.94)
         self.assertEqual(app.mini_overlay.opacity_updates[-1], 0.94)
+
+    def test_factory_reset_falls_back_to_onboarding_when_restart_unavailable(self):
+        app = self._build_app()
+        stopped = []
+        cleared = []
+        shown = []
+
+        app._stop_runtime_for_reset = lambda: stopped.append(True)
+        app._clear_factory_reset_artifacts = lambda: cleared.append(True)
+        app._restart_app = lambda: False
+        app._show_onboarding_after_reset = lambda: shown.append(True)
+
+        OpenAssistApp.factory_reset(app)
+
+        self.assertEqual(stopped, [True])
+        self.assertEqual(cleared, [True])
+        self.assertEqual(shown, [True])
+
+    def test_show_onboarding_after_reset_restarts_runtime_services(self):
+        app = self._build_app()
+        app.is_running = False
+        timer_starts = []
+        audio_starts = []
+        hotkey_starts = []
+        warmups = []
+
+        app._nexus_timer = SimpleNamespace(start=lambda ms: timer_starts.append(ms))
+        app.audio = SimpleNamespace(start=lambda: audio_starts.append(True))
+        app.hotkeys = SimpleNamespace(start=lambda: hotkey_starts.append(True))
+        app._background_warmup = lambda: warmups.append(True)
+
+        OpenAssistApp._show_onboarding_after_reset(app)
+
+        self.assertTrue(app.is_running)
+        self.assertEqual(timer_starts, [3000])
+        self.assertEqual(audio_starts, [True])
+        self.assertEqual(hotkey_starts, [True])
+        self.assertEqual(warmups, [True])
+        self.assertEqual(app.overlay.onboarding_calls, 1)
 
 
 if __name__ == "__main__":

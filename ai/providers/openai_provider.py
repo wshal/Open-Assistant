@@ -187,3 +187,64 @@ class OpenAIProvider(BaseProvider):
         except Exception as e:
             self.stats.errors += 1
             raise self._handle_error(e)
+
+    def supports_vision_stream(self) -> bool:
+        return True
+
+    async def analyze_image_stream(
+        self,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        tier: str = None,
+    ) -> AsyncGenerator[str, None]:
+        self._pre_request()
+        model = self.get_model(tier)
+        t0 = time.time()
+        tok = 0
+        try:
+            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            image_url = f"data:{mime_type};base64,{image_b64}"
+            if model.startswith("o"):
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"Instructions: {system}\n\n{user}"},
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    }
+                ]
+            else:
+                messages = [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user},
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    },
+                ]
+
+            kwargs = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": self.max_tokens,
+                "stream": True,
+            }
+            if not model.startswith("o"):
+                kwargs["temperature"] = 0.4
+
+            stream = await self.client.chat.completions.create(**kwargs)
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    tok += 1
+                    yield content
+
+            self.stats.record(tok, time.time() - t0)
+        except Exception as e:
+            self.stats.errors += 1
+            raise self._handle_error(e)

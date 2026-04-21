@@ -11,6 +11,7 @@ from ai.history import ResponseHistory
 from ai.engine import AIEngine
 from capture.audio import AudioCapture
 from capture.screen import ScreenCapture
+from core.config import Config
 from core.state import AppState
 
 
@@ -28,6 +29,7 @@ class ConfigStub:
 class HistoryStub:
     def __init__(self):
         self.entries = []
+        self.screen_analyses = []
 
     def add(self, query, response, provider, mode="general", latency=0.0, metadata=None):
         self.entries.append(
@@ -37,6 +39,16 @@ class HistoryStub:
                 "provider": provider,
                 "mode": mode,
                 "latency": latency,
+                "metadata": metadata or {},
+            }
+        )
+
+    def add_screen_analysis(self, query, response, provider, metadata=None):
+        self.screen_analyses.append(
+            {
+                "prompt": query,
+                "response": response,
+                "provider": provider,
                 "metadata": metadata or {},
             }
         )
@@ -126,6 +138,74 @@ class AIEngineParallelOrderingTests(unittest.TestCase):
         self.assertEqual(completed, ["parallel answer"])
         self.assertEqual(history.entries[-1]["provider"], "parallel")
 
+    def test_vision_fallback_clears_partial_stream_before_retry_success(self):
+        config = ConfigStub(
+            {"ai.mode": "general", "ai.vision.allow_paid_fallback": True}
+        )
+        history = HistoryStub()
+        engine = AIEngine(config, history, rag=None)
+
+        class FailingVisionProvider:
+            enabled = True
+            name = "gemini"
+
+            @staticmethod
+            def check_rate():
+                return True
+
+            @staticmethod
+            def supports_vision():
+                return True
+
+            @staticmethod
+            def supports_vision_stream():
+                return True
+
+            async def analyze_image_stream(self, system, user, image_bytes, mime_type="image/png"):
+                yield "partial"
+                raise Exception("boom")
+
+        class SuccessVisionProvider:
+            enabled = True
+            name = "openai"
+
+            @staticmethod
+            def check_rate():
+                return True
+
+            @staticmethod
+            def supports_vision():
+                return True
+
+            @staticmethod
+            def supports_vision_stream():
+                return False
+
+            async def analyze_image(self, system, user, image_bytes, mime_type="image/png"):
+                return "final answer"
+
+        engine._providers = {
+            "gemini": FailingVisionProvider(),
+            "openai": SuccessVisionProvider(),
+        }
+
+        chunks = []
+        completed = []
+        engine.response_chunk.connect(chunks.append)
+        engine.response_complete.connect(completed.append)
+
+        asyncio.run(
+            engine.analyze_image_response(
+                "analyze",
+                b"img",
+                {"latest_ocr": "", "full_audio_history": ""},
+            )
+        )
+
+        self.assertEqual(chunks, ["partial"])
+        self.assertEqual(completed, ["", "final answer"])
+        self.assertEqual(history.entries[-1]["provider"], "openai")
+
 
 class AppStateIsolationTests(unittest.TestCase):
     def test_app_state_instances_are_independent(self):
@@ -214,6 +294,58 @@ class ResponseHistoryReadOnlyTests(unittest.TestCase):
         self.assertEqual(entries[0].query, "q1")
 
         shutil.rmtree(history_dir, ignore_errors=True)
+
+    def test_read_session_bundle_returns_entries_and_screen_analyses(self):
+        history_dir = Path("openassist") / "data" / "test_history_bundle_runtime"
+        if history_dir.exists():
+            shutil.rmtree(history_dir, ignore_errors=True)
+
+        history = ResponseHistory(history_dir=str(history_dir))
+        history.start_new_session()
+        session_id = history.current_session_id
+        history.add("q1", "r1", provider="groq")
+        history.add_screen_analysis("analyze", "screen result", provider="gemini")
+
+        bundle = history.read_session_bundle(session_id)
+
+        self.assertEqual(len(bundle["entries"]), 1)
+        self.assertEqual(bundle["entries"][0].query, "q1")
+        self.assertEqual(len(bundle["screen_analyses"]), 1)
+        self.assertEqual(bundle["screen_analyses"][0]["provider"], "gemini")
+
+        shutil.rmtree(history_dir, ignore_errors=True)
+
+
+class ConfigResetTests(unittest.TestCase):
+    def test_reset_all_clears_secrets_and_restores_first_run_state(self):
+        class FakeSecureStorage:
+            def __init__(self, filepath="data/settings.enc"):
+                self.data = {"api_key_groq": "secret"}
+
+            def get_api_key(self, provider):
+                return self.data.get(f"api_key_{provider}", "")
+
+            def set_api_key(self, provider, key):
+                self.data[f"api_key_{provider}"] = key
+
+            def clear_all(self):
+                self.data.clear()
+
+        config_path = Path("openassist") / "data" / "test_reset_config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("onboarding:\n  completed: true\n", encoding="utf-8")
+
+        with patch("core.config.SecureStorage", FakeSecureStorage):
+            config = Config(str(config_path))
+            config.set("ai.mode", "coding")
+            config.reset_all()
+
+            self.assertFalse(config.get("onboarding.completed", True))
+            self.assertEqual(config.get("ai.vision.allow_paid_fallback", None), False)
+            self.assertEqual(config.secrets.get_api_key("groq"), "")
+
+        if config_path.exists():
+            config_path.unlink()
 
 
 class ScreenCaptureContextTests(unittest.TestCase):

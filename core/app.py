@@ -9,8 +9,10 @@ import sys
 import asyncio
 import threading
 import time
+import shutil
+from pathlib import Path
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal, QProcess
 
 from core.config import Config
 from core.state import AppState
@@ -29,6 +31,7 @@ from core.tray import SystemTray
 from stealth.anti_detect import StealthManager
 from stealth.input_simulator import InputSimulator
 from utils.logger import setup_logger
+from core.constants import DB_DIR, CACHE_DIR, LOG_DIR
 
 logger = setup_logger(__name__)
 
@@ -152,12 +155,17 @@ class OpenAssistApp(QObject):
             available_providers=available,
         )
         if self._screen_analysis_pending:
-            self.overlay.update_transcript("Screen captured and analyzed.")
+            via = provider.upper() if provider else "VISION"
+            self.overlay.update_transcript(f"Screen captured and analyzed via {via}.")
+            if hasattr(self.overlay, "set_analysis_provider_badge"):
+                self.overlay.set_analysis_provider_badge(provider=provider)
             self._screen_analysis_pending = False
 
     def _on_ai_error(self, error_text: str):
         if self._screen_analysis_pending:
             self.overlay.update_transcript("Screen captured, but analysis failed.")
+            if hasattr(self.overlay, "set_analysis_provider_badge"):
+                self.overlay.set_analysis_provider_badge()
             self._screen_analysis_pending = False
 
     def _on_audio_source_ui_change(self, source):
@@ -419,25 +427,31 @@ class OpenAssistApp(QObject):
             return
 
         self.overlay.update_transcript("Screen captured. Analyzing current screen...")
+        if hasattr(self.overlay, "set_analysis_provider_badge"):
+            self.overlay.set_analysis_provider_badge(pending=True)
         self._screen_analysis_pending = True
         request_epoch = self._generation_epoch
 
         async def _capture_and_analyze():
             if request_epoch != self._generation_epoch:
                 return
-            image_bytes, screen_text = await self.screen.capture_snapshot()
+            image_bytes = await self.screen.capture_image_bytes()
             if request_epoch != self._generation_epoch:
                 return
             if not image_bytes:
                 self._screen_analysis_pending = False
                 self.overlay.update_transcript("Screen capture failed.")
+                if hasattr(self.overlay, "set_analysis_provider_badge"):
+                    self.overlay.set_analysis_provider_badge()
                 return
 
-            if screen_text:
-                self.nexus.push("screen", screen_text)
             audio_text = self.audio.get_transcript()
             snapshot = self.nexus.get_snapshot()
+            ocr_task = asyncio.create_task(
+                self.screen.extract_text_from_image_bytes(image_bytes)
+            )
             try:
+                screen_text = snapshot.get("latest_ocr", "")
                 await self.ai.analyze_image_response(
                     "Analyze the current screen and answer using the visible content, recent audio, and live session context.",
                     image_bytes,
@@ -445,9 +459,15 @@ class OpenAssistApp(QObject):
                     screen_context=screen_text,
                     audio_context=audio_text,
                 )
+                latest_ocr = await ocr_task
+                if latest_ocr and request_epoch == self._generation_epoch:
+                    self.nexus.push("screen", latest_ocr)
             except Exception:
                 if request_epoch != self._generation_epoch:
                     return
+                screen_text = await ocr_task
+                if screen_text:
+                    self.nexus.push("screen", screen_text)
                 self.generate_response(
                     "Analyze the current screen and answer using the visible content, recent audio, and live session context.",
                     "screen_analysis",
@@ -504,26 +524,98 @@ class OpenAssistApp(QObject):
     def emergency_erase(self):
         """Action: Nukes all data and kills all hardware loops immediately."""
         logger.warning("☣️ EMERGENCY ERASE TRIGGERED")
-        self.is_running = False
         self.history.clear()
         self.overlay.hide()
         self.mini_overlay.hide()
-        
-        # Stop all timers
-        self._nexus_timer.stop()
-        self._move_timer.stop()
-        
-        # Hardware shutdown
-        self.audio.stop()
-        self.audio.clear()
-        self.hotkeys.stop()
-        self.screen.stop()
-        
-        self.state.target_window_id = None
-        self._stop_background_tasks()
-        
+        self._stop_runtime_for_reset()
+
         # Force quit after brief delay to allow cleanup
         QTimer.singleShot(800, self.qt_app.quit)
+
+    def _stop_runtime_for_reset(self):
+        """Stop active capture, hotkeys, and background tasks before a hard reset."""
+        self.is_running = False
+        self.session_active = False
+        self._screen_analysis_pending = False
+
+        if hasattr(self, "_nexus_timer"):
+            self._nexus_timer.stop()
+        if hasattr(self, "_move_timer"):
+            self._move_timer.stop()
+
+        if hasattr(self.ai, "cancel"):
+            self.ai.cancel()
+        if hasattr(self.audio, "stop"):
+            self.audio.stop()
+        if hasattr(self.audio, "clear"):
+            self.audio.clear()
+        if hasattr(self.hotkeys, "stop"):
+            self.hotkeys.stop()
+        if hasattr(self.hotkeys, "reset_state"):
+            self.hotkeys.reset_state()
+        if hasattr(self.screen, "stop"):
+            self.screen.stop()
+
+        self.state.target_window_id = None
+        self.state.is_capturing = False
+        self._stop_background_tasks()
+
+    def _clear_factory_reset_artifacts(self):
+        """Wipe persisted user state so the next launch is treated as first-run."""
+        self.history.clear()
+        self.nexus.clear()
+
+        if hasattr(self.ai, "_rag_cache"):
+            self.ai._rag_cache.clear()
+        if hasattr(self.rag, "_cache"):
+            self.rag._cache.clear()
+        if hasattr(self.rag, "stop"):
+            self.rag.stop()
+
+        self.config.reset_all()
+
+        for path_str in [DB_DIR, CACHE_DIR, LOG_DIR]:
+            shutil.rmtree(Path(path_str), ignore_errors=True)
+
+    def _restart_app(self) -> bool:
+        """Best-effort detached restart for script and packaged app runs."""
+        try:
+            if getattr(sys, "frozen", False):
+                return QProcess.startDetached(sys.executable, sys.argv[1:])
+            return QProcess.startDetached(sys.executable, sys.argv)
+        except Exception as e:
+            logger.error(f"Factory reset restart failed: {e}")
+            return False
+
+    def _show_onboarding_after_reset(self):
+        """Fallback when restart is unavailable: return the current process to first-run UI."""
+        self.is_running = True
+        self._sync_state_from_config()
+        if hasattr(self, "_nexus_timer"):
+            self._nexus_timer.start(3000)
+        if hasattr(self.audio, "start"):
+            self.audio.start()
+        if hasattr(self.hotkeys, "start"):
+            self.hotkeys.start()
+        self._background_warmup()
+        self.overlay.show()
+        self.overlay.raise_()
+        self.overlay.activateWindow()
+        self.overlay.show_onboarding()
+
+    def factory_reset(self, restart: bool = True):
+        """Full first-run reset: clears persisted state, caches, and hardware state."""
+        logger.warning("🧹 FACTORY RESET TRIGGERED")
+        self.overlay.hide()
+        self.mini_overlay.hide()
+        self._stop_runtime_for_reset()
+        self._clear_factory_reset_artifacts()
+
+        if restart and self._restart_app():
+            QTimer.singleShot(150, self.qt_app.quit)
+            return
+
+        self._show_onboarding_after_reset()
 
     def start_new_session(self):
         self._generation_epoch += 1
@@ -543,6 +635,8 @@ class OpenAssistApp(QObject):
             self.overlay.stack.setCurrentWidget(self.overlay.chat_view)
         self.overlay.on_complete("", "")
         self.overlay.update_transcript("Listening for context...")
+        if hasattr(self.overlay, "set_analysis_provider_badge"):
+            self.overlay.set_analysis_provider_badge()
         start_session_ui = getattr(self.overlay, "start_session_ui", None)
         if callable(start_session_ui):
             start_session_ui()
@@ -573,6 +667,8 @@ class OpenAssistApp(QObject):
             end_session_ui()
         self.overlay.update_transcript("Ready...")
         self.overlay.on_complete("", "")
+        if hasattr(self.overlay, "set_analysis_provider_badge"):
+            self.overlay.set_analysis_provider_badge()
         self.mini_overlay.on_complete("", "")
         self.mini_overlay.set_ready()
 

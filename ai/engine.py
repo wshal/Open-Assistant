@@ -318,9 +318,13 @@ class AIEngine(QObject):
         fixed = self.config.get("ai.fixed_provider", "")
         if fixed:
             preferred.append(fixed)
-        for name in ["gemini", "openai", "ollama"]:
+        for name in ["gemini", "ollama"]:
             if name not in preferred:
                 preferred.append(name)
+        if self.config.get("ai.vision.allow_paid_fallback", False):
+            for name in ["openai"]:
+                if name not in preferred:
+                    preferred.append(name)
 
         candidates = []
         for name in preferred:
@@ -338,10 +342,22 @@ class AIEngine(QObject):
 
         last_error = None
         for provider in candidates:
+            emitted_partial = False
             try:
-                response = await provider.analyze_image(
-                    sys_prompt, user_msg, image_bytes, mime_type="image/png"
-                )
+                response = ""
+                if getattr(provider, "supports_vision_stream", lambda: False)():
+                    async for chunk in provider.analyze_image_stream(
+                        sys_prompt, user_msg, image_bytes, mime_type="image/png"
+                    ):
+                        if self._is_cancelled:
+                            return ""
+                        response += chunk
+                        emitted_partial = True
+                        self.response_chunk.emit(chunk)
+                else:
+                    response = await provider.analyze_image(
+                        sys_prompt, user_msg, image_bytes, mime_type="image/png"
+                    )
                 if self._is_cancelled:
                     return ""
 
@@ -354,9 +370,17 @@ class AIEngine(QObject):
                     latency=latency_ms,
                     metadata={"vision": True},
                 )
+                self.history.add_screen_analysis(
+                    query,
+                    response,
+                    provider=provider.name,
+                    metadata={"vision": True},
+                )
                 self.response_complete.emit(response)
                 return response
             except Exception as exc:
+                if emitted_partial:
+                    self.response_complete.emit("")
                 last_error = exc
                 logger.warning(f"Vision analysis failed on {provider.name}: {exc}")
 

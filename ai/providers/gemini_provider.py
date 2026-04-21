@@ -110,3 +110,43 @@ class GeminiProvider(BaseProvider):
         except Exception as e:
             self.stats.errors += 1
             raise
+
+    def supports_vision_stream(self) -> bool:
+        return True
+
+    async def analyze_image_stream(
+        self,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        tier: str = None,
+    ) -> AsyncGenerator[str, None]:
+        self._pre_request()
+        model = self.get_model(tier)
+        t0 = time.time()
+        tok = 0
+        try:
+            from google.genai import types
+
+            contents = [
+                types.Part.from_text(text=user),
+                types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            ]
+            stream = self.client.models.generate_content_stream(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    max_output_tokens=self.max_tokens,
+                    temperature=0.4,
+                ),
+            )
+            for chunk in stream:
+                if chunk.text:
+                    tok += len(chunk.text) // 4
+                    yield chunk.text
+            self.stats.record(tok, time.time() - t0)
+        except Exception as e:
+            self.stats.errors += 1
+            raise

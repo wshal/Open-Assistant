@@ -131,6 +131,34 @@ class ScreenCapture(QObject):
         img.save(buf, format="PNG")
         return buf.getvalue(), text or ""
 
+    async def capture_image_bytes(self) -> bytes:
+        """Capture one screenshot as PNG bytes without waiting for OCR."""
+        if not self._enabled:
+            return b""
+
+        img = self._screenshot()
+        if img is None:
+            return b""
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    async def extract_text_from_image_bytes(self, image_bytes: bytes) -> str:
+        """Run OCR over an existing screenshot blob."""
+        if not image_bytes:
+            return ""
+
+        try:
+            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            text, _ = await self.ocr.extract(img)
+            if text:
+                self._last_text = text
+            return text or ""
+        except Exception as e:
+            logger.debug(f"Snapshot OCR error: {e}")
+            return ""
+
     def _update_crop_box(self, boxes, offset_x, offset_y, screen_size):
         """Logic to calculate target region based on active text hits."""
         if not boxes:

@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QGridLayout,
     QSizePolicy,
+    QMessageBox,
 )
 from ui.custom_widgets import PremiumCheckBox
 from utils.logger import setup_logger
@@ -565,6 +566,23 @@ class SettingsView(QWidget):
             f"{TEXT_MUTED} font-size: 10px; background: transparent;"
         )
         l.addWidget(smart_desc)
+
+        self.chk_paid_vision_fallback = PremiumCheckBox(
+            "Allow paid vision fallback providers"
+        )
+        self.chk_paid_vision_fallback.setChecked(
+            self.config.get("ai.vision.allow_paid_fallback", False)
+        )
+        l.addWidget(self.chk_paid_vision_fallback)
+
+        paid_fallback_desc = QLabel(
+            "When disabled, screenshot analysis stays on free-capable vision providers like Gemini and compatible local Ollama models."
+        )
+        paid_fallback_desc.setWordWrap(True)
+        paid_fallback_desc.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; background: transparent;"
+        )
+        l.addWidget(paid_fallback_desc)
         # Screenshot Interval
         lbl_interval = self._make_section_label("SCREEN CAPTURE INTERVAL")
         l.addWidget(lbl_interval)
@@ -850,6 +868,37 @@ class SettingsView(QWidget):
         )
         l.addWidget(desc_reset)
 
+        btn_factory_reset = QPushButton("FACTORY RESET")
+        btn_factory_reset.setStyleSheet(
+            """
+            QPushButton {
+                background: rgba(220, 38, 38, 0.14);
+                color: #fecaca;
+                border-radius: 12px;
+                font-weight: 800;
+                font-size: 11px;
+                padding: 12px 24px;
+                border: 1px solid rgba(248, 113, 113, 0.35);
+            }
+            QPushButton:hover {
+                background: rgba(220, 38, 38, 0.22);
+                color: white;
+            }
+            """
+        )
+        btn_factory_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_factory_reset.clicked.connect(self._factory_reset)
+        l.addWidget(btn_factory_reset)
+
+        desc_factory_reset = QLabel(
+            "Wipes settings, encrypted API keys, history, caches, logs, and sends the app back to first-run onboarding."
+        )
+        desc_factory_reset.setWordWrap(True)
+        desc_factory_reset.setStyleSheet(
+            "color: #fca5a5; font-size: 10px; background: transparent;"
+        )
+        l.addWidget(desc_factory_reset)
+
         l.addStretch()
         c.setLayout(l)
         w.setWidget(c)
@@ -863,6 +912,27 @@ class SettingsView(QWidget):
         # Show onboarding
         if hasattr(self, "app") and hasattr(self.app, "overlay"):
             self.app.overlay.show_onboarding()
+
+    def _factory_reset(self):
+        """Run a full first-run reset after explicit confirmation."""
+        if not self.app or not hasattr(self.app, "factory_reset"):
+            return
+
+        result = QMessageBox.question(
+            self,
+            "Factory Reset",
+            (
+                "Factory reset OpenAssist?\n\n"
+                "This will remove settings, encrypted API keys, history, caches, and logs, "
+                "then send the app back to onboarding."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            return
+
+        self.app.factory_reset()
 
     def _test_pid(self, pid):
         self.status_labels[pid].setText("⏳")
@@ -916,6 +986,11 @@ class SettingsView(QWidget):
                 selected_audio,
             )
             self.config.set("capture.screen.smart_crop", self.chk_smart.isChecked())
+            if hasattr(self, "chk_paid_vision_fallback"):
+                self.config.set(
+                    "ai.vision.allow_paid_fallback",
+                    self.chk_paid_vision_fallback.isChecked(),
+                )
             self.config.set("stealth.enabled", self.chk_ghost.isChecked())
 
             # Save screenshot interval
