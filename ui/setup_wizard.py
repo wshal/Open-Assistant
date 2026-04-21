@@ -544,8 +544,9 @@ class SetupWizard(QDialog):
         self.chk_screen.setStyleSheet(check_style)
         layout.addWidget(self.chk_screen)
 
-        self.chk_stealth = QCheckBox("ð» Enable stealth mode (invisible to screen recording)")
-        self.chk_stealth.setChecked(False)
+        self.chk_stealth = QCheckBox("ð» Stealth mode always enabled (invisible to screen recording)")
+        self.chk_stealth.setChecked(True)
+        self.chk_stealth.setEnabled(False)
         self.chk_stealth.setStyleSheet(check_style)
         layout.addWidget(self.chk_stealth)
 
@@ -652,7 +653,7 @@ class SetupWizard(QDialog):
     def _finish(self):
         self.config.set("capture.audio.enabled", self.chk_audio.isChecked())
         self.config.set("capture.screen.enabled", self.chk_screen.isChecked())
-        self.config.set("stealth.enabled", self.chk_stealth.isChecked())
+        self.config.set("stealth.enabled", True)
         self.config.set("rag.enabled", self.chk_rag.isChecked())
         self.config.set("app.start_minimized", self.chk_tray.isChecked())
         self.config.secrets.set("setup_complete", True)

@@ -483,7 +483,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertEqual(scrolls, ["up", "down"])
 
-    def test_toggle_stealth_mode_updates_state_and_window_opacity(self):
+    def test_toggle_stealth_mode_enforces_stealth_state_and_window_opacity(self):
         app = self._build_app()
         app.state.is_stealth = False
         app.config.set("stealth.low_opacity", 0.75)
@@ -497,9 +497,9 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         OpenAssistApp.toggle_stealth_mode(app)
 
-        self.assertFalse(app.state.is_stealth)
-        self.assertEqual(app.overlay.opacity_updates[-1], 0.94)
-        self.assertEqual(app.mini_overlay.opacity_updates[-1], 0.94)
+        self.assertTrue(app.state.is_stealth)
+        self.assertEqual(app.overlay.opacity_updates[-1], 0.75)
+        self.assertEqual(app.mini_overlay.opacity_updates[-1], 0.75)
 
     def test_factory_reset_falls_back_to_onboarding_when_restart_unavailable(self):
         app = self._build_app()

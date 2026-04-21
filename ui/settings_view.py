@@ -491,7 +491,7 @@ class SettingsView(QWidget):
             "scroll_down": "Scroll Response Down",
             "switch_mode": "Rotate AI Modes",
             "toggle_audio": "Mute/Unmute Mic",
-            "stealth": "Toggle Ghost Stealth",
+            "stealth": "Reapply Ghost Stealth",
             "mini_mode": "Switch to Mini-HUD",
             "toggle_click_through": "Focus Click-Through",
             "emergency_erase": "Emergency System Wipe",
@@ -671,11 +671,12 @@ class SettingsView(QWidget):
         lbl = QLabel("GHOST ANTI-RECORDING")
         lbl.setStyleSheet("background: transparent;")
         l.addWidget(lbl)
-        self.chk_ghost = PremiumCheckBox("Mask overlay from Screen Recorders")
-        self.chk_ghost.setChecked(self.config.get("stealth.enabled", False))
+        self.chk_ghost = PremiumCheckBox("Mask overlay from Screen Recorders (Always On)")
+        self.chk_ghost.setChecked(True)
+        self.chk_ghost.setEnabled(False)
         l.addWidget(self.chk_ghost)
         desc = QLabel(
-            "Enabling this prevents Zoom, Teams, or OBS from seeing the AI overlay."
+            "Stealth protection is enforced by default so Zoom, Teams, Meet, and OBS should not capture the overlay."
         )
         desc.setWordWrap(True)
         desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
@@ -1032,7 +1033,7 @@ class SettingsView(QWidget):
                     "ai.vision.allow_paid_fallback",
                     self.chk_paid_vision_fallback.isChecked(),
                 )
-            self.config.set("stealth.enabled", self.chk_ghost.isChecked())
+            self.config.set("stealth.enabled", True)
 
             # Save screenshot interval
             if hasattr(self, "screenshot_interval"):

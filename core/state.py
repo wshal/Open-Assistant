@@ -25,7 +25,7 @@ class AppState(QObject):
         self._audio_source = "system"
         self._is_muted = False
         self._is_capturing = False
-        self._is_stealth = False
+        self._is_stealth = True
         self._is_mini = False
         self._target_window_id = 0
         self._provider_health = {}
@@ -34,7 +34,7 @@ class AppState(QObject):
         if config:
             self._mode = config.get("ai.mode", "general")
             self._audio_source = config.get("capture.audio.mode", "system")
-            self._is_stealth = config.get("stealth.enabled", False)
+            self._is_stealth = config.get("stealth.enabled", True)
             
 
     # Properties with signal emission

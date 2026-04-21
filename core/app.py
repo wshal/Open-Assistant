@@ -199,7 +199,7 @@ class OpenAssistApp(QObject):
         """Pull persisted config back into AppState before async subsystems catch up."""
         self.state.mode = self.config.get("ai.mode", "general")
         self.state.audio_source = self.config.get("capture.audio.mode", "system")
-        self.state.is_stealth = self.config.get("stealth.enabled", False)
+        self.state.is_stealth = self.config.get("stealth.enabled", True)
 
     def _poll_nexus_context(self):
         """Polls environmental signals for the ContextNexus."""
@@ -799,7 +799,7 @@ class OpenAssistApp(QObject):
         self.state.is_mini = self.mini_mode
 
     def toggle_stealth_mode(self):
-        self.state.is_stealth = not self.state.is_stealth
+        self.state.is_stealth = True
         if hasattr(self.config, "save"):
             try:
                 self.config.save()

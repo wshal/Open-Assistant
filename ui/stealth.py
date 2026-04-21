@@ -22,7 +22,7 @@ class StealthUIManager(QObject):
         super().__init__()
         self.config = config
         self.window = window
-        self.enabled = config.get("stealth.enabled", False)
+        self.enabled = config.get("stealth.enabled", True)
         self.auto_hide = config.get("stealth.auto_hide_on_share", True)
 
         self.cloaker = WindowCloaker(config)

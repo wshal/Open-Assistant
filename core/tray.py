@@ -45,7 +45,7 @@ class SystemTray:
         quick.triggered.connect(app.quick_answer)
         menu.addAction(quick)
 
-        stealth = QAction("Toggle Stealth", menu)
+        stealth = QAction("Reapply Stealth", menu)
         stealth.triggered.connect(app.toggle_stealth_mode)
         menu.addAction(stealth)
 

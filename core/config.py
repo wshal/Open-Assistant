@@ -105,6 +105,7 @@ class Config:
                 logger.warning("Config: Reverting to empty/default state.")
                 self._data = {}
         self._apply_defaults()
+        self.set("stealth.enabled", True)
         self._resolve_env(self._data)
         self._inject_secrets()
 
@@ -123,6 +124,10 @@ class Config:
         self._data.setdefault("ai", {})
         self._data["ai"].setdefault("vision", {})
         self._data["ai"]["vision"].setdefault("allow_paid_fallback", False)
+        self._data.setdefault("stealth", {})
+        self._data["stealth"].setdefault("enabled", True)
+        self._data["stealth"].setdefault("auto_hide_on_share", True)
+        self._data["stealth"].setdefault("low_opacity", 0.75)
         self._data.setdefault("hotkeys", {})
         hotkeys = self._data["hotkeys"]
         hotkeys.setdefault("toggle", "ctrl+\\")
