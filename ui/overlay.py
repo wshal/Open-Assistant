@@ -530,6 +530,8 @@ class OverlayWindow(QMainWindow):
 
     def showEvent(self, e):
         super().showEvent(e)
+        if hasattr(self.app, "_apply_window_effects"):
+            self.app._apply_window_effects(self)
         if hasattr(self.app, "hotkeys"):
             self.app.hotkeys.reset_state()
 
@@ -545,7 +547,10 @@ class OverlayWindow(QMainWindow):
         Can be disabled via config 'app.gaze_fade.enabled'.
         """
         # Check if gaze fade is enabled in config
-        if not self.config.get("app.gaze_fade.enabled", True):
+        if not self.config.get("app.gaze_fade.enabled", False):
+            return
+
+        if getattr(self.app.state, "is_stealth", False):
             return
 
         # Only fade during active session - not on standby/settings screens

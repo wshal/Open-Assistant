@@ -1,10 +1,12 @@
-"""Ollama â Local, offline, no API key. FIXED: No model pull during generation."""
+"""Ollama - Local, offline, no API key. FIXED: No model pull during generation."""
 
-import time
-import json
 import asyncio
-import aiohttp
+import json
+import time
 from typing import AsyncGenerator, Optional
+
+import aiohttp
+
 from ai.providers.base import BaseProvider
 from utils.logger import setup_logger
 
@@ -14,7 +16,7 @@ logger = setup_logger(__name__)
 class OllamaProvider(BaseProvider):
     """
     Ollama local LLM provider.
-    
+
     FIXED in v4.0:
     - Model availability check happens at init, NOT during generate()
     - If model isn't available, provider marks itself disabled
@@ -39,7 +41,7 @@ class OllamaProvider(BaseProvider):
         )
         if not self.endpoint.startswith("http"):
             logger.warning(
-                f"  ⚠️ Ollama endpoint looks invalid: {self.endpoint!r}. "
+                f"  Ollama endpoint looks invalid: {self.endpoint!r}. "
                 "Falling back to http://localhost:11434"
             )
             self.endpoint = "http://localhost:11434"
@@ -54,7 +56,7 @@ class OllamaProvider(BaseProvider):
         """
         Check if Ollama is running and the required model exists.
         Called during app initialization, NOT during generate().
-        
+
         Returns True if ready to serve requests.
         """
         self._state = self.STATE_CHECKING
@@ -63,18 +65,17 @@ class OllamaProvider(BaseProvider):
             async with aiohttp.ClientSession() as session:
                 # Step 1: Check if Ollama server is running
                 async with session.get(
-                    f"{self.endpoint}/api/tags",
-                    timeout=self._connect_timeout
+                    f"{self.endpoint}/api/tags", timeout=self._connect_timeout
                 ) as resp:
                     if resp.status != 200:
                         self._state = self.STATE_UNAVAILABLE
                         self.enabled = False
-                        logger.warning("  â ï¸ Ollama: Server returned non-200")
+                        logger.warning("  Ollama: Server returned non-200")
                         return False
 
                     data = await resp.json()
                     self._available_models = [
-                        m["name"] for m in data.get("models", [])
+                        model["name"] for model in data.get("models", [])
                     ]
 
             # Step 2: Check if our target model is available
@@ -82,97 +83,98 @@ class OllamaProvider(BaseProvider):
             target_base = target.split(":")[0]
 
             model_found = any(
-                target in m or target_base in m
-                for m in self._available_models
+                target in model or target_base in model
+                for model in self._available_models
             )
 
             if model_found:
                 self._state = self.STATE_READY
                 self.enabled = True
-                logger.info(f"  â Ollama ready (model: {target})")
+                logger.info(f"  Ollama ready (model: {target})")
                 return True
-            else:
-                self._state = self.STATE_MISSING
-                self.enabled = False
-                available_str = ", ".join(self._available_models[:5]) or "none"
-                logger.warning(
-                    f"  â ï¸ Ollama: Model '{target}' not found. "
-                    f"Available: {available_str}. "
-                    f"Run: ollama pull {target}"
-                )
-                return False
+
+            self._state = self.STATE_MISSING
+            self.enabled = False
+            available_str = ", ".join(self._available_models[:5]) or "none"
+            logger.warning(
+                f"  Ollama: Model '{target}' not found. "
+                f"Available: {available_str}. "
+                f"Run: ollama pull {target}"
+            )
+            return False
 
         except aiohttp.ClientConnectorError:
             self._state = self.STATE_UNAVAILABLE
             self.enabled = False
-            logger.info("  â¬ Ollama: Not running (install: https://ollama.com)")
+            logger.info("  Ollama: Not running (install: https://ollama.com)")
             return False
         except asyncio.TimeoutError:
             self._state = self.STATE_UNAVAILABLE
             self.enabled = False
-            logger.warning("  â ï¸ Ollama: Connection timeout")
+            logger.warning("  Ollama: Connection timeout")
             return False
-        except Exception as e:
+        except Exception as exc:
             self._state = self.STATE_UNAVAILABLE
             self.enabled = False
-            logger.warning(f"  â ï¸ Ollama: {e}")
+            logger.warning(f"  Ollama: {exc}")
             return False
 
     async def pull_model(self, model: str = None, progress_callback=None) -> bool:
         """
-        Explicitly pull a model. Called from SetupWizard or Settings, 
-        NEVER from generate().
-        
+        Explicitly pull a model. Called from settings flows, NEVER from generate().
+
         Args:
             model: Model name to pull (default: configured model)
             progress_callback: Optional callable(status: str, percent: float)
-        
+
         Returns True if pull succeeded.
         """
         model = model or self.get_model()
         self._state = self.STATE_PULLING
-        logger.info(f"ð¦ Pulling Ollama model: {model}...")
+        logger.info(f"Pulling Ollama model: {model}...")
 
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{self.endpoint}/api/pull",
                     json={"name": model},
-                    timeout=aiohttp.ClientTimeout(total=3600)  # 1 hour for large models
+                    timeout=aiohttp.ClientTimeout(total=3600),
                 ) as resp:
                     last_status = ""
                     async for line in resp.content:
-                        if line:
-                            try:
-                                data = json.loads(line)
-                                status = data.get("status", "")
-                                
-                                # Report progress
-                                if status != last_status:
-                                    last_status = status
-                                    total = data.get("total", 0)
-                                    completed = data.get("completed", 0)
-                                    percent = (completed / total * 100) if total > 0 else 0
-                                    
-                                    if progress_callback:
-                                        progress_callback(status, percent)
-                                    
-                                    if "pulling" in status.lower():
-                                        logger.info(f"  ð¥ {status}: {percent:.0f}%")
-                            except json.JSONDecodeError:
-                                continue
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        status = data.get("status", "")
+                        if status == last_status:
+                            continue
+
+                        last_status = status
+                        total = data.get("total", 0)
+                        completed = data.get("completed", 0)
+                        percent = (completed / total * 100) if total > 0 else 0
+
+                        if progress_callback:
+                            progress_callback(status, percent)
+
+                        if "pulling" in status.lower():
+                            logger.info(f"  Download {status}: {percent:.0f}%")
 
             # Verify the model is now available
             self._state = self.STATE_READY
             self.enabled = True
             self._available_models.append(model)
-            logger.info(f"  â Model '{model}' pulled successfully")
+            logger.info(f"  Model '{model}' pulled successfully")
             return True
 
-        except Exception as e:
+        except Exception as exc:
             self._state = self.STATE_MISSING
             self.enabled = False
-            logger.error(f"  â Pull failed: {e}")
+            logger.error(f"  Pull failed: {exc}")
             return False
 
     def get_available_models(self) -> list:
@@ -191,7 +193,7 @@ class OllamaProvider(BaseProvider):
         """Generate response. Lazy-checks availability if state is unknown."""
         if self._state == self.STATE_UNKNOWN:
             await self.check_availability()
-            
+
         if not self.is_ready:
             raise Exception(
                 f"Ollama model not available (state: {self._state}). "
@@ -209,12 +211,12 @@ class OllamaProvider(BaseProvider):
                     "model": model,
                     "messages": [
                         {"role": "system", "content": system},
-                        {"role": "user", "content": user}
+                        {"role": "user", "content": user},
                     ],
                     "stream": False,
-                    "options": {"num_ctx": 8192, "temperature": 0.7}
+                    "options": {"num_ctx": 8192, "temperature": 0.7},
                 },
-                timeout=self._generate_timeout
+                timeout=self._generate_timeout,
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
@@ -226,11 +228,13 @@ class OllamaProvider(BaseProvider):
                 self.stats.record(tok, time.time() - t0)
                 return text
 
-    async def generate_stream(self, system: str, user: str, tier: str = None) -> AsyncGenerator[str, None]:
+    async def generate_stream(
+        self, system: str, user: str, tier: str = None
+    ) -> AsyncGenerator[str, None]:
         """Stream response. Lazy-checks availability if state is unknown."""
         if self._state == self.STATE_UNKNOWN:
             await self.check_availability()
-            
+
         if not self.is_ready:
             raise Exception(
                 f"Ollama model not available (state: {self._state}). "
@@ -249,27 +253,28 @@ class OllamaProvider(BaseProvider):
                     "model": model,
                     "messages": [
                         {"role": "system", "content": system},
-                        {"role": "user", "content": user}
+                        {"role": "user", "content": user},
                     ],
                     "stream": True,
-                    "options": {"num_ctx": 8192, "temperature": 0.7}
+                    "options": {"num_ctx": 8192, "temperature": 0.7},
                 },
-                timeout=self._generate_timeout
+                timeout=self._generate_timeout,
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     raise Exception(f"Ollama error {resp.status}: {body[:200]}")
 
                 async for line in resp.content:
-                    if line:
-                        try:
-                            data = json.loads(line)
-                            c = data.get("message", {}).get("content", "")
-                            if c:
-                                tok += 1
-                                yield c
-                        except json.JSONDecodeError:
-                            continue
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunk = data.get("message", {}).get("content", "")
+                    if chunk:
+                        tok += 1
+                        yield chunk
 
         self.stats.record(tok, time.time() - t0)
 

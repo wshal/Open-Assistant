@@ -26,6 +26,16 @@ class HistoryStub:
     def get_state(self):
         return self.state
 
+    def get_last(self, n):
+        return [
+            SimpleNamespace(
+                query="example question",
+                response="example response",
+                provider="groq",
+                latency=1234,
+            )
+        ][:n]
+
 
 class AudioStub:
     def __init__(self):
@@ -55,6 +65,8 @@ class OverlayStub:
         self.raise_calls = 0
         self.activate_calls = 0
         self.onboarding_calls = 0
+        self.status_updates = []
+        self.opacity_updates = []
 
     def _set_index(self, index):
         self.indices.append(index)
@@ -86,6 +98,12 @@ class OverlayStub:
     def update_audio_state(self, muted):
         pass
 
+    def update_status(self, **kwargs):
+        self.status_updates.append(kwargs)
+
+    def setWindowOpacity(self, value):
+        self.opacity_updates.append(value)
+
     def start_session_ui(self):
         pass
 
@@ -104,6 +122,7 @@ class MiniOverlayStub:
         self.history_updates = []
         self.hide_calls = 0
         self.show_calls = 0
+        self.opacity_updates = []
 
     def update_mode(self, mode):
         self.mode_updates.append(mode)
@@ -125,6 +144,9 @@ class MiniOverlayStub:
 
     def update_audio_state(self, muted):
         pass
+
+    def setWindowOpacity(self, value):
+        self.opacity_updates.append(value)
 
 
 class ConfigStub:
@@ -159,6 +181,8 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         app.mini_mode = mini_mode
         app.session_active = False
         app._last_query = "stale query"
+        app.ai = SimpleNamespace(_providers={"groq": SimpleNamespace(enabled=True)})
+        app.stealth = SimpleNamespace(apply_to_window=lambda window, enabled: None)
         return app
 
     def test_start_new_session_resets_state_and_updates_ui(self):
@@ -262,6 +286,38 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(app.overlay.show_calls, 1)
         self.assertEqual(app.overlay.raise_calls, 1)
         self.assertEqual(app.overlay.activate_calls, 1)
+
+    def test_response_complete_uses_app_capture_state_for_status(self):
+        app = self._build_app()
+        app.state.is_capturing = True
+        app.config.set("capture.audio.enabled", True)
+        app.config.set("capture.screen.enabled", True)
+
+        OpenAssistApp._on_response_complete(app, "done")
+
+        update = app.overlay.status_updates[-1]
+        self.assertTrue(update["capture_audio"])
+        self.assertTrue(update["capture_screen"])
+        self.assertEqual(update["provider"], "groq")
+        self.assertEqual(update["latency_ms"], 1234)
+
+    def test_toggle_stealth_mode_updates_state_and_window_opacity(self):
+        app = self._build_app()
+        app.state.is_stealth = False
+        app.config.set("stealth.low_opacity", 0.75)
+        app.config.set("app.opacity", 0.94)
+
+        OpenAssistApp.toggle_stealth_mode(app)
+
+        self.assertTrue(app.state.is_stealth)
+        self.assertEqual(app.overlay.opacity_updates[-1], 0.75)
+        self.assertEqual(app.mini_overlay.opacity_updates[-1], 0.75)
+
+        OpenAssistApp.toggle_stealth_mode(app)
+
+        self.assertFalse(app.state.is_stealth)
+        self.assertEqual(app.overlay.opacity_updates[-1], 0.94)
+        self.assertEqual(app.mini_overlay.opacity_updates[-1], 0.94)
 
 
 if __name__ == "__main__":

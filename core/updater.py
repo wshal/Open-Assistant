@@ -1,9 +1,11 @@
-"""Auto-updater â checks GitHub for new releases."""
+"""Auto-updater - checks GitHub for new releases."""
 
 import asyncio
-import aiohttp
 from typing import Optional, Tuple
+
+import aiohttp
 from packaging import version as pkg_version
+
 from core.constants import APP_VERSION
 from utils.logger import setup_logger
 
@@ -33,7 +35,7 @@ class Updater:
                 async with session.get(
                     RELEASES_URL,
                     timeout=aiohttp.ClientTimeout(total=10),
-                    headers={"Accept": "application/vnd.github.v3+json"}
+                    headers={"Accept": "application/vnd.github.v3+json"},
                 ) as resp:
                     if resp.status != 200:
                         return False, None, None
@@ -48,6 +50,7 @@ class Updater:
 
                     # Find download URL for current platform
                     import platform
+
                     os_name = platform.system().lower()
                     for asset in assets:
                         name = asset.get("name", "").lower()
@@ -64,14 +67,16 @@ class Updater:
                         update_available = tag != self.current_version
 
                     if update_available:
-                        logger.info(f"ð Update available: v{self.current_version} â v{tag}")
+                        logger.info(
+                            f"Update available: v{self.current_version} -> v{tag}"
+                        )
                     else:
-                        logger.debug(f"â Up to date (v{self.current_version})")
+                        logger.debug(f"Up to date (v{self.current_version})")
 
                     return update_available, tag, notes
 
-        except Exception as e:
-            logger.debug(f"Update check failed: {e}")
+        except Exception as exc:
+            logger.debug(f"Update check failed: {exc}")
             return False, None, None
 
     def get_download_url(self) -> Optional[str]:
@@ -86,11 +91,11 @@ class Updater:
             async with aiohttp.ClientSession() as session:
                 async with session.get(self.download_url) as resp:
                     if resp.status == 200:
-                        with open(save_path, 'wb') as f:
+                        with open(save_path, "wb") as file_obj:
                             async for chunk in resp.content.iter_chunked(8192):
-                                f.write(chunk)
-                        logger.info(f"â Update downloaded to {save_path}")
+                                file_obj.write(chunk)
+                        logger.info(f"Update downloaded to {save_path}")
                         return True
-        except Exception as e:
-            logger.error(f"Download failed: {e}")
+        except Exception as exc:
+            logger.error(f"Download failed: {exc}")
         return False

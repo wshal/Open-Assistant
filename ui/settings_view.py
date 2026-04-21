@@ -16,9 +16,11 @@ from PyQt6.QtWidgets import (
     QTabWidget,
     QCheckBox,
     QComboBox,
+    QSlider,
     QScrollArea,
     QFrame,
     QGridLayout,
+    QSizePolicy,
 )
 from ui.custom_widgets import PremiumCheckBox
 from utils.logger import setup_logger
@@ -228,6 +230,47 @@ class SettingsView(QWidget):
         self.status_labels = {}
         self._build()
 
+    @staticmethod
+    def _slider_percent(opacity: float) -> int:
+        return int(round(opacity * 100))
+
+    def _set_opacity_label(self, label: QLabel, value: int):
+        label.setText(f"{value}%")
+
+    def _preview_window_opacity(self):
+        if not self.app or not hasattr(self.app, "_apply_ui_only"):
+            return
+
+        if hasattr(self, "hud_opacity_slider"):
+            self.config.set(
+                "app.opacity",
+                self.hud_opacity_slider.value() / 100.0,
+            )
+        if hasattr(self, "stealth_opacity_slider"):
+            self.config.set(
+                "stealth.low_opacity",
+                self.stealth_opacity_slider.value() / 100.0,
+            )
+
+        self.app._apply_ui_only()
+
+    def _make_section_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; font-weight: 800; letter-spacing: 1px; background: transparent;"
+        )
+        label.setWordWrap(True)
+        return label
+
+    def _style_combo(self, combo: QComboBox):
+        combo.setStyleSheet(SS_INPUT)
+        combo.setMinimumHeight(36)
+        combo.setMinimumContentsLength(18)
+        combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
     def _build(self):
         self.setStyleSheet(BG_DARK + SS_INPUT)
         layout = QVBoxLayout(self)
@@ -435,14 +478,17 @@ class SettingsView(QWidget):
         return w
 
     def _tab_capture(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("background: transparent; border: none;")
+
         w = QWidget()
         l = QVBoxLayout(w)
         l.setContentsMargins(20, 20, 20, 20)
         l.setSpacing(20)
         w.setStyleSheet("background: transparent;")
 
-        lbl_mode = QLabel("ACTIVE AI MODE")
-        lbl_mode.setStyleSheet("background: transparent;")
+        lbl_mode = self._make_section_label("ACTIVE AI MODE")
         l.addWidget(lbl_mode)
         self.ai_mode = QComboBox()
         self.ai_mode.addItems(
@@ -465,7 +511,7 @@ class SettingsView(QWidget):
             "writing": 5,
         }
         self.ai_mode.setCurrentIndex(mode_map.get(current_mode, 0))
-        self.ai_mode.setStyleSheet(SS_INPUT)
+        self._style_combo(self.ai_mode)
         l.addWidget(self.ai_mode)
 
         sep_mode = QFrame()
@@ -473,8 +519,7 @@ class SettingsView(QWidget):
         sep_mode.setStyleSheet("background: rgba(255,255,255,0.05);")
         l.addWidget(sep_mode)
 
-        lbl = QLabel("PRIMARY AUDIO SOURCE")
-        lbl.setStyleSheet("background: transparent;")
+        lbl = self._make_section_label("PRIMARY AUDIO SOURCE")
         l.addWidget(lbl)
         self.audio_mode = QComboBox()
         self.audio_mode.addItems(
@@ -484,23 +529,35 @@ class SettingsView(QWidget):
         self.audio_mode.setCurrentIndex(
             0 if curr == "system" else 1 if curr == "mic" else 2
         )
-        self.audio_mode.setStyleSheet(SS_INPUT)
+        self._style_combo(self.audio_mode)
         l.addWidget(self.audio_mode)
+        audio_desc = QLabel(
+            "Choose which source the assistant should listen to while collecting audio context."
+        )
+        audio_desc.setWordWrap(True)
+        audio_desc.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; background: transparent;"
+        )
+        l.addWidget(audio_desc)
         sep = QFrame()
         sep.setFixedHeight(1)
         sep.setStyleSheet("background: rgba(255,255,255,0.05);")
         l.addWidget(sep)
-        lbl2 = QLabel("VISION ENGINE")
-        lbl2.setStyleSheet("background: transparent;")
+        lbl2 = self._make_section_label("VISION ENGINE")
         l.addWidget(lbl2)
         self.chk_smart = PremiumCheckBox("Enable Contextual Smart-Crop")
         self.chk_smart.setChecked(self.config.get("capture.screen.smart_crop", True))
         l.addWidget(self.chk_smart)
-        # Screenshot Interval
-        lbl_interval = QLabel("SCREEN CAPTURE INTERVAL")
-        lbl_interval.setStyleSheet(
-            f"{TEXT_MUTED} font-size: 10px; background: transparent; margin-top: 15px;"
+        smart_desc = QLabel(
+            "Keeps OCR focused on the active region so the vision pipeline stays relevant and efficient."
         )
+        smart_desc.setWordWrap(True)
+        smart_desc.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; background: transparent;"
+        )
+        l.addWidget(smart_desc)
+        # Screenshot Interval
+        lbl_interval = self._make_section_label("SCREEN CAPTURE INTERVAL")
         l.addWidget(lbl_interval)
 
         self.screenshot_interval = QComboBox()
@@ -516,14 +573,11 @@ class SettingsView(QWidget):
         current_interval = self.config.get("capture.screen.interval_ms", 500)
         interval_map = {500: 0, 1000: 1, 2000: 2, 3000: 3, 5000: 4}
         self.screenshot_interval.setCurrentIndex(interval_map.get(current_interval, 0))
-        self.screenshot_interval.setStyleSheet(SS_INPUT)
+        self._style_combo(self.screenshot_interval)
         l.addWidget(self.screenshot_interval)
 
         # Image Quality
-        lbl_quality = QLabel("IMAGE QUALITY")
-        lbl_quality.setStyleSheet(
-            f"{TEXT_MUTED} font-size: 10px; background: transparent; margin-top: 10px;"
-        )
+        lbl_quality = self._make_section_label("IMAGE QUALITY")
         l.addWidget(lbl_quality)
 
         self.image_quality = QComboBox()
@@ -533,11 +587,12 @@ class SettingsView(QWidget):
         current_quality = self.config.get("capture.screen.quality", "medium")
         quality_map = {"low": 0, "medium": 1, "high": 2}
         self.image_quality.setCurrentIndex(quality_map.get(current_quality, 1))
-        self.image_quality.setStyleSheet(SS_INPUT)
+        self._style_combo(self.image_quality)
         l.addWidget(self.image_quality)
 
         l.addStretch()
-        return w
+        scroll.setWidget(w)
+        return scroll
 
     def _tab_stealth(self):
         w = QWidget()
@@ -570,6 +625,122 @@ class SettingsView(QWidget):
         l.setContentsMargins(20, 20, 20, 20)
         l.setSpacing(20)
 
+        lbl_opacity_main = QLabel("STEALTH VISIBILITY")
+        lbl_opacity_main.setStyleSheet(
+            f"{TEXT_PRIMARY} font-size: 11px; font-weight: 800; letter-spacing: 1px; background: transparent;"
+        )
+        l.addWidget(lbl_opacity_main)
+
+        stealth_opacity_row = QHBoxLayout()
+        self.stealth_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.stealth_opacity_slider.setRange(70, 100)
+        self.stealth_opacity_slider.setSingleStep(1)
+        self.stealth_opacity_slider.setPageStep(5)
+        self.stealth_opacity_slider.setValue(
+            self._slider_percent(self.config.get("stealth.low_opacity", 0.75))
+        )
+        self.stealth_opacity_slider.setStyleSheet(
+            """
+            QSlider::groove:horizontal {
+                background: rgba(255,255,255,0.08);
+                height: 6px;
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #10b981;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: white;
+                width: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+            }
+            """
+        )
+        self.stealth_opacity_value = QLabel()
+        self.stealth_opacity_value.setStyleSheet(
+            f"{TEXT_PRIMARY} font-size: 10px; font-weight: 700; background: transparent;"
+        )
+        self._set_opacity_label(
+            self.stealth_opacity_value, self.stealth_opacity_slider.value()
+        )
+        self.stealth_opacity_slider.valueChanged.connect(
+            lambda value: self._set_opacity_label(self.stealth_opacity_value, value)
+        )
+        self.stealth_opacity_slider.valueChanged.connect(
+            lambda _: self._preview_window_opacity()
+        )
+        stealth_opacity_row.addWidget(self.stealth_opacity_slider, 1)
+        stealth_opacity_row.addWidget(self.stealth_opacity_value)
+        l.addLayout(stealth_opacity_row)
+
+        desc_hud_opacity = QLabel(
+            "Primary control for how visible the HUD remains while stealth mode is enabled."
+        )
+        desc_hud_opacity.setWordWrap(True)
+        desc_hud_opacity.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; background: transparent;"
+        )
+        l.addWidget(desc_hud_opacity)
+
+        lbl_normal_opacity = QLabel("NORMAL HUD VISIBILITY")
+        lbl_normal_opacity.setStyleSheet(
+            f"{TEXT_PRIMARY} font-size: 11px; font-weight: 800; letter-spacing: 1px; background: transparent;"
+        )
+        l.addWidget(lbl_normal_opacity)
+
+        hud_opacity_row = QHBoxLayout()
+        self.hud_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.hud_opacity_slider.setRange(70, 100)
+        self.hud_opacity_slider.setSingleStep(1)
+        self.hud_opacity_slider.setPageStep(5)
+        self.hud_opacity_slider.setValue(
+            self._slider_percent(self.config.get("app.opacity", 0.94))
+        )
+        self.hud_opacity_slider.setStyleSheet(
+            """
+            QSlider::groove:horizontal {
+                background: rgba(255,255,255,0.08);
+                height: 6px;
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #6366f1;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: white;
+                width: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+            }
+            """
+        )
+        self.hud_opacity_value = QLabel()
+        self.hud_opacity_value.setStyleSheet(
+            f"{TEXT_PRIMARY} font-size: 10px; font-weight: 700; background: transparent;"
+        )
+        self._set_opacity_label(self.hud_opacity_value, self.hud_opacity_slider.value())
+        self.hud_opacity_slider.valueChanged.connect(
+            lambda value: self._set_opacity_label(self.hud_opacity_value, value)
+        )
+        self.hud_opacity_slider.valueChanged.connect(
+            lambda _: self._preview_window_opacity()
+        )
+        hud_opacity_row.addWidget(self.hud_opacity_slider, 1)
+        hud_opacity_row.addWidget(self.hud_opacity_value)
+        l.addLayout(hud_opacity_row)
+
+        desc_stealth_opacity = QLabel(
+            "Optional fallback for non-stealth use, setup, or when you want the regular HUD more readable."
+        )
+        desc_stealth_opacity.setWordWrap(True)
+        desc_stealth_opacity.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; background: transparent;"
+        )
+        l.addWidget(desc_stealth_opacity)
+
         # Gaze Fade Section
         lbl_gaze = QLabel("NEURAL GAZE DETECTION")
         lbl_gaze.setStyleSheet(
@@ -578,7 +749,7 @@ class SettingsView(QWidget):
         l.addWidget(lbl_gaze)
 
         self.chk_gaze = PremiumCheckBox("Enable gaze-based window fading")
-        self.chk_gaze.setChecked(self.config.get("app.gaze_fade.enabled", True))
+        self.chk_gaze.setChecked(self.config.get("app.gaze_fade.enabled", False))
         l.addWidget(self.chk_gaze)
         desc_gaze = QLabel(
             "When enabled, the window will fade to low opacity when your mouse is near it. "
@@ -757,6 +928,17 @@ class SettingsView(QWidget):
             # Save parallel inference setting
             if hasattr(self, "chk_parallel"):
                 self.config.set("ai.parallel.enabled", self.chk_parallel.isChecked())
+
+            if hasattr(self, "hud_opacity_slider"):
+                self.config.set(
+                    "app.opacity",
+                    self.hud_opacity_slider.value() / 100.0,
+                )
+            if hasattr(self, "stealth_opacity_slider"):
+                self.config.set(
+                    "stealth.low_opacity",
+                    self.stealth_opacity_slider.value() / 100.0,
+                )
 
             # Save gaze fade settings
             if hasattr(self, "chk_gaze"):

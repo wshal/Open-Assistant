@@ -2,15 +2,17 @@
 
 import asyncio
 import time
+
 from rich.console import Console
 from rich.table import Table
+
 from ai.providers import init_providers
 
 console = Console()
 
 
 async def run_benchmark(config):
-    console.print("\n[bold cyan]ð OpenAssist AI v3.0 â Provider Benchmark[/bold cyan]\n")
+    console.print("\n[bold cyan]OpenAssist AI v3.0 - Provider Benchmark[/bold cyan]\n")
     providers = init_providers(config)
     if not providers:
         console.print("[red]No providers![/red]")
@@ -19,47 +21,75 @@ async def run_benchmark(config):
     prompt = "Explain recursion in 3 sentences."
     results = []
 
-    for name, p in providers.items():
+    for name, provider in providers.items():
         console.print(f"  Testing [yellow]{name}[/yellow]...", end=" ")
         try:
             t0 = time.time()
-            r = await p.generate("Be concise.", prompt, "fast")
+            response = await provider.generate("Be concise.", prompt, "fast")
             dt = time.time() - t0
-            words = len(r.split())
+            words = len(response.split())
             tps = words / dt if dt > 0 else 0
-            results.append({"name": name, "model": p.get_model("fast"), "time": dt,
-                          "words": words, "tps": tps, "ok": True, "spd": p.speed, "qual": p.quality})
+            results.append(
+                {
+                    "name": name,
+                    "model": provider.get_model("fast"),
+                    "time": dt,
+                    "words": words,
+                    "tps": tps,
+                    "ok": True,
+                    "spd": provider.speed,
+                    "qual": provider.quality,
+                }
+            )
             console.print(f"[green]{dt:.2f}s ({tps:.0f} w/s)[/green]")
-        except Exception as e:
-            results.append({"name": name, "model": p.get_model("fast"), "time": 0,
-                          "words": 0, "tps": 0, "ok": False, "spd": p.speed, "qual": p.quality,
-                          "err": str(e)[:40]})
-            console.print(f"[red]FAIL: {e}[/red]")
+        except Exception as exc:
+            results.append(
+                {
+                    "name": name,
+                    "model": provider.get_model("fast"),
+                    "time": 0,
+                    "words": 0,
+                    "tps": 0,
+                    "ok": False,
+                    "spd": provider.speed,
+                    "qual": provider.quality,
+                    "err": str(exc)[:40],
+                }
+            )
+            console.print(f"[red]FAIL: {exc}[/red]")
 
-    results.sort(key=lambda x: x["tps"], reverse=True)
+    results.sort(key=lambda item: item["tps"], reverse=True)
 
-    t = Table(title="\nð Results (by speed)")
-    t.add_column("#", width=3)
-    t.add_column("Provider", style="cyan", width=12)
-    t.add_column("Model", width=30)
-    t.add_column("Time", justify="right", width=7)
-    t.add_column("Words/s", justify="right", style="green", width=8)
-    t.add_column("Spd", width=4)
-    t.add_column("Qual", width=4)
-    t.add_column("Status", width=10)
+    table = Table(title="\nResults (by speed)")
+    table.add_column("#", width=3)
+    table.add_column("Provider", style="cyan", width=12)
+    table.add_column("Model", width=30)
+    table.add_column("Time", justify="right", width=7)
+    table.add_column("Words/s", justify="right", style="green", width=8)
+    table.add_column("Spd", width=4)
+    table.add_column("Qual", width=4)
+    table.add_column("Status", width=10)
 
-    for i, r in enumerate(results):
-        t.add_row(
-            str(i+1), r["name"], r["model"][:28],
-            f'{r["time"]:.2f}s', f'{r["tps"]:.0f}',
-            f'{r["spd"]}/10', f'{r["qual"]}/10',
-            "â" if r["ok"] else f'â {r.get("err", "")[:20]}'
+    for index, result in enumerate(results, start=1):
+        table.add_row(
+            str(index),
+            result["name"],
+            result["model"][:28],
+            f'{result["time"]:.2f}s',
+            f'{result["tps"]:.0f}',
+            f'{result["spd"]}/10',
+            f'{result["qual"]}/10',
+            "OK" if result["ok"] else f'ERR {result.get("err", "")[:20]}',
         )
-    console.print(t)
+    console.print(table)
 
-    ok = [r for r in results if r["ok"]]
+    ok = [result for result in results if result["ok"]]
     if ok:
-        f = ok[0]
-        console.print(f"\nâ¡ Fastest: [bold green]{f['name']}[/] ({f['tps']:.0f} words/s)")
-        b = max(ok, key=lambda x: x["qual"])
-        console.print(f"ð Best Quality: [bold blue]{b['name']}[/] (quality={b['qual']}/10)")
+        fastest = ok[0]
+        console.print(
+            f"\nFastest: [bold green]{fastest['name']}[/] ({fastest['tps']:.0f} words/s)"
+        )
+        best_quality = max(ok, key=lambda item: item["qual"])
+        console.print(
+            f"Best Quality: [bold blue]{best_quality['name']}[/] (quality={best_quality['qual']}/10)"
+        )

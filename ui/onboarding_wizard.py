@@ -125,7 +125,7 @@ class OnboardingWizard(QWidget):
             },
             "ai_mode": self.config.get("ai.mode", "general"),
             "audio_mode": self.config.get("capture.audio.mode", "system"),
-            "gaze_enabled": self.config.get("app.gaze_fade.enabled", True),
+            "gaze_enabled": self.config.get("app.gaze_fade.enabled", False),
             "start_minimized": self.config.get("app.start_minimized", False),
         }
 
@@ -499,7 +499,7 @@ class OnboardingWizard(QWidget):
 
         # Gaze detection toggle (Custom Painted Widget)
         self.chk_gaze = PremiumCheckBox("Enable gaze-based window fading")
-        self.chk_gaze.setChecked(self.wizard_state.get("gaze_enabled", True))
+        self.chk_gaze.setChecked(self.wizard_state.get("gaze_enabled", False))
         self.content_layout.addWidget(self.chk_gaze, 0, Qt.AlignmentFlag.AlignCenter)
 
         self.content_layout.addSpacing(2)

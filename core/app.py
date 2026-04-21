@@ -116,6 +116,7 @@ class OpenAssistApp(QObject):
             self._on_audio_source_ui_change
         )
         self.ai.response_complete.connect(self._on_response_complete)
+        self.state.stealth_changed.connect(lambda _: self._apply_ui_only())
 
     def _on_response_complete(self, full_text: str):
         """Update overlay status bar with latency after each response."""
@@ -136,14 +137,14 @@ class OpenAssistApp(QObject):
                 if hasattr(prov, "enabled") and prov.enabled
             ]
 
+        capture_active = bool(getattr(self.state, "is_capturing", False))
+        audio_enabled = bool(self.config.get("capture.audio.enabled", True))
+        screen_enabled = bool(self.config.get("capture.screen.enabled", True))
+
         self.overlay.update_status(
             provider=provider,
-            capture_audio=self.audio.is_capturing
-            if hasattr(self.audio, "is_capturing")
-            else False,
-            capture_screen=self.screen.is_capturing
-            if hasattr(self.screen, "is_capturing")
-            else False,
+            capture_audio=capture_active and audio_enabled,
+            capture_screen=capture_active and screen_enabled,
             latency_ms=latency_ms if entries else 0,
             available_providers=available,
         )
@@ -247,12 +248,16 @@ class OpenAssistApp(QObject):
         t.start()
 
     def _apply_ui_only(self):
-        opa = self.config.get("app.opacity", 0.94)
-        self.overlay.setWindowOpacity(opa)
-        self.mini_overlay.setWindowOpacity(opa)
-        is_stealth = self.state.is_stealth
-        self.stealth.apply_to_window(self.overlay, is_stealth)
-        self.stealth.apply_to_window(self.mini_overlay, is_stealth)
+        self._apply_window_effects(self.overlay)
+        self._apply_window_effects(self.mini_overlay)
+
+    def _apply_window_effects(self, window):
+        base_opacity = self.config.get("app.opacity", 0.94)
+        stealth_opacity = self.config.get("stealth.low_opacity", 0.75)
+        is_stealth = bool(getattr(self.state, "is_stealth", False))
+
+        window.setWindowOpacity(stealth_opacity if is_stealth else base_opacity)
+        self.stealth.apply_to_window(window, is_stealth)
 
     def _create_system_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -482,10 +487,13 @@ class OpenAssistApp(QObject):
         self.state.is_mini = self.mini_mode
 
     def toggle_stealth_mode(self):
-        self.config.set(
-            "stealth.enabled", not self.config.get("stealth.enabled", False)
-        )
-        self._apply_settings()
+        self.state.is_stealth = not self.state.is_stealth
+        if hasattr(self.config, "save"):
+            try:
+                self.config.save()
+            except Exception as e:
+                logger.debug(f"Stealth config save skipped: {e}")
+        self._apply_ui_only()
 
     def type_last_response(self):
         """Action: Type the latest AI response into the Snap-Locked window."""

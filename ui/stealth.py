@@ -49,7 +49,7 @@ class StealthUIManager(QObject):
         self.enabled = True
         self.cloaker.cloak()
         self.window.setWindowOpacity(
-            self.config.get("stealth.low_opacity", 0.12)
+            self.config.get("stealth.low_opacity", 0.75)
         )
         self.stealth_activated.emit()
         logger.info("ð» Stealth mode activated")
