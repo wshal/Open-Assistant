@@ -223,6 +223,7 @@ class StateStub:
         self.target_window_id = None
         self.is_capturing = False
         self._audio_source = "system"
+        self.session_context = ""  # Added for session context feature
 
     @property
     def audio_source(self):
@@ -286,6 +287,8 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
                 _providers={"groq": SimpleNamespace(enabled=True)},
                 cancel=lambda: None,
                 _rag_cache={},
+                clear_rag_prefetch=lambda: None,
+                set_session_context=lambda ctx: None,
                 detector=SimpleNamespace(
                     set_mode=lambda m: None,
                 ),
@@ -298,6 +301,11 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             stealth=SimpleNamespace(apply_to_window=lambda window, enabled: None),
         )
         app.state = StateStub(app.config)
+        app._context_auto_suggested = False  # auto-suggest flag
+        app._context_store = SimpleNamespace(
+            get_last_context=lambda: "",
+            set_last_context=lambda t: None,
+        )
         app._apply_window_effects = lambda window: OpenAssistApp._apply_window_effects(
             app, window
         )

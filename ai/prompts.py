@@ -239,18 +239,32 @@ RULES:
         )
         return len(q.split()) <= 10 and any(marker in q for marker in generic_markers)
 
-    def system(self, mode=None) -> str:
+    def system(self, mode=None, session_context: str = "") -> str:
+        """Build the system prompt, optionally prepended with the user's session context.
+
+        session_context (when set) is injected as the FIRST block so it takes
+        absolute precedence over all mode defaults — the AI adopts the user-defined
+        persona/role/style for the entire session.
+        """
         if isinstance(mode, str):
             name = mode
         else:
             name = mode.name if mode and hasattr(mode, "name") else "general"
 
         if name in self.PROMPT_PACKS:
-            return self.PROMPT_PACKS[name]["system"]
+            base = self.PROMPT_PACKS[name]["system"]
+        else:
+            base = self.SYSTEMS.get(name, self.SYSTEMS["general"])
+            if mode and hasattr(mode, "custom_instructions") and mode.custom_instructions:
+                base += f"\n\nCustom: {mode.custom_instructions}"
 
-        base = self.SYSTEMS.get(name, self.SYSTEMS["general"])
-        if mode and hasattr(mode, "custom_instructions") and mode.custom_instructions:
-            base += f"\n\nCustom: {mode.custom_instructions}"
+        if session_context:
+            return (
+                f"[SESSION CONTEXT — FOLLOW THESE INSTRUCTIONS ABOVE ALL ELSE]\n"
+                f"{session_context}\n\n"
+                f"---\n"
+                f"{base}"
+            )
         return base
 
     def build_from_pack(

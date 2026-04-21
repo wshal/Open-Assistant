@@ -32,6 +32,8 @@ from core.tray import SystemTray
 from stealth.anti_detect import StealthManager
 from stealth.input_simulator import InputSimulator
 from utils.logger import setup_logger
+from utils.context_store import get_store as get_context_store
+from utils.context_store import get_suggested_preset_for_mode
 from core.constants import DB_DIR, CACHE_DIR, LOG_DIR
 
 logger = setup_logger(__name__)
@@ -69,6 +71,10 @@ class OpenAssistApp(QObject):
         self._generation_epoch = 0
         self._screen_analysis_pending = False
         self._pending_request_metadata = None
+        # Tracks whether the current session_context was auto-suggested by a mode
+        # switch (True) or typed/loaded manually (False). Auto-suggested context
+        # can be silently replaced when the mode changes; manual context cannot.
+        self._context_auto_suggested: bool = False
 
         # Async Loop
         self.loop = asyncio.new_event_loop()
@@ -83,6 +89,18 @@ class OpenAssistApp(QObject):
 
         self._wire_signals()
         self.qt_app.aboutToQuit.connect(self.shutdown)
+
+        # Session Context: load the last-used context from disk so it's
+        # available immediately when the user opens Settings and starts a session.
+        self._context_store = get_context_store()
+        last_ctx = self._context_store.get_last_context()
+        if last_ctx:
+            self.state.session_context = last_ctx
+            self.ai.set_session_context(last_ctx)
+            logger.debug(f"Session context restored ({len(last_ctx)} chars)")
+
+        # Propagate future context changes from state → AI engine
+        self.state.session_context_changed.connect(self.ai.set_session_context)
 
         # MOVEMENT ENGINE: RESTORED Smooth Glide (60fps)
         self._move_timer = QTimer(self)
@@ -660,6 +678,37 @@ class OpenAssistApp(QObject):
             f"vad={profile.vad_silence_ms}ms"
         )
 
+        # ── Context auto-suggest ─────────────────────────────────────────────
+        # If context is currently empty or was auto-suggested by a previous mode
+        # switch, silently replace it with the best-fit preset for the new mode.
+        # If the user typed their own context, never overwrite it — but still
+        # show the suggestion chip so they know what the preset would be.
+        preset_name, preset_text = get_suggested_preset_for_mode(mode)
+        standby = getattr(getattr(self, "overlay", None), "standby_view", None)
+
+        ctx_is_auto_or_empty = (
+            not self.state.session_context
+            or self._context_auto_suggested
+        )
+
+        if preset_name and ctx_is_auto_or_empty and preset_text:
+            # Auto-load: context was empty or previously auto-suggested
+            self.state.session_context = preset_text
+            self.ai.set_session_context(preset_text)
+            self._context_store.set_last_context(preset_text)
+            self._context_auto_suggested = True
+            logger.debug(f"Context auto-suggested: '{preset_name}' for mode '{mode}'")
+            if standby and hasattr(standby, "show_context_chip"):
+                standby.show_context_chip(preset_name, applied=True)
+        elif preset_name:
+            # User has manual context — just surface the suggestion without loading
+            if standby and hasattr(standby, "show_context_chip"):
+                standby.show_context_chip(preset_name, applied=False)
+        else:
+            # No suggestion for this mode (e.g., General) — clear the chip
+            if standby and hasattr(standby, "show_context_chip"):
+                standby.show_context_chip(None)
+
     def toggle_audio(self):
         muted = self.audio.toggle()
         self.state.is_muted = muted
@@ -875,6 +924,14 @@ class OpenAssistApp(QObject):
             self.ai.clear_rag_prefetch()
         if hasattr(self.ai, "_complexity_cached"):
             self.ai._complexity_cached.cache_clear()
+
+        # Persist the current context to disk before clearing from state,
+        # so it reloads on next app launch (user doesn't retype every time).
+        if hasattr(self, "_context_store"):
+            self._context_store.set_last_context(self.state.session_context)
+        # Clear from live state — next session starts clean unless user re-selects
+        self.state.session_context = ""
+        self.ai.set_session_context("")
 
         # Hard-wipe the visible response area — user should see a blank screen
         # when they return to standby, and again when next session starts.

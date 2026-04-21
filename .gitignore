@@ -1,42 +1,47 @@
 # --- OpenAssist — GitHub Production Ignore ---
 
-# Internal Technical Docs & Sensitive Assets (Private)
-ISSUES_ANALYSIS.md
-OPENASSIST_TECH_AUDIT.md
-latency_audit.md
-cheating/
-
-# Application Data & Secrets
+# ── Application Secrets & Encrypted State ────────────────────────────────────
 config.yaml
 data/settings.enc
 data/history.enc
+
+# ── Runtime Data (auto-generated, user-specific) ──────────────────────────────
 data/history/
 data/vectordb/
 data/__pycache__/
 logs/
 
-# Python Environment
+# ── Internal Docs & Private Assets ───────────────────────────────────────────
+ISSUES_ANALYSIS.md
+OPENASSIST_TECH_AUDIT.md
+latency_audit.md
+cheating/
+
+# ── Python Environment ────────────────────────────────────────────────────────
 venv/
+env/
+.Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
-env/
-instance/
+*.pyw
 .pytest_cache/
 .coverage
 htmlcov/
+*.egg-info/
+dist-info/
 
-# Local Dev Artifacts
+# ── Local Dev Artifacts ───────────────────────────────────────────────────────
 .env
 .DS_Store
 Thumbs.db
 *.log
 *.bak
 *.tmp
+*.swp
 
-# Hardware/Build
+# ── Build & Distribution ──────────────────────────────────────────────────────
 build/
 dist/
 *.spec

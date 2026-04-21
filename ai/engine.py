@@ -88,8 +88,17 @@ class AIEngine(QObject):
         self._prefetch_ttl: int = 90           # seconds a prefetch stays valid
         self._prefetch_lock = asyncio.Lock()   # prevent concurrent prefetch storms
 
-    def warmup(self):
+        # ── Session Context (user-defined persona / instructions) ─────────────
+        # Set by app.py from AppState.session_context each time it changes.
+        # Injected as the top block of every system prompt for the session.
+        self._session_context: str = ""
 
+    def set_session_context(self, text: str):
+        """Update the active session context injected into all system prompts."""
+        self._session_context = (text or "").strip()
+        logger.debug(f"Session context updated ({len(self._session_context)} chars)")
+
+    def warmup(self):
         """Initializes AI providers and checks availability."""
         try:
             self._providers = init_providers(self.config)
@@ -320,7 +329,10 @@ class AIEngine(QObject):
 
             # 3. Prompt Synthesis — pass Mode object for profile-aware context limits
             _mode_arg = mode_obj or mode_id
-            sys_prompt = self.prompts.system(_mode_arg)
+            sys_prompt = self.prompts.system(
+                _mode_arg,
+                session_context=getattr(self, "_session_context", ""),
+            )
 
             # Resolve follow-up queries using recent history so short ambiguous
             # queries like "give me an example" inherit the previous topic context.

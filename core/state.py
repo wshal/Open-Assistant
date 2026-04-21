@@ -15,6 +15,7 @@ class AppState(QObject):
     capturing_changed = pyqtSignal(bool)
     stealth_changed = pyqtSignal(bool)
     hud_mode_changed = pyqtSignal(bool)  # True = Mini, False = Overlay
+    session_context_changed = pyqtSignal(str)
     
     def __init__(self, config=None):
         super().__init__()
@@ -29,6 +30,7 @@ class AppState(QObject):
         self._is_mini = False
         self._target_window_id = 0
         self._provider_health = {}
+        self._session_context = ""  # Custom per-session instructions
         
         # Load initials from config if provided
         if config:
@@ -108,3 +110,15 @@ class AppState(QObject):
 
     @property
     def provider_health(self): return self._provider_health
+
+    @property
+    def session_context(self) -> str:
+        return self._session_context
+
+    @session_context.setter
+    def session_context(self, val: str):
+        val = (val or "").strip()
+        if self._session_context != val:
+            self._session_context = val
+            self.session_context_changed.emit(val)
+            self.state_changed.emit("session_context", val)
