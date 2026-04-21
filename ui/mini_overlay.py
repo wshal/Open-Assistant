@@ -99,16 +99,6 @@ class MiniOverlay(QMainWindow):
         self.dot.setStyleSheet("color: #4ade80; font-size: 10px;")
         bl.addWidget(self.dot)
 
-        self.btn_type = QPushButton("⌨️")
-        self.btn_type.setToolTip("Type response into Snap-Locked window")
-        self.btn_type.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_type.setFixedSize(24, 24)
-        self.btn_type.setStyleSheet(
-            "color: #f472b6; font-size: 11px; background: transparent; border: none;"
-        )
-        self.btn_type.clicked.connect(self.app.type_last_response)
-        bl.addWidget(self.btn_type)
-
         self.expand_btn = QPushButton("▲")
         self.expand_btn.setFixedSize(22, 22)
         self.expand_btn.setStyleSheet(

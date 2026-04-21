@@ -130,6 +130,7 @@ class AIEngine(QObject):
         nexus_snapshot: Dict[str, Any],
         screen_context: Optional[str] = None,
         audio_context: Optional[str] = None,
+        origin: Optional[str] = None,
     ):
         """
         RESTORED: Main async generation task.
@@ -158,6 +159,7 @@ class AIEngine(QObject):
                 audio=audio_context or nexus_snapshot.get("recent_audio", ""),
                 rag="",
                 mode=mode_id,
+                origin=origin,
                 nexus=nexus_snapshot
             )
 
@@ -239,6 +241,7 @@ class AIEngine(QObject):
                 audio=refined_audio or nexus_snapshot.get("full_audio_history", ""),
                 rag=rag_context,
                 mode=mode_id,
+                origin=origin,
                 nexus=nexus_snapshot
             )
 
@@ -287,6 +290,77 @@ class AIEngine(QObject):
             return fixed.strip() if fixed else raw_text
         except:
             return raw_text
+
+    async def analyze_image_response(
+        self,
+        query: str,
+        image_bytes: bytes,
+        nexus_snapshot: Dict[str, Any],
+        screen_context: str = "",
+        audio_context: str = "",
+    ) -> str:
+        """Run screenshot analysis through the best available vision-capable provider."""
+        self._is_cancelled = False
+        start_time = time.time()
+        mode_id = self.config.get("ai.mode", "general")
+        sys_prompt = self.prompts.system(mode_id)
+        user_msg = self.prompts.user(
+            query=query,
+            screen=screen_context or nexus_snapshot.get("latest_ocr", ""),
+            audio=audio_context or nexus_snapshot.get("full_audio_history", ""),
+            rag="",
+            mode=mode_id,
+            origin="screen_analysis",
+            nexus=nexus_snapshot,
+        )
+
+        preferred = []
+        fixed = self.config.get("ai.fixed_provider", "")
+        if fixed:
+            preferred.append(fixed)
+        for name in ["gemini", "openai", "ollama"]:
+            if name not in preferred:
+                preferred.append(name)
+
+        candidates = []
+        for name in preferred:
+            provider = self._providers.get(name)
+            if (
+                provider
+                and provider.enabled
+                and provider.check_rate()
+                and getattr(provider, "supports_vision", lambda: False)()
+            ):
+                candidates.append(provider)
+
+        if not candidates:
+            raise Exception("No vision-capable provider available for screenshot analysis.")
+
+        last_error = None
+        for provider in candidates:
+            try:
+                response = await provider.analyze_image(
+                    sys_prompt, user_msg, image_bytes, mime_type="image/png"
+                )
+                if self._is_cancelled:
+                    return ""
+
+                latency_ms = (time.time() - start_time) * 1000
+                self.history.add(
+                    query,
+                    response,
+                    provider=provider.name,
+                    mode=mode_id,
+                    latency=latency_ms,
+                    metadata={"vision": True},
+                )
+                self.response_complete.emit(response)
+                return response
+            except Exception as exc:
+                last_error = exc
+                logger.warning(f"Vision analysis failed on {provider.name}: {exc}")
+
+        raise Exception(str(last_error) if last_error else "Vision analysis failed.")
 
     def _chunk_response(self, text: str, chunk_size: int = 20):
         """Split response into chunks for streaming effect."""

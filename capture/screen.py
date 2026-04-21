@@ -4,6 +4,7 @@ RESTORED: Dynamic Monitor Selection.
 FIXED: Active region tracking for Smart Crop (Vision Focus).
 """
 
+import io
 import time
 from typing import Optional, Tuple
 from PIL import Image
@@ -93,7 +94,7 @@ class ScreenCapture(QObject):
             logger.debug(f"Screen capture error: {e}")
         return None
 
-    async def capture_now(self) -> str:
+    async def capture_now(self, emit_signal: bool = True) -> str:
         """Force immediate capture regardless of debounce."""
         if not self._enabled:
             return ""
@@ -102,7 +103,8 @@ class ScreenCapture(QObject):
             text, _ = await self.ocr.extract(img)
             if text:
                 self._last_text = text
-                self.text_captured.emit(text)
+                if emit_signal:
+                    self.text_captured.emit(text)
                 return text
         return ""
 
@@ -111,6 +113,23 @@ class ScreenCapture(QObject):
         if text is not None:
             return text
         return self._last_text
+
+    async def capture_snapshot(self) -> Tuple[bytes, str]:
+        """Capture one screenshot and derive OCR text from the same image."""
+        if not self._enabled:
+            return b"", ""
+
+        img = self._screenshot()
+        if img is None:
+            return b"", ""
+
+        text, _ = await self.ocr.extract(img)
+        if text:
+            self._last_text = text
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue(), text or ""
 
     def _update_crop_box(self, boxes, offset_x, offset_y, screen_size):
         """Logic to calculate target region based on active text hits."""

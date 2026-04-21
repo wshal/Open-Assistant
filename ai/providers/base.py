@@ -118,6 +118,19 @@ class BaseProvider(ABC):
     ) -> AsyncGenerator[str, None]:
         pass
 
+    def supports_vision(self) -> bool:
+        return False
+
+    async def analyze_image(
+        self,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        tier: str = None,
+    ) -> str:
+        raise NotImplementedError(f"{self.name} does not support image analysis")
+
     async def health_check(self) -> bool:
         try:
             r = await self.generate("Say ok.", "ok", "fast")

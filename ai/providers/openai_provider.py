@@ -1,5 +1,6 @@
 """OpenAI â GPT-4o, GPT-4o-mini, o3-mini. Paid API."""
 
+import base64
 import time
 from typing import AsyncGenerator
 from ai.providers.base import BaseProvider
@@ -130,3 +131,59 @@ class OpenAIProvider(BaseProvider):
         elif "context_length" in error_str:
             return Exception("OpenAI: Input too long. Reduce context.")
         return Exception(f"OpenAI: {error}")
+
+    def supports_vision(self) -> bool:
+        return True
+
+    async def analyze_image(
+        self,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        tier: str = None,
+    ) -> str:
+        self._pre_request()
+        model = self.get_model(tier)
+        t0 = time.time()
+        try:
+            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            image_url = f"data:{mime_type};base64,{image_b64}"
+            if model.startswith("o"):
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"Instructions: {system}\n\n{user}"},
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    }
+                ]
+            else:
+                messages = [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user},
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    },
+                ]
+
+            kwargs = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": self.max_tokens,
+            }
+            if not model.startswith("o"):
+                kwargs["temperature"] = 0.4
+
+            response = await self.client.chat.completions.create(**kwargs)
+            text = response.choices[0].message.content or ""
+            tok = response.usage.total_tokens if response.usage else len(text) // 4
+            self.stats.record(tok, time.time() - t0)
+            return text
+        except Exception as e:
+            self.stats.errors += 1
+            raise self._handle_error(e)

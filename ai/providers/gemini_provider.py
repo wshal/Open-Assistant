@@ -68,3 +68,45 @@ class GeminiProvider(BaseProvider):
         except Exception as e:
             self.stats.errors += 1
             raise
+
+    def supports_vision(self) -> bool:
+        return True
+
+    async def analyze_image(
+        self,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        tier: str = None,
+    ) -> str:
+        self._pre_request()
+        model = self.get_model(tier)
+        t0 = time.time()
+        try:
+            from google.genai import types
+
+            contents = [
+                types.Part.from_text(text=user),
+                types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            ]
+            r = self.client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    max_output_tokens=self.max_tokens,
+                    temperature=0.4,
+                ),
+            )
+            text = r.text or ""
+            tok = (
+                r.usage_metadata.total_token_count
+                if getattr(r, "usage_metadata", None)
+                else len(text) // 4
+            )
+            self.stats.record(tok, time.time() - t0)
+            return text
+        except Exception as e:
+            self.stats.errors += 1
+            raise

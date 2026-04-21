@@ -345,20 +345,29 @@ class SettingsView(QWidget):
             )
             bl = QVBoxLayout(box)
             top = QHBoxLayout()
+            top.setContentsMargins(0, 0, 5, 0)
+            top.setSpacing(10)
+            
             lbl = QLabel(name)
             lbl.setStyleSheet(
                 "background: transparent; font-weight: bold; font-size: 11px; color: #a0a0cc;"
             )
             top.addWidget(lbl)
             top.addStretch()
+            
             stat = QLabel("⚪")
             self.status_labels[pid] = stat
-            stat.setStyleSheet("background: transparent;")
+            stat.setStyleSheet("background: transparent; font-size: 11px;")
             top.addWidget(stat)
+            
             tbtn = QPushButton("TEST")
-            tbtn.setFixedSize(50, 22)
+            tbtn.setFixedSize(60, 24)
+            tbtn.setCursor(Qt.CursorShape.PointingHandCursor)
+            tbtn.setToolTip(f"Test {name} connection")
             tbtn.setStyleSheet(
-                "background: rgba(80,85,255,0.1); color: #8fa1b3; border-radius: 5px; font-size: 9px;"
+                "QPushButton { background: rgba(80,85,255,0.18); color: #f8fafc; border-radius: 4px; font-size: 10px; font-weight: 800; border: 1px solid rgba(129,140,248,0.55); padding: 0 8px; text-align: center; }"
+                "QPushButton:hover { background: rgba(80,85,255,0.35); color: white; border: 1px solid rgba(165,180,252,0.85); }"
+                "QPushButton:pressed { background: rgba(67,56,202,0.55); }"
             )
             tbtn.clicked.connect(lambda _, p=pid: self._test_pid(p))
             top.addWidget(tbtn)

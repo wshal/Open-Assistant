@@ -44,6 +44,7 @@ class OverlayWindow(QMainWindow):
         self._raw_buffer = ""
         self._user_is_scrolling = False
         self._prev_stack_index = 0
+        self._prev_stack_widget = None
 
         self.md = MarkdownRenderer()
         self._render_timer = QTimer(self)
@@ -74,14 +75,21 @@ class OverlayWindow(QMainWindow):
         """Called when session starts - show timer and end button"""
         self._session_start_time = time.time()
         self.session_timer.setVisible(True)
+        self.audio_status.setVisible(True)
         self.btn_end_session.setVisible(True)
+        self.btn_history.setVisible(False)
+        self.btn_settings.setVisible(False)
+        self.update_audio_state(self.app.state.is_muted)
         self._session_timer.start(1000)
 
     def end_session_ui(self):
         """Called when session ends - hide timer and end button"""
         self._session_start_time = None
         self.session_timer.setVisible(False)
+        self.audio_status.setVisible(False)
         self.btn_end_session.setVisible(False)
+        self.btn_history.setVisible(True)
+        self.btn_settings.setVisible(True)
         self._session_timer.stop()
         self.session_timer.setText("00:00")
 
@@ -155,11 +163,20 @@ class OverlayWindow(QMainWindow):
         )
         hl.addWidget(self.title_lbl)
 
+        # Session timer label
+        self.session_timer = QLabel("00:00")
+        self.session_timer.setStyleSheet(
+            "color: #64748b; font-size: 10px; font-family: monospace; background: transparent;"
+        )
+        self.session_timer.setToolTip("Session Duration")
+        self.session_timer.setVisible(False)
+        hl.addWidget(self.session_timer)
+
         hl.addStretch()
 
         # RESTORATION: Interactive Audio Status Pill in Header
         self.audio_status = QPushButton("🎙️")
-        self.audio_status.setToolTip("Toggle AI Audio Capture")
+        self.audio_status.setToolTip("Mute or unmute the selected session audio capture")
         self.audio_status.setCursor(Qt.CursorShape.PointingHandCursor)
         self.audio_status.setFixedSize(24, 24)
         self.audio_status.setStyleSheet("""
@@ -171,16 +188,8 @@ class OverlayWindow(QMainWindow):
             }
         """)
         self.audio_status.clicked.connect(self.app.toggle_audio)
+        self.audio_status.setVisible(False)
         hl.addWidget(self.audio_status)
-
-        # Session timer label
-        self.session_timer = QLabel("00:00")
-        self.session_timer.setStyleSheet(
-            "color: #64748b; font-size: 10px; font-family: monospace; background: transparent;"
-        )
-        self.session_timer.setToolTip("Session Duration")
-        self.session_timer.setVisible(False)
-        hl.addWidget(self.session_timer)
 
         self.btn_end_session = QPushButton("⏹")
         self.btn_end_session.setToolTip("End Session")
@@ -195,6 +204,7 @@ class OverlayWindow(QMainWindow):
             }
         """)
         self.btn_end_session.clicked.connect(self.app.end_session)
+        self.btn_end_session.setVisible(False)
         hl.addWidget(self.btn_end_session)
 
         self.btn_history = QPushButton("📜")
@@ -212,27 +222,7 @@ class OverlayWindow(QMainWindow):
         self.btn_history.clicked.connect(self._show_history)
         hl.addWidget(self.btn_history)
 
-        self.btn_type = QPushButton("⌨️")
-        self.btn_type.setToolTip("Type response into Snap-Locked window")
-        self.btn_type.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_type.setFixedSize(24, 24)
-        self.btn_type.setStyleSheet("""
-            QPushButton { 
-                color: #f472b6; font-size: 12px; background: transparent; border: none; border-radius: 12px;
-            }
-            QPushButton:hover { 
-                background: rgba(255, 255, 255, 0.05); 
-            }
-        """)
-        self.btn_type.clicked.connect(self.app.type_last_response)
-        hl.addWidget(self.btn_type)
-
-        self.status_bar = QLabel("⚡ Ready")
-        self.status_bar.setStyleSheet(
-            "color: #64748b; font-size: 10px; background: transparent;"
-        )
-        self.status_bar.setToolTip("Provider | Capture State | Latency")
-        hl.addWidget(self.status_bar)
+        self._status_snapshot = ""
 
         btn_set = QPushButton("⚙️")
         btn_set.setToolTip("Settings")
@@ -241,6 +231,7 @@ class OverlayWindow(QMainWindow):
             "color: #667; border: none; font-size: 14px; background: transparent;"
         )
         btn_set.clicked.connect(self._show_settings)
+        self.btn_settings = btn_set
         hl.addWidget(btn_set)
 
         btn_close = QPushButton("✕")
@@ -289,12 +280,65 @@ class OverlayWindow(QMainWindow):
         cv_layout.addWidget(self.transcript_bar)
 
         self.input = QLineEdit()
-        self.input.setPlaceholderText("Ask anything...")
+        self.input.setPlaceholderText("Ask about the live session or use Analyze Screen...")
         self.input.returnPressed.connect(self._send)
         self.input.setStyleSheet(
-            "background: rgba(25,25,50,200); color: white; border: 1px solid rgba(255,255,255,10); border-radius: 10px; padding: 10px; margin: 5px;"
+            "background: transparent; color: white; border: none; padding: 0 4px; font-size: 12px;"
         )
-        cv_layout.addWidget(self.input)
+
+        self.input_bar = QFrame()
+        self.input_bar.setStyleSheet(
+            "background: rgba(18,20,38,220); border: 1px solid rgba(99,102,241,0.18); border-radius: 14px; margin: 6px 5px 8px 5px;"
+        )
+        input_layout = QHBoxLayout(self.input_bar)
+        input_layout.setContentsMargins(12, 8, 8, 8)
+        input_layout.setSpacing(8)
+        input_layout.addWidget(self.input, 1)
+
+        self.btn_analyze_screen = QPushButton("ANALYZE SCREEN")
+        self.btn_analyze_screen.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_analyze_screen.setToolTip("Capture the current screen and analyze it with live session context")
+        self.btn_analyze_screen.setStyleSheet("""
+            QPushButton {
+                background: rgba(56, 189, 248, 0.12);
+                color: #7dd3fc;
+                border: 1px solid rgba(56, 189, 248, 0.28);
+                border-radius: 10px;
+                padding: 8px 12px;
+                font-size: 10px;
+                font-weight: 800;
+                letter-spacing: 1px;
+            }
+            QPushButton:hover {
+                background: rgba(56, 189, 248, 0.18);
+                color: white;
+            }
+        """)
+        self.btn_analyze_screen.clicked.connect(self._analyze_screen)
+        input_layout.addWidget(self.btn_analyze_screen)
+
+        self.btn_send = QPushButton("ASK")
+        self.btn_send.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_send.setToolTip("Ask about the current live session")
+        self.btn_send.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #5b4cf1, stop:1 #8b5cf6);
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 8px 14px;
+                font-size: 10px;
+                font-weight: 900;
+                letter-spacing: 1px;
+            }
+            QPushButton:hover {
+                background: #7367ff;
+            }
+        """)
+        self.btn_send.clicked.connect(self._send)
+        input_layout.addWidget(self.btn_send)
+
+        cv_layout.addWidget(self.input_bar)
 
         self.stack.addWidget(self.chat_view)
 
@@ -400,7 +444,7 @@ class OverlayWindow(QMainWindow):
         else:
             parts.append("⚡ Ready")
 
-        self.status_bar.setText(" | ".join(parts))
+        self._status_snapshot = " | ".join(parts)
 
     # --- RESTORED BRIDGES ---
     def update_transcript(self, text):
@@ -437,38 +481,62 @@ class OverlayWindow(QMainWindow):
         self._is_streaming = False
         self._render_markdown_now()
 
+    def show_standby_view(self):
+        self.stack.setCurrentWidget(self.standby_view)
+
+    def show_chat_view(self):
+        self.stack.setCurrentWidget(self.chat_view)
+
+    def show_history_view(self):
+        self.history_feed.refresh()
+        self.stack.setCurrentWidget(self.history_feed)
+
+    def show_settings_view(self):
+        self.stack.setCurrentWidget(self.settings_view)
+
     def _show_history(self):
         """Show full history feed."""
+        if self.stack.currentWidget() is self.history_feed:
+            self.show_standby_view()
+            return
         self._prev_stack_index = self.stack.currentIndex()
-        self.history_feed.refresh()
-        self.stack.setCurrentIndex(3)
+        self._prev_stack_widget = self.stack.currentWidget()
+        self.show_history_view()
 
     def _show_settings(self):
         """Show settings and remember where we came from."""
+        if self.stack.currentWidget() is self.settings_view:
+            self.show_standby_view()
+            return
         self._prev_stack_index = self.stack.currentIndex()
-        self.stack.setCurrentIndex(2)
+        self._prev_stack_widget = self.stack.currentWidget()
+        self.show_settings_view()
 
     def _on_settings_closed(self):
         """Return to previous view."""
         self.refresh_standby_state()
-        self.stack.setCurrentIndex(self._prev_stack_index)
+        if self._prev_stack_widget is not None:
+            self.stack.setCurrentWidget(self._prev_stack_widget)
+        else:
+            self.stack.setCurrentIndex(self._prev_stack_index)
 
     def _on_onboarding_finished(self):
         """Handle onboarding completion - go to standby."""
-        self.stack.setCurrentIndex(0)  # Standby view
+        self.show_standby_view()
         self.refresh_standby_state()
 
     def _on_onboarding_skipped(self):
         """Handle onboarding skip - go to standby."""
-        self.stack.setCurrentIndex(0)  # Standby view
+        self.show_standby_view()
         self.refresh_standby_state()
 
     def show_onboarding(self):
         """Show the onboarding wizard, resetting it to step 0."""
         self._prev_stack_index = 0
+        self._prev_stack_widget = self.standby_view
         if hasattr(self, "onboarding_wizard"):
             self.onboarding_wizard.reset()
-        self.stack.setCurrentIndex(4)  # Onboarding view
+        self.stack.setCurrentWidget(self.onboarding_wizard)
 
     def refresh_standby_state(self, mode=None, audio=None):
         self.standby_view.refresh_highlights(mode=mode, audio=audio)
@@ -479,6 +547,11 @@ class OverlayWindow(QMainWindow):
             self.input.clear()
             self._user_is_scrolling = False
             self.user_query.emit(q)
+
+    def _analyze_screen(self):
+        if hasattr(self.app, "analyze_current_screen"):
+            self._user_is_scrolling = False
+            self.app.analyze_current_screen()
 
     def set_click_through(self, enabled: bool):
         """Toggle mouse interaction transparency."""

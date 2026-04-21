@@ -1,6 +1,6 @@
 """Prompt templates for all modes — Optimized for speed & weight."""
 
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
 
 
 class ContextRanker:
@@ -45,7 +45,12 @@ class ContextRanker:
 class PromptBuilder:
     SYSTEMS = {
         "general": """You are OpenAssist AI, a real-time assistant with screen and audio access.
-Rules: Be concise. Use bullets. Code in fenced blocks. No filler.""",
+Rules:
+- Prioritize what is visible on the current screen.
+- Use recent audio and session context as supporting evidence.
+- Distinguish clearly between observed facts and inference.
+- Be concise, useful, and action-oriented.
+- Use bullets when scanning is easier. Code in fenced blocks. No filler.""",
         "interview": """You are an interview coach with real-time screen/audio access.
 FORMAT:
 - Key Points (3-5 bullets)
@@ -234,6 +239,18 @@ RULES:
 
         if origin == "speech":
             parts.append("(Origin: Audio. Fix ASR errors.)")
+        elif origin == "screen_analysis":
+            parts.append(
+                "[TASK]\nAnalyze the attached screenshot first. Treat the image as the primary source of truth. "
+                "Use [SCREEN] as OCR support, and use [AUDIO] and environment context only as support. "
+                "If the screenshot or OCR is partial, say what is visible, what it likely means, and the best next action.\n"
+                "FORMAT:\n- What I See\n- What It Means\n- What To Do Next"
+            )
+        elif origin == "manual":
+            parts.append(
+                "[TASK]\nAnswer the user's question using the current live session context. "
+                "Prefer the most recent on-screen evidence when relevant."
+            )
 
         parts.append(f"Q: {query}")
         return "\n---\n".join(parts)

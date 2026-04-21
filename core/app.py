@@ -60,6 +60,8 @@ class OpenAssistApp(QObject):
         self._last_query = ""
         self._last_query_time = 0.0
         self._click_through = False
+        self._generation_epoch = 0
+        self._screen_analysis_pending = False
 
         # Async Loop
         self.loop = asyncio.new_event_loop()
@@ -116,6 +118,7 @@ class OpenAssistApp(QObject):
             self._on_audio_source_ui_change
         )
         self.ai.response_complete.connect(self._on_response_complete)
+        self.ai.error_occurred.connect(self._on_ai_error)
         self.state.stealth_changed.connect(lambda _: self._apply_ui_only())
 
     def _on_response_complete(self, full_text: str):
@@ -148,6 +151,14 @@ class OpenAssistApp(QObject):
             latency_ms=latency_ms if entries else 0,
             available_providers=available,
         )
+        if self._screen_analysis_pending:
+            self.overlay.update_transcript("Screen captured and analyzed.")
+            self._screen_analysis_pending = False
+
+    def _on_ai_error(self, error_text: str):
+        if self._screen_analysis_pending:
+            self.overlay.update_transcript("Screen captured, but analysis failed.")
+            self._screen_analysis_pending = False
 
     def _on_audio_source_ui_change(self, source):
         self.state.audio_source = source
@@ -284,7 +295,14 @@ class OpenAssistApp(QObject):
     def open_settings(self):
         if self.mini_mode:
             self.mini_overlay.hide()
-        self.overlay.stack.setCurrentIndex(2)
+        if hasattr(self.overlay, "stack"):
+            self.overlay._prev_stack_index = self.overlay.stack.currentIndex()
+            self.overlay._prev_stack_widget = self.overlay.stack.currentWidget()
+        show_settings_view = getattr(self.overlay, "show_settings_view", None)
+        if callable(show_settings_view):
+            show_settings_view()
+        else:
+            self.overlay.stack.setCurrentWidget(self.overlay.settings_view)
         self.overlay.show()
         self.overlay.raise_()
         self.overlay.activateWindow()
@@ -320,9 +338,17 @@ class OpenAssistApp(QObject):
         if not q or not self._ai_lock_ready.wait(timeout=2):
             return
 
+        # Background session-triggered queries should never outlive the session.
+        if s in {"speech", "auto"} and not self.session_active:
+            return
+
         # OMEGA DEBOUNCE: Prevent double-triggers (Audio + OCR) for the same query
         now = time.time()
-        if q == self._last_query and (now - self._last_query_time) < 3.0:
+        if (
+            s in {"speech", "auto"}
+            and q == self._last_query
+            and (now - self._last_query_time) < 3.0
+        ):
             logger.debug(f"AI: Debouncing duplicate query: {q[:50]}...")
             return
 
@@ -340,13 +366,22 @@ class OpenAssistApp(QObject):
         # Start timing for instrumentation
         self._current_request_start = time.time()
         self._stage_timings = {"start": self._current_request_start}
+        request_epoch = self._generation_epoch
 
-        asyncio.run_coroutine_threadsafe(self._process_ai(q, s, c), self.loop)
+        asyncio.run_coroutine_threadsafe(
+            self._process_ai(q, s, c, request_epoch), self.loop
+        )
 
-    async def _process_ai(self, q, s, c):
+    async def _process_ai(self, q, s, c, request_epoch):
+        if request_epoch != self._generation_epoch:
+            return
         async with self._ai_lock:
+            if request_epoch != self._generation_epoch:
+                return
             self._last_query = q
             sc = c.get("screen") if c else await self.screen.capture_context()
+            if request_epoch != self._generation_epoch:
+                return
             if sc:
                 self.nexus.push("screen", sc)
 
@@ -354,8 +389,14 @@ class OpenAssistApp(QObject):
             # Push last transcript fragment specifically if available
 
             snapshot = self.nexus.get_snapshot()
+            if request_epoch != self._generation_epoch:
+                return
             await self.ai.generate_response(
-                q, snapshot, screen_context=sc, audio_context=au
+                q,
+                snapshot,
+                screen_context=sc,
+                audio_context=au,
+                origin=s,
             )
 
     def toggle_overlay(self):
@@ -372,6 +413,48 @@ class OpenAssistApp(QObject):
 
     def quick_answer(self):
         self.generate_response("Summarize current context.", "quick")
+
+    def analyze_current_screen(self):
+        if not self.session_active:
+            return
+
+        self.overlay.update_transcript("Screen captured. Analyzing current screen...")
+        self._screen_analysis_pending = True
+        request_epoch = self._generation_epoch
+
+        async def _capture_and_analyze():
+            if request_epoch != self._generation_epoch:
+                return
+            image_bytes, screen_text = await self.screen.capture_snapshot()
+            if request_epoch != self._generation_epoch:
+                return
+            if not image_bytes:
+                self._screen_analysis_pending = False
+                self.overlay.update_transcript("Screen capture failed.")
+                return
+
+            if screen_text:
+                self.nexus.push("screen", screen_text)
+            audio_text = self.audio.get_transcript()
+            snapshot = self.nexus.get_snapshot()
+            try:
+                await self.ai.analyze_image_response(
+                    "Analyze the current screen and answer using the visible content, recent audio, and live session context.",
+                    image_bytes,
+                    snapshot,
+                    screen_context=screen_text,
+                    audio_context=audio_text,
+                )
+            except Exception:
+                if request_epoch != self._generation_epoch:
+                    return
+                self.generate_response(
+                    "Analyze the current screen and answer using the visible content, recent audio, and live session context.",
+                    "screen_analysis",
+                    {"screen": screen_text, "audio": audio_text},
+                )
+
+        asyncio.run_coroutine_threadsafe(_capture_and_analyze(), self.loop)
 
     def switch_mode(self, mode: str = None):
         if not mode:
@@ -443,12 +526,21 @@ class OpenAssistApp(QObject):
         QTimer.singleShot(800, self.qt_app.quit)
 
     def start_new_session(self):
+        self._generation_epoch += 1
+        self.ai.cancel()
+        self.nexus.clear()
         self.history.start_new_session()
+        self.state.is_muted = False
+        self._screen_analysis_pending = False
         self.audio.clear()
         self._last_query = ""
         self.session_active = True
         self.state.is_capturing = True
-        self.overlay.stack.setCurrentIndex(1)
+        show_chat_view = getattr(self.overlay, "show_chat_view", None)
+        if callable(show_chat_view):
+            show_chat_view()
+        else:
+            self.overlay.stack.setCurrentWidget(self.overlay.chat_view)
         self.overlay.on_complete("", "")
         self.overlay.update_transcript("Listening for context...")
         start_session_ui = getattr(self.overlay, "start_session_ui", None)
@@ -462,12 +554,20 @@ class OpenAssistApp(QObject):
         logger.info("🚀 Session Started.")
 
     def end_session(self):
+        self._generation_epoch += 1
+        self.ai.cancel()
+        self._screen_analysis_pending = False
         self.session_active = False
         self.state.is_capturing = False
         self.state.target_window_id = None
+        self.nexus.clear()
         self.audio.clear()
         self._last_query = ""
-        self.overlay.stack.setCurrentIndex(0)
+        show_standby_view = getattr(self.overlay, "show_standby_view", None)
+        if callable(show_standby_view):
+            show_standby_view()
+        else:
+            self.overlay.stack.setCurrentWidget(self.overlay.standby_view)
         end_session_ui = getattr(self.overlay, "end_session_ui", None)
         if callable(end_session_ui):
             end_session_ui()
@@ -510,6 +610,8 @@ class OpenAssistApp(QObject):
             logger.warning("Sim: No Snap-Locked target window available.")
 
     def _on_transcription(self, t):
+        if not self.session_active:
+            return
         self.nexus.push("audio", t)
         self.overlay.update_transcript(t)
         q = self.ai.detector.detect(t)
@@ -517,6 +619,8 @@ class OpenAssistApp(QObject):
             self.generate_response(q, "speech", {"audio": t})
 
     def _on_screen_text(self, t):
+        if not self.session_active:
+            return
         q = self.ai.detector.detect(t)
         if q:
             self.generate_response(q, "auto", {"screen": t})
@@ -584,10 +688,8 @@ class OpenAssistApp(QObject):
         logger.info("👁️ Continuous Vision Loop Started.")
         while self.is_running:
             try:
-                # Only capture if session is active and user hasn't manually paused
-                if self.session_active and not (
-                    hasattr(self.audio, "_paused") and self.audio._paused
-                ):
+                # Screen context remains active during a session even if audio is muted.
+                if self.session_active:
                     # Capture current screen state and push to context
                     text = await self.screen.capture_context()
                     if text:

@@ -1,6 +1,7 @@
 """Ollama - Local, offline, no API key. FIXED: No model pull during generation."""
 
 import asyncio
+import base64
 import json
 import time
 from typing import AsyncGenerator, Optional
@@ -281,3 +282,56 @@ class OllamaProvider(BaseProvider):
     async def health_check(self) -> bool:
         """Quick health check."""
         return await self.check_availability()
+
+    def supports_vision(self) -> bool:
+        return True
+
+    async def analyze_image(
+        self,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        tier: str = None,
+    ) -> str:
+        if self._state == self.STATE_UNKNOWN:
+            await self.check_availability()
+
+        if not self.is_ready:
+            raise Exception(
+                f"Ollama model not available (state: {self._state}). "
+                f"Pull it first: ollama pull {self.get_model(tier)}"
+            )
+
+        self._pre_request()
+        model = self.get_model(tier)
+        t0 = time.time()
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.endpoint}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {
+                            "role": "user",
+                            "content": user,
+                            "images": [image_b64],
+                        },
+                    ],
+                    "stream": False,
+                    "options": {"num_ctx": 8192, "temperature": 0.4},
+                },
+                timeout=self._generate_timeout,
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise Exception(f"Ollama error {resp.status}: {body[:200]}")
+
+                data = await resp.json()
+                text = data.get("message", {}).get("content", "")
+                tok = data.get("eval_count", len(text) // 4)
+                self.stats.record(tok, time.time() - t0)
+                return text

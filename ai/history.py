@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import inspect
+import uuid
 from pathlib import Path
 from typing import List, Optional
 from dataclasses import dataclass, field, asdict
@@ -38,7 +39,7 @@ class ResponseHistory:
         self.history_dir.mkdir(parents=True, exist_ok=True)
 
         self.index_storage = SecureStorage(str(self.history_dir / "index.enc"))
-        self.current_session_id = str(int(time.time()))
+        self.current_session_id = self._new_session_id()
         self.current_storage = SecureStorage(
             str(self.history_dir / f"{self.current_session_id}.enc")
         )
@@ -49,18 +50,14 @@ class ResponseHistory:
         self.sessions = self.index_storage.get("sessions_index") or []
         # No longer auto-starting session here. Wait for start_new_session.
 
-    def start_new_session(self):
-        """Starts a fresh session and archives the current one."""
-        self.save()  # Ensure current is saved
+    def _new_session_id(self) -> str:
+        return f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
 
-        self.current_session_id = str(int(time.time()))
-        self.current_storage = SecureStorage(
-            str(self.history_dir / f"{self.current_session_id}.enc")
-        )
-        self.entries = []
-        self.current_index = -1
+    def _ensure_current_session_meta(self):
+        for session in self.sessions:
+            if session["id"] == self.current_session_id:
+                return session
 
-        # Update index with new session metadata
         session_meta = {
             "id": self.current_session_id,
             "created_at": time.time(),
@@ -78,8 +75,18 @@ class ResponseHistory:
                         old_file.unlink()
                 except Exception as e:
                     logger.debug(f"Failed to delete old session file {old['id']}: {e}")
+        return session_meta
 
-        self.index_storage.set("sessions_index", self.sessions)
+    def start_new_session(self):
+        """Starts a fresh session and archives the current one."""
+        self.save()  # Ensure current is saved
+
+        self.current_session_id = self._new_session_id()
+        self.current_storage = SecureStorage(
+            str(self.history_dir / f"{self.current_session_id}.enc")
+        )
+        self.entries = []
+        self.current_index = -1
         logger.info(f"🆕 Started new session: {self.current_session_id}")
 
     def add(
@@ -101,6 +108,7 @@ class ResponseHistory:
             metadata=metadata or {},
         )
         with self._lock:
+            self._ensure_current_session_meta()
             self.entries.append(entry)
             if len(self.entries) > self.max:
                 self.entries = self.entries[-self.max :]
@@ -237,6 +245,10 @@ class ResponseHistory:
             # 2. Re-initialize empty state
             self.sessions = []
             self.index_storage.set("sessions_index", [])
+            self.current_session_id = self._new_session_id()
+            self.current_storage = SecureStorage(
+                str(self.history_dir / f"{self.current_session_id}.enc")
+            )
 
         except Exception as e:
             logger.error(f"Global purge failed: {e}")
