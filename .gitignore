@@ -9,6 +9,7 @@ data/history.enc
 data/history/
 data/vectordb/
 data/__pycache__/
+data/context_presets.json
 logs/
 
 # ── Internal Docs & Private Assets ───────────────────────────────────────────
