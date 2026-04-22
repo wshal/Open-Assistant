@@ -679,10 +679,12 @@ class SettingsView(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet("background: transparent; border: none;")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         w = QWidget()
+        w.setMinimumWidth(0)
         l = QVBoxLayout(w)
-        l.setContentsMargins(20, 20, 20, 20)
+        l.setContentsMargins(14, 16, 14, 16)
         l.setSpacing(20)
         w.setStyleSheet("background: transparent;")
 
@@ -865,12 +867,13 @@ class SettingsView(QWidget):
         self.vision_primary.setCurrentIndex(idx_map.get(primary, 0))
         self.vision_secondary.setCurrentIndex(idx_map.get(secondary, 1))
 
-        row_v = QHBoxLayout()
-        row_v.addWidget(QLabel("Primary"))
-        row_v.addWidget(self.vision_primary, 1)
-        row_v.addSpacing(10)
-        row_v.addWidget(QLabel("Secondary"))
-        row_v.addWidget(self.vision_secondary, 1)
+        row_v = QGridLayout()
+        row_v.setHorizontalSpacing(10)
+        row_v.setVerticalSpacing(8)
+        row_v.addWidget(QLabel("Primary"), 0, 0)
+        row_v.addWidget(self.vision_primary, 0, 1)
+        row_v.addWidget(QLabel("Secondary"), 1, 0)
+        row_v.addWidget(self.vision_secondary, 1, 1)
         l.addLayout(row_v)
 
         self.chk_vision_race = PremiumCheckBox("Race mode (send to both, take fastest)")
@@ -910,12 +913,13 @@ class SettingsView(QWidget):
         self.text_primary.setCurrentIndex(tidx.get(t1, 0))
         self.text_secondary.setCurrentIndex(tidx.get(t2, 1))
 
-        row_t = QHBoxLayout()
-        row_t.addWidget(QLabel("Primary"))
-        row_t.addWidget(self.text_primary, 1)
-        row_t.addSpacing(10)
-        row_t.addWidget(QLabel("Secondary"))
-        row_t.addWidget(self.text_secondary, 1)
+        row_t = QGridLayout()
+        row_t.setHorizontalSpacing(10)
+        row_t.setVerticalSpacing(8)
+        row_t.addWidget(QLabel("Primary"), 0, 0)
+        row_t.addWidget(self.text_primary, 0, 1)
+        row_t.addWidget(QLabel("Secondary"), 1, 0)
+        row_t.addWidget(self.text_secondary, 1, 1)
         l.addLayout(row_t)
 
         self.chk_text_race = PremiumCheckBox("Race mode for text (use fastest successful)")
@@ -1250,24 +1254,12 @@ class SettingsView(QWidget):
         opacity_layout.addStretch()
         l.addLayout(opacity_layout)
 
-        # Reset Onboarding
+        # Reset section (Factory Reset below performs a full first-run reset)
         sep = QFrame()
         sep.setStyleSheet(
             "background: rgba(255,255,255,0.05); height: 1px; margin: 20px 0;"
         )
         l.addWidget(sep)
-
-        btn_reset_onboard = QPushButton("🔄 Reset Setup Wizard")
-        btn_reset_onboard.setStyleSheet(STYLE_BTN_SECONDARY)
-        btn_reset_onboard.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_reset_onboard.clicked.connect(self._reset_onboarding)
-        l.addWidget(btn_reset_onboard)
-
-        desc_reset = QLabel("Run the setup wizard again to reconfigure your settings.")
-        desc_reset.setStyleSheet(
-            f"{TEXT_MUTED} font-size: 10px; background: transparent;"
-        )
-        l.addWidget(desc_reset)
 
         btn_factory_reset = QPushButton("FACTORY RESET")
         btn_factory_reset.setStyleSheet(
@@ -1531,15 +1523,6 @@ class SettingsView(QWidget):
             self._ctx_char_label.setStyleSheet(
                 f"color: {color}; font-size: 9px; background: transparent;"
             )
-
-    def _reset_onboarding(self):
-        """Reset onboarding flag and show wizard."""
-        self.config.set("onboarding.completed", False)
-        self.config.save()
-        self.closed.emit()  # Close settings
-        # Show onboarding
-        if hasattr(self, "app") and hasattr(self.app, "overlay"):
-            self.app.overlay.show_onboarding()
 
     def _factory_reset(self):
         """Run a full first-run reset after explicit confirmation."""

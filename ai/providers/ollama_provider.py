@@ -326,6 +326,50 @@ class OllamaProvider(BaseProvider):
         ]
         return any(marker in model_lower for marker in markers)
 
+    @staticmethod
+    def _is_ram_model_load_error(text: str) -> bool:
+        msg = (text or "").lower()
+        return (
+            "requires more system memory" in msg
+            or "than is available" in msg
+            or "not enough system memory" in msg
+        )
+
+    def _vision_model_fallbacks(self, current_model: str) -> list:
+        """Pick a small set of locally-available fallback vision models."""
+        if not self._available_models:
+            return []
+
+        current_model = (current_model or "").strip()
+        vision_models = [m for m in self._available_models if self._looks_like_vision_model(m)]
+        if not vision_models:
+            return []
+
+        # Prefer lightweight-ish vision models first when we hit RAM constraints.
+        preferred_prefixes = (
+            "moondream",
+            "minicpm-v",
+            "llava",
+            "bakllava",
+            "llama3.2-vision",
+            "qwen2-vl",
+            "qwen2.5-vl",
+            "qwen3-vl",
+        )
+
+        ordered = []
+        for prefix in preferred_prefixes:
+            for m in vision_models:
+                if m.startswith(prefix) and m not in ordered:
+                    ordered.append(m)
+
+        for m in vision_models:
+            if m not in ordered:
+                ordered.append(m)
+
+        ordered = [m for m in ordered if m and m != current_model]
+        return ordered[:2]
+
     async def generate(self, system: str, user: str, tier: str = None) -> str:
         """Generate response. Lazy-checks availability if state is unknown."""
         if self._state == self.STATE_UNKNOWN:
@@ -450,32 +494,49 @@ class OllamaProvider(BaseProvider):
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
         session = await self._get_session()
-        async with session.post(
-            f"{self.endpoint}/api/chat",
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {
-                        "role": "user",
-                        "content": user,
-                        "images": [image_b64],
-                    },
-                ],
-                "stream": False,
-                "options": {"num_ctx": 8192, "temperature": 0.4},
-            },
-            timeout=self._generate_timeout,
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise Exception(f"Ollama error {resp.status}: {body[:200]}")
+        attempt_models = [model]
+        for m in self._vision_model_fallbacks(model):
+            if m not in attempt_models:
+                attempt_models.append(m)
 
-            data = await resp.json()
-            text = data.get("message", {}).get("content", "")
-            tok = data.get("eval_count", len(text) // 4)
-            self.stats.record(tok, time.time() - t0)
-            return text
+        last_error = None
+        for idx, m in enumerate(attempt_models):
+            async with session.post(
+                f"{self.endpoint}/api/chat",
+                json={
+                    "model": m,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {
+                            "role": "user",
+                            "content": user,
+                            "images": [image_b64],
+                        },
+                    ],
+                    "stream": False,
+                    "options": {"num_ctx": 8192, "temperature": 0.4},
+                },
+                timeout=self._generate_timeout,
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    last_error = Exception(f"Ollama error {resp.status}: {body[:200]}")
+                    # Only auto-downgrade on RAM/model-load failures.
+                    if idx == 0 and resp.status >= 500 and self._is_ram_model_load_error(body):
+                        continue
+                    raise last_error
+
+                data = await resp.json()
+                text = data.get("message", {}).get("content", "")
+                tok = data.get("eval_count", len(text) // 4)
+                self.stats.record(tok, time.time() - t0)
+                if m != model:
+                    # Persist the working fallback for future calls (reduces repeated failures).
+                    self._resolved_vision_model = m
+                    logger.warning(f"  Ollama: downgraded vision model -> {m}")
+                return text
+
+        raise last_error or Exception("Ollama vision failed")
 
     def supports_vision_stream(self) -> bool:
         return self.supports_vision()
@@ -507,37 +568,53 @@ class OllamaProvider(BaseProvider):
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
         session = await self._get_session()
-        async with session.post(
-            f"{self.endpoint}/api/chat",
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {
-                        "role": "user",
-                        "content": user,
-                        "images": [image_b64],
-                    },
-                ],
-                "stream": True,
-                "options": {"num_ctx": 8192, "temperature": 0.4},
-            },
-            timeout=self._generate_timeout,
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise Exception(f"Ollama error {resp.status}: {body[:200]}")
+        attempt_models = [model]
+        for m in self._vision_model_fallbacks(model):
+            if m not in attempt_models:
+                attempt_models.append(m)
 
-            async for line in resp.content:
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                chunk = data.get("message", {}).get("content", "")
-                if chunk:
-                    tok += 1
-                    yield chunk
+        last_error = None
+        for idx, m in enumerate(attempt_models):
+            async with session.post(
+                f"{self.endpoint}/api/chat",
+                json={
+                    "model": m,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {
+                            "role": "user",
+                            "content": user,
+                            "images": [image_b64],
+                        },
+                    ],
+                    "stream": True,
+                    "options": {"num_ctx": 8192, "temperature": 0.4},
+                },
+                timeout=self._generate_timeout,
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    last_error = Exception(f"Ollama error {resp.status}: {body[:200]}")
+                    if idx == 0 and resp.status >= 500 and self._is_ram_model_load_error(body):
+                        continue
+                    raise last_error
 
-        self.stats.record(tok, time.time() - t0)
+                async for line in resp.content:
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunk = data.get("message", {}).get("content", "")
+                    if chunk:
+                        tok += 1
+                        yield chunk
+
+                self.stats.record(tok, time.time() - t0)
+                if m != model:
+                    self._resolved_vision_model = m
+                    logger.warning(f"  Ollama: downgraded vision model -> {m}")
+                return
+
+        raise last_error or Exception("Ollama vision stream failed")

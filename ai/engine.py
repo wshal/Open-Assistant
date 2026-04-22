@@ -946,7 +946,14 @@ class AIEngine(QObject):
             and not bool(self.config.get("ai.vision.local_only", False))
             and len(candidates) >= 2
         ):
-            providers_tried = [p.name for p in candidates]
+            # Staggered race: start primary immediately, then start the next provider
+            # after a short delay if we haven't gotten a success yet. This keeps
+            # latency low while avoiding hammering every provider on every request.
+            stagger_ms = int(self.config.get("ai.vision.race_stagger_ms", 900))
+            stagger_s = max(stagger_ms / 1000.0, 0.0)
+
+            providers_tried = []
+
             async def _run_one(p):
                 if getattr(p, "supports_vision_stream", lambda: False)():
                     # Consume stream into a full string for parity with non-streaming.
@@ -958,12 +965,45 @@ class AIEngine(QObject):
                     return out
                 return await _analyze_one(p)
 
-            tasks = {asyncio.create_task(_run_one(p)): p for p in candidates}
+            tasks = {}
+            next_idx = 0
+
+            def _launch_one(idx: int):
+                nonlocal next_idx
+                p = candidates[idx]
+                tasks[asyncio.create_task(_run_one(p))] = p
+                providers_tried.append(p.name)
+                next_idx = idx + 1
+
+            _launch_one(0)
+            next_launch_at = time.time() + stagger_s
             try:
-                while tasks:
+                # Keep going until we have no running tasks AND no remaining providers to launch.
+                while tasks or next_idx < len(candidates):
+                    if not tasks and next_idx < len(candidates):
+                        # All running attempts failed quickly; launch the next immediately.
+                        _launch_one(next_idx)
+                        next_launch_at = time.time() + stagger_s
+
+                    timeout = None
+                    if next_idx < len(candidates):
+                        timeout = max(0.0, next_launch_at - time.time())
+
                     done, _pending = await asyncio.wait(
-                        tasks.keys(), return_when=asyncio.FIRST_COMPLETED
+                        tasks.keys(),
+                        timeout=timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
+
+                    if not done:
+                        # Time to launch the next provider in the race.
+                        if next_idx < len(candidates):
+                            _launch_one(next_idx)
+                            next_launch_at = time.time() + stagger_s
+                            continue
+                        # No more providers to launch; keep waiting for completion.
+                        continue
+
                     for t in done:
                         p = tasks.pop(t, None)
                         try:
@@ -975,6 +1015,10 @@ class AIEngine(QObject):
 
                         if self._is_cancelled:
                             return ""
+
+                        if not response.strip():
+                            last_error = Exception("Empty response from vision provider")
+                            continue
 
                         # Cancel remaining attempts
                         for other in list(tasks.keys()):
@@ -1025,6 +1069,10 @@ class AIEngine(QObject):
                         t.cancel()
                     except Exception:
                         pass
+
+            # If we raced and still got no result, do not retry the same providers
+            # sequentially; bubble up the last error to the caller for OCR fallback.
+            raise Exception(str(last_error) if last_error else "Vision analysis failed.")
 
         for provider in candidates:
             emitted_partial = False

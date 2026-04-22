@@ -1,6 +1,6 @@
 from PyQt6.QtWidgets import QCheckBox
-from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath
-from PyQt6.QtCore import Qt, QRect
+from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QFontMetrics
+from PyQt6.QtCore import Qt, QRect, QSize
 
 class PremiumCheckBox(QCheckBox):
     """
@@ -12,7 +12,33 @@ class PremiumCheckBox(QCheckBox):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         # We handle geometry manually, so we keep the base style clean
         self.setStyleSheet("background: transparent; border: none;")
+        f = self.font()
+        f.setPixelSize(11)
+        self.setFont(f)
         self.setMinimumHeight(22)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        indicator_size = 18
+        spacing = 10
+        text_width = max(0, int(width) - indicator_size - spacing)
+        fm = QFontMetrics(self.font())
+        br = fm.boundingRect(
+            0,
+            0,
+            text_width,
+            10_000,
+            int(Qt.TextFlag.TextWordWrap),
+            self.text(),
+        )
+        content_h = max(indicator_size, br.height())
+        return max(22, content_h)
+
+    def sizeHint(self) -> QSize:
+        base = super().sizeHint()
+        return QSize(base.width(), self.heightForWidth(base.width()))
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -64,9 +90,13 @@ class PremiumCheckBox(QCheckBox):
             
         # 3. Draw the Label Text
         painter.setPen(QColor("#cbd5e1" if not self.isChecked() else "#f1f5f9"))
-        font = self.font()
-        font.setPixelSize(11)
-        painter.setFont(font)
-        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
+        painter.setFont(self.font())
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignVCenter
+            | Qt.AlignmentFlag.AlignLeft
+            | Qt.TextFlag.TextWordWrap,
+            self.text(),
+        )
         
         painter.end()

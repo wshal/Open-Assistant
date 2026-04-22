@@ -357,6 +357,14 @@ class OpenAssistApp(QObject):
         logger.info("⚙️ Applying Settings (Background Thread)...")
 
         self._sync_state_from_config()
+        # Ensure runtime ModeManager + UI highlights reflect the newly saved mode.
+        # Without this, Settings can update config/state but leave the active Mode
+        # profile (detector sensitivity, VAD, preferred providers) stale until the
+        # user manually switches modes.
+        try:
+            self.switch_mode(self.state.mode)
+        except Exception as e:
+            logger.debug(f"Mode apply skipped: {e}")
         self.overlay.refresh_standby_state()
 
         def _apply():
@@ -722,16 +730,47 @@ class OpenAssistApp(QObject):
                         "If it is a coding/UI task, include code."
                     )
 
-                await self.ai.analyze_image_response(
-                    query,
-                    image_bytes,
-                    snapshot,
-                    screen_context=screen_text,
-                    audio_context=audio_text,
-                )
-                latest_ocr = ocr_text
-                if latest_ocr and request_epoch == self._generation_epoch:
-                    self.nexus.push("screen", latest_ocr)
+                try:
+                    await self.ai.analyze_image_response(
+                        query,
+                        image_bytes,
+                        snapshot,
+                        screen_context=screen_text,
+                        audio_context=audio_text,
+                    )
+                    latest_ocr = ocr_text
+                    if latest_ocr and request_epoch == self._generation_epoch:
+                        self.nexus.push("screen", latest_ocr)
+                    return
+                except Exception as exc:
+                    if request_epoch != self._generation_epoch:
+                        return
+                    self._screen_analysis_pending = False
+                    if hasattr(self.overlay, "set_analysis_provider_badge"):
+                        self.overlay.set_analysis_provider_badge()
+                    logger.warning(f"Vision analysis exhausted providers: {exc}")
+                    if hasattr(self.overlay, "show_error_toast"):
+                        self.overlay.show_error_toast(
+                            "Image analysis failed — using OCR/text fallback."
+                        )
+                    self.overlay.update_transcript(
+                        "Screen captured, but image analysis failed. Using OCR/text fallback...",
+                        state="error",
+                    )
+
+                    # Fall back to OCR/text routing (best-effort).
+                    try:
+                        screen_text_fb = await asyncio.wait_for(ocr_task, timeout=2.0)
+                    except Exception:
+                        screen_text_fb = ""
+                    if screen_text_fb:
+                        self.nexus.push("screen", screen_text_fb)
+                    self.generate_response(
+                        query,
+                        "screen_analysis",
+                        {"screen": screen_text_fb, "audio": audio_text},
+                    )
+                    return
             except Exception:
                 if request_epoch != self._generation_epoch:
                     return

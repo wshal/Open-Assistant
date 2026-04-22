@@ -6,6 +6,7 @@ import os
 import signal
 import argparse
 import traceback
+import warnings
 from pathlib import Path
 from dotenv import load_dotenv
 from PyQt6.QtWidgets import QApplication
@@ -57,6 +58,16 @@ def main():
     sys.excepthook = global_exception_handler
 
     logger.info("🚀 OpenAssist AI starting...")
+
+    # Suppress a noisy PyTorch warning from upstream libs when running on CPU:
+    # "pin_memory argument is set as true but no accelerator is found..."
+    # It is harmless (pinning just won't be used) and can confuse users.
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*pin_memory.*no accelerator is found.*",
+        category=UserWarning,
+        module=r"torch\\.utils\\.data\\.dataloader",
+    )
 
     try:
         # Initialize Qt Application FIRST
