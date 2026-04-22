@@ -320,6 +320,23 @@ class StandbyView(QWidget):
         layout.addWidget(self.model_bar)
         self.set_provider_statuses({})
 
+        layout.addSpacing(6)
+
+        # P2.4: Update available badge (shown only when a newer version is detected)
+        self._update_badge = QLabel()
+        self._update_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._update_badge.setStyleSheet(
+            "background: rgba(251,191,36,0.15); color: #fbbf24;"
+            " border: 1px solid rgba(251,191,36,0.4); border-radius: 10px;"
+            " font-size: 9px; font-weight: 800; letter-spacing: 1px; padding: 3px 10px;"
+        )
+        self._update_badge.setText("⬆ UPDATE AVAILABLE — github.com/OpenAssist")
+        self._update_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._update_badge.hide()
+        layout.addWidget(self._update_badge)
+        # Kick off background version check
+        QTimer.singleShot(3000, self._check_for_update)
+
         layout.addStretch(1)
 
         # ── Footer ───────────────────────────────────────────────────────────
@@ -372,6 +389,54 @@ class StandbyView(QWidget):
         line.setFixedHeight(1)
         line.setStyleSheet("background: rgba(255, 255, 255, 0.04);")
         return line
+
+    def _check_for_update(self):
+        """P2.4: Non-blocking GitHub releases check — shows badge if update available."""
+        import threading
+
+        def _fetch():
+            try:
+                import urllib.request, json as _json
+                REPO = "OpenAssist/OpenAssist"
+                url = f"https://api.github.com/repos/{REPO}/releases/latest"
+                req = urllib.request.Request(url, headers={"User-Agent": "OpenAssist-Updater/1.0"})
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    data = _json.loads(r.read())
+                latest_tag = data.get("tag_name", "").lstrip("v")
+                try:
+                    from core.version import __version__ as local_ver
+                except ImportError:
+                    local_ver = "0.0.0"
+
+                def _ver_tuple(v):
+                    try:
+                        return tuple(int(x) for x in str(v).split(".")[:3])
+                    except Exception:
+                        return (0, 0, 0)
+
+                if _ver_tuple(latest_tag) > _ver_tuple(local_ver):
+                    tag = data.get("tag_name", latest_tag)
+                    # Update badge text on main thread via QTimer trick
+                    QTimer.singleShot(0, lambda: self._show_update_badge(tag))
+            except Exception:
+                pass  # Non-fatal — silently ignore (offline, rate limit, etc.)
+
+        t = threading.Thread(target=_fetch, daemon=True, name="update-check")
+        t.start()
+
+    def _show_update_badge(self, tag: str):
+        """Show the update badge with the new version tag."""
+        self._update_badge.setText(f"⬆ UPDATE AVAILABLE  v{tag}  — click to visit releases")
+        self._update_badge.mousePressEvent = lambda e: self._open_releases()
+        self._update_badge.show()
+
+    def _open_releases(self):
+        try:
+            from PyQt6.QtGui import QDesktopServices
+            from PyQt6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl("https://github.com/OpenAssist/OpenAssist/releases"))
+        except Exception:
+            pass
 
     # ── Provider status bar ──────────────────────────────────────────────────
 

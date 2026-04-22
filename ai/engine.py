@@ -214,10 +214,24 @@ class AIEngine(QObject):
                         "request_metadata": request_metadata,
                     },
                 )
-                # Parallel mode returns a fully-materialized answer, so emit only completion.
-                # Streaming chunks after completion duplicates content in the UI layer.
-                self.response_complete.emit(full_response)
 
+                # P0.4 FIX: Emit chunks so the UI shows streaming feedback.
+                # Parallel returns a full string — stream it in word-level batches
+                # (~50 chars each) so append_response() fires and the user sees
+                # text appearing progressively rather than a blank-then-flash.
+                words = full_response.split(" ")
+                batch, batch_size = [], 50
+                for word in words:
+                    batch.append(word)
+                    chunk = " ".join(batch) + " "
+                    if len(chunk) >= batch_size:
+                        self.response_chunk.emit(chunk)
+                        batch = []
+                        await asyncio.sleep(0)  # yield to event loop between batches
+                if batch:
+                    self.response_chunk.emit(" ".join(batch))
+
+                self.response_complete.emit(full_response)
                 logger.info(f"Parallel AI: Response complete ({latency_ms:.0f}ms)")
                 return
             except Exception as e:
@@ -353,21 +367,58 @@ class AIEngine(QObject):
                 history=history_block,
             )
 
-            # 4. Streamed Generation
+            # 4. Streamed Generation — with provider fallback chain (P1.4)
+            # If the primary provider fails mid-stream, we transparently try the
+            # next available provider from the preferred list before giving up.
             full_response = ""
-            async for chunk in provider.generate_stream(sys_prompt, user_msg):
-                if self._is_cancelled:
-                    logger.warning("AI: Stream cancelled mid-token")
-                    return
+            providers_tried = [provider.name]
+            generation_succeeded = False
 
-                full_response += chunk
-                if not first_token_time:
-                    first_token_time = time.time()
-                    stage_timings["first_token_ms"] = (first_token_time - start_time) * 1000
-                    stage_timings["request_to_first_token_ms"] = (
-                        first_token_time - request_started_at
-                    ) * 1000
-                self.response_chunk.emit(chunk)
+            # Build a fallback queue: preferred list minus already-selected primary
+            fallback_queue = [
+                pid for pid in preferred_providers
+                if pid != provider.name
+                and pid in self._providers
+                and getattr(self._providers[pid], "enabled", False)
+            ]
+
+            current_provider = provider
+            while True:
+                try:
+                    async for chunk in current_provider.generate_stream(sys_prompt, user_msg):
+                        if self._is_cancelled:
+                            logger.warning("AI: Stream cancelled mid-token")
+                            return
+
+                        full_response += chunk
+                        if not first_token_time:
+                            first_token_time = time.time()
+                            stage_timings["first_token_ms"] = (first_token_time - start_time) * 1000
+                            stage_timings["request_to_first_token_ms"] = (
+                                first_token_time - request_started_at
+                            ) * 1000
+                        self.response_chunk.emit(chunk)
+                    generation_succeeded = True
+                    break  # Stream completed successfully
+
+                except Exception as stream_err:
+                    logger.warning(
+                        f"AI: Provider '{current_provider.name}' failed during stream "
+                        f"({stream_err}). Trying fallback..."
+                    )
+                    full_response = ""  # Discard any partial output
+
+                    if not fallback_queue:
+                        logger.error("AI: All providers exhausted — no response generated.")
+                        self.error_occurred.emit(
+                            f"All providers failed. Last error: {stream_err}"
+                        )
+                        return
+
+                    next_id = fallback_queue.pop(0)
+                    current_provider = self._providers[next_id]
+                    providers_tried.append(next_id)
+                    logger.info(f"AI: Falling back to '{next_id}'")
 
             # 5. Finalize
             if not self._is_cancelled:
@@ -375,7 +426,7 @@ class AIEngine(QObject):
                 self.history.add(
                     query,
                     full_response,
-                    provider=provider.name,
+                    provider=current_provider.name,  # actual provider that served the response
                     mode=mode_id,
                     latency=latency_ms,
                     metadata={
@@ -384,6 +435,11 @@ class AIEngine(QObject):
                             "request_to_complete_ms": (time.time() - request_started_at) * 1000,
                         },
                         "request_metadata": request_metadata,
+                        "providers_tried": providers_tried,
+                        # P2.7: Provenance flags — which context sources contributed
+                        "had_screen": bool((nexus_snapshot or {}).get("latest_ocr", "").strip()),
+                        "had_audio": bool((nexus_snapshot or {}).get("full_audio_history", "").strip()),
+                        "had_rag": bool(rag_context.strip()) if rag_context else False,
                     }
                 )
                 self.response_complete.emit(full_response)

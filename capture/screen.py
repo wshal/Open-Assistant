@@ -30,10 +30,12 @@ class ScreenCapture(QObject):
         self._debounce = config.get("performance.debounce_ms", 400) / 1000.0
         self._threshold = config.get("capture.screen.change_threshold", 0.15)
 
-        # Image quality affects capture resolution
+        # Image quality affects capture resolution AND JPEG compression (P2.2)
         quality = config.get("capture.screen.quality", "medium")
         quality_widths = {"low": 1024, "medium": 1920, "high": 2560}
+        quality_jpeg = {"low": 40, "medium": 72, "high": 95}
         self._max_w = quality_widths.get(quality, 1920)
+        self._jpeg_quality = quality_jpeg.get(quality, 72)
 
         self._smart_crop_enabled = config.get("capture.screen.smart_crop", True)
         self._enabled = config.get("capture.screen.enabled", True)
@@ -138,7 +140,7 @@ class ScreenCapture(QObject):
         return buf.getvalue(), text or ""
 
     async def capture_image_bytes(self) -> bytes:
-        """Capture one screenshot as PNG bytes without waiting for OCR."""
+        """Capture one screenshot as JPEG bytes (quality-tiered per config) without OCR."""
         if not self._enabled:
             return b""
 
@@ -147,7 +149,8 @@ class ScreenCapture(QObject):
             return b""
 
         buf = io.BytesIO()
-        img.save(buf, format="PNG")
+        # P2.2: Use JPEG with quality tier for faster network transfer and less memory
+        img.convert("RGB").save(buf, format="JPEG", quality=self._jpeg_quality)
         return buf.getvalue()
 
     async def extract_text_from_image_bytes(self, image_bytes: bytes) -> str:

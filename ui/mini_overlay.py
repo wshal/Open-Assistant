@@ -26,6 +26,10 @@ class MiniOverlay(QMainWindow):
     HEADER_HEIGHT = 48
     MAX_WINDOW_HEIGHT = 360
     MIN_VISIBLE_RESPONSE_ROWS = 10
+    # P2.6: Nano mode dimensions
+    NANO_WIDTH = 200
+    NANO_HEIGHT = 36
+    FULL_WIDTH = 280
 
     user_query = pyqtSignal(str)
 
@@ -37,6 +41,7 @@ class MiniOverlay(QMainWindow):
         self._raw_buffer = ""
         self._drag = False
         self._expanded = False
+        self._nano_mode = False  # P2.6: ultra-compact nano state
 
         # NEURAL UX: Gaze-based transparency
         self._gaze_timer = QTimer(self)
@@ -93,6 +98,9 @@ class MiniOverlay(QMainWindow):
 
         self.mode_icon = QLabel("🧠")
         self.mode_icon.setStyleSheet("font-size: 15px;")
+        self.mode_icon.setToolTip("Double-click for nano/compact mode")
+        self.mode_icon.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mode_icon.mouseDoubleClickEvent = lambda e: self._toggle_nano_mode()
         bl.addWidget(self.mode_icon)
 
         self.input = QLineEdit()
@@ -106,6 +114,20 @@ class MiniOverlay(QMainWindow):
         self.dot = QLabel("●")
         self.dot.setStyleSheet("color: #4ade80; font-size: 10px;")
         bl.addWidget(self.dot)
+
+        # P1.1: Type response button — injects the last AI answer into the focused window
+        self.type_btn = QPushButton("⌨")
+        self.type_btn.setFixedSize(22, 22)
+        self.type_btn.setToolTip("Type last response into active window")
+        self.type_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.type_btn.setStyleSheet(
+            "background: rgba(80,200,120,0.12); color: #4ade80; border: none;"
+            " border-radius: 11px; font-size: 11px;"
+            " QPushButton:hover { background: rgba(80,200,120,0.25); }"
+        )
+        self.type_btn.clicked.connect(self._type_response)
+        self.type_btn.setVisible(False)  # only shown once a response exists
+        bl.addWidget(self.type_btn)
 
         self.expand_btn = QPushButton("▲")
         self.expand_btn.setFixedSize(22, 22)
@@ -199,6 +221,11 @@ class MiniOverlay(QMainWindow):
         self._raw_buffer = full_text or ""
         self._render_markdown_now()
         self.set_ready()
+        # P1.1: Show type button once there's a response to inject
+        if full_text and full_text.strip():
+            self.type_btn.setVisible(True)
+        else:
+            self.type_btn.setVisible(False)
 
     def set_response(self, text: str):
         self._raw_buffer = text or ""
@@ -283,6 +310,67 @@ class MiniOverlay(QMainWindow):
         super().showEvent(e)
         if hasattr(self.app, "_apply_window_effects"):
             self.app._apply_window_effects(self)
+        # P1.6: Resume gaze timer when the overlay becomes visible
+        self._gaze_timer.start(100)
+
+    def hideEvent(self, e):
+        # P1.6: Pause gaze polling while hidden — avoids 100ms busy-loop when invisible
+        self._gaze_timer.stop()
+        super().hideEvent(e)
+
+    def _type_response(self):
+        """P1.1: Inject the last AI response into the focused window via the app simulator."""
+        if hasattr(self.app, "type_response") and callable(self.app.type_response):
+            self.app.type_response()
+        else:
+            logger.warning("MiniOverlay: app.type_response() not available")
+
+    def _toggle_nano_mode(self):
+        """P2.6: Toggle ultra-compact nano mode (200×36) ↔ full mini mode (280×48)."""
+        self._nano_mode = not self._nano_mode
+        if self._nano_mode:
+            # Collapse to nano — hide most controls, show icon + response preview
+            self.input.hide()
+            self.type_btn.hide()
+            self.expand_btn.hide()
+            self.dot.hide()
+            if self._expanded:
+                self._toggle_expand(False)
+            # Show a compact text preview in the mode icon slot
+            preview = (self._raw_buffer[:35] + "…") if self._raw_buffer else "Ready"
+            self.mode_icon.setToolTip(self._raw_buffer)
+            self.bar.setStyleSheet(
+                "background: rgba(20,20,35,220); border: 1px solid rgba(80,80,150,60);"
+                " border-radius: 18px;"
+            )
+            self.setFixedSize(self.NANO_WIDTH, self.NANO_HEIGHT)
+        else:
+            # Restore full mini mode
+            self.input.show()
+            self.expand_btn.show()
+            self.dot.show()
+            if self._raw_buffer:
+                self.type_btn.show()
+            self.mode_icon.setToolTip("Double-click for nano/compact mode")
+            self.bar.setStyleSheet(
+                "background: rgba(20,20,35,250); border: 1px solid rgba(80,80,150,80);"
+                " border-radius: 24px;"
+            )
+            self.setFixedWidth(self.FULL_WIDTH)
+            self.setFixedHeight(self.COLLAPSED_HEIGHT)
+
+    def show_error(self, err: str):
+        """P1.10: Surface provider errors as a visible red toast in the mini overlay."""
+        self.set_error()
+        self._raw_buffer = ""
+        self.response_area.setHtml(
+            f"<div style='color:#ef4444; font-size:11px; padding:4px;'>❌ {err}</div>"
+        )
+        self._toggle_expand(True)
+        # Auto-dismiss after 6 seconds
+        QTimer.singleShot(6000, lambda: (
+            self.response_area.clear() if not self._raw_buffer else None
+        ))
 
     def scroll_up(self):
         sb = self.response_area.verticalScrollBar()
@@ -313,7 +401,7 @@ class MiniOverlay(QMainWindow):
         Can be disabled via config 'app.gaze_fade.enabled'.
         """
         # Check if gaze fade is enabled in config
-        if not self.config.get("app.gaze_fade.enabled", False):
+        if not self.config.get("app.gaze_fade.enabled", True):  # P1.2: default ON
             return
 
         if getattr(self.app.state, "is_stealth", False):

@@ -186,7 +186,10 @@ class AIEngineParallelOrderingTests(unittest.TestCase):
         )
 
         self.assertEqual(errors, [])
-        self.assertEqual(chunks, [])
+        # P0.4 FIX: Parallel path now emits chunks for streaming UI feedback.
+        # The full response is streamed word-by-word before response_complete fires.
+        self.assertTrue(len(chunks) > 0, "Expected chunks to be emitted in parallel mode")
+        self.assertEqual("".join(chunks).strip(), "parallel answer")
         self.assertEqual(completed, ["parallel answer"])
         self.assertEqual(history.entries[-1]["provider"], "parallel")
 

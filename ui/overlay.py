@@ -1,7 +1,8 @@
 """
-Main overlay window — v4.1 (Layer 4 Hardened).
+Main overlay window - v4.1 (Layer 4 Hardened).
 RESTORED: Markdown Render Debounce (150ms) and Manual Scroll Lock.
 FIXED: Connection of transcript and audio-status bridges.
+P0.1 FIX: Removed duplicate CRLF class definition artifact.
 """
 
 import time
@@ -25,26 +26,7 @@ from ui.standby_view import StandbyView
 from ui.settings_view import SettingsView
 from ui.history_feed import HistoryFeedView
 from ui.onboarding_wizard import OnboardingWizard
-from utils.logger import setup_logger
-
-logger = setup_logger(__name__)
-
-
-class OverlayWindow(QMainWindow):
-    user_query = pyqtSignal(str)
-
-    def __init__(self, config, app):
-        super().__init__()
-        self.config = config
-        self.app = app
-        self._drag = False
-        self._drag_pos = QPoint()
-        self._current_query = ""
-from ui.markdown_renderer import MarkdownRenderer
-from ui.standby_view import StandbyView
-from ui.settings_view import SettingsView
-from ui.history_feed import HistoryFeedView
-from ui.onboarding_wizard import OnboardingWizard
+from ui.nexus_timeline import NexusTimelineView  # P2.9
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -273,6 +255,18 @@ class OverlayWindow(QMainWindow):
         self.btn_history.clicked.connect(self._show_history)
         hl.addWidget(self.btn_history)
 
+        # P2.9: Timeline button
+        self.btn_timeline = QPushButton("⏱")
+        self.btn_timeline.setToolTip("Context Timeline — see what the AI saw")
+        self.btn_timeline.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_timeline.setFixedSize(24, 24)
+        self.btn_timeline.setStyleSheet("""
+            QPushButton { background: rgba(255,255,255,0.05); color: #aaa; border: none; border-radius: 12px; font-size: 13px; }
+            QPushButton:hover { background: rgba(255,255,255,0.10); color: #c0c0ff; }
+        """)
+        self.btn_timeline.clicked.connect(self._show_timeline)
+        hl.addWidget(self.btn_timeline)
+
         self._status_snapshot = ""
 
         btn_set = QPushButton("⚙️")
@@ -395,6 +389,10 @@ class OverlayWindow(QMainWindow):
         self.onboarding_wizard.finished.connect(self._on_onboarding_finished)
         self.onboarding_wizard.skipped.connect(self._on_onboarding_skipped)
         self.stack.addWidget(self.onboarding_wizard)
+
+        # P2.9: Context Timeline (last in stack)
+        self.timeline_view = NexusTimelineView(self.app.nexus, self)
+        self.stack.addWidget(self.timeline_view)
 
     def _on_scroll_changed(self, value):
         sb = self.response_area.verticalScrollBar()
@@ -542,6 +540,35 @@ class OverlayWindow(QMainWindow):
             f"color: {colour}; font-size: 10px; font-style: {'italic' if italic else 'normal'};"
         )
 
+    def show_error_toast(self, message: str, duration_ms: int = 6000):
+        """P1.10: Surface AI/provider errors as a dismissible red toast above the transcript.
+
+        Auto-dismisses after `duration_ms`. If called again before dismiss,
+        the timer resets so the latest error always gets full visibility.
+        """
+        if not hasattr(self, "_error_toast"):
+            # Create the toast label once and reuse it
+            self._error_toast = QLabel(self.container)
+            self._error_toast.setWordWrap(True)
+            self._error_toast.setStyleSheet(
+                "background: rgba(239,68,68,0.18); color: #ef4444;"
+                " border: 1px solid rgba(239,68,68,0.5); border-radius: 8px;"
+                " padding: 6px 10px; font-size: 10px;"
+            )
+            self._error_toast.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._error_toast.hide()
+            self._error_toast_timer = QTimer(self)
+            self._error_toast_timer.setSingleShot(True)
+            self._error_toast_timer.timeout.connect(self._error_toast.hide)
+
+        self._error_toast.setText(f"⚠ {message}")
+        # Position above the transcript area — top of the chat view
+        self._error_toast.setFixedWidth(self.width() - 24)
+        self._error_toast.move(12, 48)
+        self._error_toast.raise_()
+        self._error_toast.show()
+        self._error_toast_timer.start(duration_ms)
+
     def set_analysis_provider_badge(self, provider: str = None, pending: bool = False):
         if pending:
             self._start_analyze_button_animation()
@@ -609,6 +636,19 @@ class OverlayWindow(QMainWindow):
         self._prev_stack_widget = self.stack.currentWidget()
         self.show_history_view()
 
+    def _show_timeline(self):
+        """P2.9: Show/hide the context timeline view."""
+        if self.stack.currentWidget() is self.timeline_view:
+            # Navigating away — pause the timer to save CPU
+            self.timeline_view.deactivate()
+            self.show_standby_view()
+            return
+        self._prev_stack_index = self.stack.currentIndex()
+        self._prev_stack_widget = self.stack.currentWidget()
+        self.timeline_view.activate()
+        self.timeline_view.resume()
+        self.stack.setCurrentWidget(self.timeline_view)
+
     def _show_settings(self):
         """Show settings and remember where we came from."""
         if self.stack.currentWidget() is self.settings_view:
@@ -619,7 +659,11 @@ class OverlayWindow(QMainWindow):
         self.show_settings_view()
 
     def _on_settings_closed(self):
-        """Return to previous view."""
+        """Return to previous view and push any live config changes to running subsystems."""
+        # P1.7: Push new screen capture interval to running ScreenCapture live
+        if hasattr(self.app, "screen") and hasattr(self.app.screen, "_debounce"):
+            new_interval = self.app.config.get("capture.screen.interval_ms", 500) / 1000.0
+            self.app.screen._debounce = new_interval
         self.refresh_standby_state()
         if self._prev_stack_widget is not None:
             self.stack.setCurrentWidget(self._prev_stack_widget)

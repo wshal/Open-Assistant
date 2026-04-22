@@ -113,9 +113,10 @@ class OpenAssistApp(QObject):
         self._nexus_timer.start(3000)
 
         # Keep the active HUD window pinned above other apps even after focus churn.
+        # P2.10: Timer is started only when a session is ACTIVE to reduce unnecessary Win32 calls.
         self._topmost_timer = QTimer(self)
         self._topmost_timer.timeout.connect(self._refresh_topmost_window)
-        self._topmost_timer.start(1500)
+        # Do NOT start here — started in start_session(), stopped in end_session()
 
     def _run_master_loop(self):
         asyncio.set_event_loop(self.loop)
@@ -230,11 +231,17 @@ class OpenAssistApp(QObject):
                 self.overlay.set_analysis_provider_badge()
             self._screen_analysis_pending = False
         else:
-            # Reset transcript label on error too
+            # Reset transcript label on error
             self.overlay.update_transcript(
                 "🟡 Error — Listening..." if getattr(self, "session_active", False) else "Ready...",
                 state="error" if getattr(self, "session_active", False) else "idle",
             )
+
+        # P1.10: Surface the error as a visible toast so the user knows what failed
+        if hasattr(self.overlay, "show_error_toast"):
+            # Trim long stack traces to a readable one-liner
+            short = error_text.split("\n")[0][:120]
+            self.overlay.show_error_toast(short)
 
     def _on_audio_source_ui_change(self, source):
         self.state.audio_source = source
@@ -544,6 +551,9 @@ class OpenAssistApp(QObject):
         logger.debug("👻 HUD Hidden via toggle.")
 
     def quick_answer(self):
+        # P0.2: Never fire outside an active session — no context, no UI target
+        if not self.session_active:
+            return
         if not self._ai_lock_ready.wait(timeout=2):
             return
 
@@ -650,9 +660,10 @@ class OpenAssistApp(QObject):
     def switch_mode(self, mode: str = None):
         if not mode:
             modes = ["general", "interview", "coding", "meeting", "exam", "writing"]
-            mode = modes[
-                (modes.index(self.config.get("ai.mode", "general")) + 1) % len(modes)
-            ]
+            # P0.3: Safe cycler — fall back to 'general' if config holds an unknown mode
+            current = self.config.get("ai.mode", "general")
+            current = current if current in modes else "general"
+            mode = modes[(modes.index(current) + 1) % len(modes)]
         self.state.mode = mode
         self.overlay.update_mode(mode)
         self.mini_overlay.update_mode(mode)
@@ -900,6 +911,8 @@ class OpenAssistApp(QObject):
         m = self.config.get("ai.mode", "general")
         self.overlay.update_mode(m)
         self.mini_overlay.update_mode(m)
+        # P2.10: Pin-to-top is only needed during an active session
+        self._topmost_timer.start(1500)
         logger.info("🚀 New Session Started — slate is clean.")
 
     def end_session(self):
@@ -913,6 +926,9 @@ class OpenAssistApp(QObject):
         self.nexus.clear()
         self.audio.clear()
         self._last_query = ""
+
+        # P0.5: Reset auto-suggest flag so next session can freely pick presets
+        self._context_auto_suggested = False
 
         # Archive the current session so next start_new_session() begins with a blank slate.
         # This also clears in-memory entries so the history block injected into prompts
@@ -952,8 +968,16 @@ class OpenAssistApp(QObject):
         self.overlay.on_complete("", "")
         if hasattr(self.overlay, "set_analysis_provider_badge"):
             self.overlay.set_analysis_provider_badge()
+
+        # P0.6: Clear the context chip — stale chip from previous session would be misleading
+        standby = getattr(self.overlay, "standby_view", None)
+        if standby and hasattr(standby, "show_context_chip"):
+            standby.show_context_chip(None)
+
         self.mini_overlay.on_complete("", "")
         self.mini_overlay.set_ready()
+        # P2.10: Stop pinning to top while on standby — no need to fight the OS scheduler
+        self._topmost_timer.stop()
         logger.info("🛑 Session Ended — history archived, slate wiped.")
 
     def set_current_mode(self, name):
@@ -1025,9 +1049,16 @@ class OpenAssistApp(QObject):
                 self.loop,
             )
 
-        q = self.ai.detector.detect(t)
-        if q:
-            self.generate_response(q, "speech", {"audio": t})
+        q = self.ai.detector.detect_with_confidence(t, source="audio")
+        if q.triggered:
+            if q.should_auto_respond():
+                self.generate_response(q.detected_text, "speech", {"audio": t})
+            else:
+                # P2.1: Low-confidence — surface hint without auto-firing
+                self.overlay.update_transcript(
+                    f"🤔 Possible question detected (tap ⎨ to answer)",
+                    state="processing",
+                )
 
     def _on_screen_text(self, t):
         if not self.session_active:
@@ -1045,9 +1076,16 @@ class OpenAssistApp(QObject):
                 self.loop,
             )
 
-        q = self.ai.detector.detect(t)
-        if q:
-            self.generate_response(q, "auto", {"screen": t})
+        q = self.ai.detector.detect_with_confidence(t, source="screen")
+        if q.triggered:
+            if q.should_auto_respond():
+                self.generate_response(q.detected_text, "auto", {"screen": t})
+            else:
+                # P2.1: Low-confidence screen detection — show hint, do not auto-answer
+                self.overlay.update_transcript(
+                    "🤔 Possible cue on screen (tap ⎨ to answer)",
+                    state="processing",
+                )
 
     def _background_warmup(self):
         """Two-tier parallelized warmup — fast startup by separating critical from deferred.

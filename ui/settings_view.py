@@ -710,6 +710,65 @@ class SettingsView(QWidget):
         sep.setFixedHeight(1)
         sep.setStyleSheet("background: rgba(255,255,255,0.05);")
         l.addWidget(sep)
+
+        # P2.3: Transcription Language Selector
+        lbl_lang = self._make_section_label("TRANSCRIPTION LANGUAGE")
+        l.addWidget(lbl_lang)
+        self.audio_language = QComboBox()
+        self.audio_language.addItems([
+            "Auto-detect",
+            "English (en)",
+            "Hindi (hi)",
+            "Spanish (es)",
+            "French (fr)",
+            "German (de)",
+            "Japanese (ja)",
+            "Chinese (zh)",
+            "Portuguese (pt)",
+            "Arabic (ar)",
+            "Russian (ru)",
+        ])
+        lang_map = {
+            "": 0, "auto": 0, "en": 1, "hi": 2, "es": 3,
+            "fr": 4, "de": 5, "ja": 6, "zh": 7, "pt": 8, "ar": 9, "ru": 10
+        }
+        saved_lang = self.config.get("capture.audio.language", "")
+        self.audio_language.setCurrentIndex(lang_map.get(saved_lang, 0))
+        self._style_combo(self.audio_language)
+        l.addWidget(self.audio_language)
+        lang_desc = QLabel("Language hint for the transcription engine. Auto-detect works well for most cases.")
+        lang_desc.setWordWrap(True)
+        lang_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+        l.addWidget(lang_desc)
+
+        sep2 = QFrame()
+        sep2.setFixedHeight(1)
+        sep2.setStyleSheet("background: rgba(255,255,255,0.05);")
+        l.addWidget(sep2)
+
+        # P2.8: ASR Correction Provider Selector
+        lbl_corr = self._make_section_label("TRANSCRIPT CORRECTION PROVIDER")
+        l.addWidget(lbl_corr)
+        self.correction_provider = QComboBox()
+        self.correction_provider.addItems(["Auto (Fastest Available)", "groq", "gemini", "cerebras", "together", "ollama"])
+        cp_map = {"auto": 0, "groq": 1, "gemini": 2, "cerebras": 3, "together": 4, "ollama": 5}
+        saved_cp = self.config.get("capture.audio.correction_provider", "groq")
+        self.correction_provider.setCurrentIndex(cp_map.get(saved_cp, 1))
+        self._style_combo(self.correction_provider)
+        l.addWidget(self.correction_provider)
+        corr_desc = QLabel(
+            "Provider used to fix ASR typos in transcripts. Kept separate from your main AI so typo correction "
+            "doesn't burn quota on the primary model."
+        )
+        corr_desc.setWordWrap(True)
+        corr_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+        l.addWidget(corr_desc)
+
+        sep3 = QFrame()
+        sep3.setFixedHeight(1)
+        sep3.setStyleSheet("background: rgba(255,255,255,0.05);")
+        l.addWidget(sep3)
+
         lbl2 = self._make_section_label("VISION ENGINE")
         l.addWidget(lbl2)
         self.chk_smart = PremiumCheckBox("Enable Contextual Smart-Crop")
@@ -934,7 +993,7 @@ class SettingsView(QWidget):
         l.addWidget(lbl_gaze)
 
         self.chk_gaze = PremiumCheckBox("Enable gaze-based window fading")
-        self.chk_gaze.setChecked(self.config.get("app.gaze_fade.enabled", False))
+        self.chk_gaze.setChecked(self.config.get("app.gaze_fade.enabled", True))  # P1.2: default ON
         l.addWidget(self.chk_gaze)
         desc_gaze = QLabel(
             "When enabled, the window will fade to low opacity when your mouse is near it. "
@@ -1450,6 +1509,18 @@ class SettingsView(QWidget):
                     "capture.screen.interval_ms",
                     interval_values[self.screenshot_interval.currentIndex()],
                 )
+
+            # P2.3: Save transcription language
+            if hasattr(self, "audio_language"):
+                lang_codes = ["", "en", "hi", "es", "fr", "de", "ja", "zh", "pt", "ar", "ru"]
+                idx = self.audio_language.currentIndex()
+                self.config.set("capture.audio.language", lang_codes[idx] if idx < len(lang_codes) else "")
+
+            # P2.8: Save correction provider
+            if hasattr(self, "correction_provider"):
+                cp_values = ["auto", "groq", "gemini", "cerebras", "together", "ollama"]
+                idx = self.correction_provider.currentIndex()
+                self.config.set("capture.audio.correction_provider", cp_values[idx] if idx < len(cp_values) else "groq")
 
             # Save image quality
             if hasattr(self, "image_quality"):

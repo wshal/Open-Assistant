@@ -50,6 +50,8 @@ class AudioCapture(QObject):
 
         self.model = None
         self._model_name = config.get("capture.audio.whisper_model", "tiny")
+        # P2.3: Language hint for Faster Whisper (empty string = auto-detect)
+        self._language = config.get("capture.audio.language", "") or None
         self._model_loaded = False
         self._model_lock = threading.Lock()
         self._current_rms = 0.0
@@ -393,7 +395,8 @@ class AudioCapture(QObject):
         transcribe_started_at = time.time()
         try:
             audio = np.concatenate(buffer, axis=0).flatten()
-            segments, _ = self.model.transcribe(audio, language="en")
+            # P2.3: Use configured language hint; None = Whisper auto-detects
+            segments, _ = self.model.transcribe(audio, language=self._language)
             text = " ".join(
                 [s.text.strip() for s in segments if not self._is_hall(s.text)]
             )

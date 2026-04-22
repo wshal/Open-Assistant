@@ -351,6 +351,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         app = self._build_app()
         app._ai_lock_ready = SimpleNamespace(wait=lambda timeout=2: True)
         app.loop = object()
+        app.session_active = True  # P0.2: guard requires active session
         app.nexus = SimpleNamespace(
             get_snapshot=lambda: {
                 "recent_audio": "latest meeting question",
@@ -392,6 +393,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         app = self._build_app()
         app._ai_lock_ready = SimpleNamespace(wait=lambda timeout=2: True)
         app.loop = object()
+        app.session_active = True  # P0.2: guard requires active session
         app.nexus = SimpleNamespace(
             get_snapshot=lambda: {
                 "recent_audio": "",
