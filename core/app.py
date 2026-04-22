@@ -616,7 +616,7 @@ class OpenAssistApp(QObject):
         async def _capture_and_analyze():
             if request_epoch != self._generation_epoch:
                 return
-            image_bytes = await self.screen.capture_image_bytes()
+            image_bytes = await self.screen.capture_image_bytes(for_analysis=True)
             if request_epoch != self._generation_epoch:
                 return
             if not image_bytes:
@@ -628,29 +628,88 @@ class OpenAssistApp(QObject):
 
             audio_text = self.audio.get_transcript()
             snapshot = self.nexus.get_snapshot()
-            ocr_task = asyncio.create_task(
-                self.screen.extract_text_from_image_bytes(image_bytes)
-            )
+            ocr_task = asyncio.create_task(self.screen.extract_text_from_image_bytes(image_bytes))
             try:
-                screen_text = snapshot.get("latest_ocr", "")
+                # Prefer OCR extracted from the *same* screenshot so "Analyze Screen"
+                # is task-directed even when the periodic OCR loop is idle.
+                try:
+                    ocr_text = await asyncio.wait_for(ocr_task, timeout=3.0)
+                except Exception:
+                    ocr_text = ""
+
+                screen_text = ocr_text or snapshot.get("latest_ocr", "") or ""
+
+                # Task-first analysis: extract the most actionable on-screen prompt
+                # (ignore chrome UI, URLs, weather, etc.) and answer that directly.
+                def _extract_task(text: str) -> str:
+                    import re
+
+                    if not text:
+                        return ""
+                    lines = [l.strip() for l in text.splitlines() if l and l.strip()]
+                    # Drop obvious noise
+                    cleaned = []
+                    for l in lines:
+                        ll = l.lower()
+                        if "http" in ll or "www." in ll:
+                            continue
+                        if ll.startswith(("chrome", "edge", "firefox")):
+                            continue
+                        cleaned.append(l)
+                    if not cleaned:
+                        cleaned = lines
+
+                    # Prefer explicit "build/implement" style prompts
+                    for l in cleaned:
+                        if re.search(r"\b(build|implement|create|design|write)\b", l.lower()):
+                            return l
+
+                    # Next: a numbered title followed by a description
+                    for i, l in enumerate(cleaned[:-1]):
+                        if re.match(r"^\d+\.\s+\S+", l):
+                            nxt = cleaned[i + 1]
+                            if len(nxt.split()) >= 5:
+                                return nxt
+
+                    # Fallback: the longest non-noise line (often the prompt)
+                    return max(cleaned, key=lambda s: len(s), default="")
+
+                task = _extract_task(screen_text)
+                if task:
+                    query = (
+                        "Complete the on-screen task.\n\n"
+                        f"Task: {task}\n\n"
+                        "If this is a coding/UI task, include a minimal working implementation (code) and brief notes."
+                    )
+                else:
+                    query = (
+                        "Identify the single most important task from the screenshot "
+                        "(ignore URLs, browser chrome, and unrelated UI), then complete it. "
+                        "If it is a coding/UI task, include code."
+                    )
+
                 await self.ai.analyze_image_response(
-                    "Analyze the current screen and answer using the visible content, recent audio, and live session context.",
+                    query,
                     image_bytes,
                     snapshot,
                     screen_context=screen_text,
                     audio_context=audio_text,
                 )
-                latest_ocr = await ocr_task
+                latest_ocr = ocr_text
                 if latest_ocr and request_epoch == self._generation_epoch:
                     self.nexus.push("screen", latest_ocr)
             except Exception:
                 if request_epoch != self._generation_epoch:
                     return
-                screen_text = await ocr_task
+                # Never await OCR unbounded here — EasyOCR on CPU can take minutes.
+                try:
+                    screen_text = await asyncio.wait_for(ocr_task, timeout=2.0)
+                except Exception:
+                    screen_text = ""
                 if screen_text:
                     self.nexus.push("screen", screen_text)
                 self.generate_response(
-                    "Analyze the current screen and answer using the visible content, recent audio, and live session context.",
+                    query if "query" in locals() else "Analyze the current screen and answer using the visible content and live session context.",
                     "screen_analysis",
                     {"screen": screen_text, "audio": audio_text},
                 )

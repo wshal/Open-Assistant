@@ -87,16 +87,19 @@ class ProviderTestWorker(QThread):
 
     result_ready = pyqtSignal(str, bool, str, object)
 
-    def __init__(self, provider_id, config, parent=None):
+    def __init__(self, provider_id, config, parent=None, key_override: str = ""):
         super().__init__(parent)
         self.provider_id = provider_id
         self.config = config
+        self.key_override = (key_override or "").strip()
 
     def run(self):
         import asyncio
         import aiohttp
 
-        key = self.config.get_api_key(self.provider_id)
+        # Prefer the in-UI key (what the user just typed) so TEST works even
+        # before "APPLY SETTINGS" persists into encrypted storage.
+        key = self.key_override or self.config.get_api_key(self.provider_id)
         if self.provider_id == "ollama":
             endpoint = (
                 self.config.get("ai.providers.ollama.endpoint")
@@ -173,7 +176,9 @@ class ProviderTestWorker(QThread):
                 },
             ),
             "gemini": (
-                f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={key}",
+                # v1beta is the current Gemini API surface for model operations.
+                # Using Flash keeps TEST fast and typically within free-tier limits.
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}",
                 {"contents": [{"parts": [{"text": "Hi"}]}]},
             ),
             "cerebras": (
@@ -192,6 +197,30 @@ class ProviderTestWorker(QThread):
                     "max_tokens": 5,
                 },
             ),
+            "openai": (
+                "https://api.openai.com/v1/chat/completions",
+                {
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 5,
+                },
+            ),
+            "anthropic": (
+                "https://api.anthropic.com/v1/messages",
+                {
+                    "model": "claude-3-haiku-20240307",
+                    "max_tokens": 5,
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}],
+                },
+            ),
+            "mistral": (
+                "https://api.mistral.ai/v1/chat/completions",
+                {
+                    "model": "mistral-tiny",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 5,
+                },
+            ),
         }
 
         if self.provider_id not in endpoints:
@@ -203,66 +232,65 @@ class ProviderTestWorker(QThread):
         url, payload = endpoints[self.provider_id]
         headers = {"Content-Type": "application/json"}
 
-        # Add auth header for most providers
-        headers["Authorization"] = f"Bearer {key}"
+        # Configure provider-specific authentication headers
+        if self.provider_id == "gemini":
+            pass  # Key is already in the URL
+        elif self.provider_id == "anthropic":
+            headers["x-api-key"] = key
+            headers["anthropic-version"] = "2023-06-01"
+        else:
+            headers["Authorization"] = f"Bearer {key}"
+
+        async def _post_json():
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    status = resp.status
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = {"raw": (await resp.text())[:200]}
+                    return status, data
 
         try:
-            if self.provider_id == "gemini":
+            status, result = asyncio.run(_post_json())
+            if status >= 400:
+                msg = None
+                if isinstance(result, dict):
+                    err = result.get("error")
+                    if isinstance(err, dict):
+                        msg = err.get("message")
+                msg = msg or (result.get("raw") if isinstance(result, dict) else None) or "API Error"
+                self.result_ready.emit(self.provider_id, False, f"HTTP {status}: {msg}"[:120], result)
+                return
 
-                async def test_gemini():
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(
-                            url,
-                            json=payload,
-                            headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=10),
-                        ) as resp:
-                            return await resp.json()
+            if isinstance(result, dict) and "error" in result:
+                self.result_ready.emit(
+                    self.provider_id,
+                    False,
+                    (result["error"].get("message", "API Error") if isinstance(result.get("error"), dict) else "API Error"),
+                    result,
+                )
+                return
 
-                result = asyncio.run(test_gemini())
-                if "error" in result:
-                    self.result_ready.emit(
-                        self.provider_id,
-                        False,
-                        result["error"].get("message", "API Error"),
-                        None,
-                    )
-                else:
-                    self.result_ready.emit(
-                        self.provider_id, True, "Connected", None
-                    )
+            # Heuristic: success for OpenAI-style APIs returns choices/output; Gemini returns candidates.
+            if isinstance(result, dict) and (
+                "choices" in result
+                or "output" in result
+                or "candidates" in result
+                or "contents" in result
+            ):
+                self.result_ready.emit(self.provider_id, True, "Connected", result)
             else:
-
-                async def test_api():
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(
-                            url,
-                            json=payload,
-                            headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=10),
-                        ) as resp:
-                            return await resp.json()
-
-                result = asyncio.run(test_api())
-                if "error" in result:
-                    self.result_ready.emit(
-                        self.provider_id,
-                        False,
-                        result["error"].get("message", "API Error"),
-                        None,
-                    )
-                elif "choices" in result or "output" in result:
-                    self.result_ready.emit(
-                        self.provider_id, True, "Connected", None
-                    )
-                else:
-                    self.result_ready.emit(
-                        self.provider_id, False, "Unexpected response", None
-                    )
+                self.result_ready.emit(self.provider_id, True, "Connected (unexpected payload)", result)
         except asyncio.TimeoutError:
             self.result_ready.emit(self.provider_id, False, "Timeout", None)
         except Exception as e:
-            self.result_ready.emit(self.provider_id, False, str(e)[:30], None)
+            self.result_ready.emit(self.provider_id, False, str(e)[:120], None)
 
 
 class SettingsView(QWidget):
@@ -433,6 +461,9 @@ class SettingsView(QWidget):
             ("gemini", "🧠 Google Gemini"),
             ("cerebras", "⚡ Cerebras AI"),
             ("together", "🎭 Together AI"),
+            ("openai", "🟢 OpenAI"),
+            ("anthropic", "🟣 Anthropic"),
+            ("mistral", "🌬️ Mistral AI"),
             ("ollama", "🏠 Local Ollama"),
         ]
         for pid, name in providers:
@@ -513,6 +544,12 @@ class SettingsView(QWidget):
                 inp.setText(self.config.get_api_key(pid) or "")
                 self.api_inputs[pid] = inp
                 bl.addWidget(inp)
+
+                detail = QLabel("Not tested")
+                detail.setWordWrap(True)
+                detail.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+                self.provider_detail_labels[pid] = detail
+                bl.addWidget(detail)
             else:
                 desc = QLabel("Local Engine (No API Key Required)")
                 desc.setStyleSheet(f"color: #64748b; font-size: 10px; font-style: italic; background: transparent;")
@@ -799,6 +836,44 @@ class SettingsView(QWidget):
             f"{TEXT_MUTED} font-size: 10px; background: transparent;"
         )
         l.addWidget(paid_fallback_desc)
+
+        # Vision Priority + Race Mode
+        lbl_vprio = self._make_section_label("VISION PRIORITY (LOW LATENCY)")
+        l.addWidget(lbl_vprio)
+
+        self.vision_primary = QComboBox()
+        self.vision_secondary = QComboBox()
+        vision_options = ["gemini", "ollama", "openai"]
+        self.vision_primary.addItems([p.capitalize() for p in vision_options])
+        self.vision_secondary.addItems([p.capitalize() for p in vision_options])
+        self._style_combo(self.vision_primary)
+        self._style_combo(self.vision_secondary)
+
+        saved_order = self.config.get("ai.vision.preferred_providers", ["gemini", "ollama"]) or ["gemini", "ollama"]
+        primary = saved_order[0] if len(saved_order) > 0 else "gemini"
+        secondary = saved_order[1] if len(saved_order) > 1 else "ollama"
+        idx_map = {p: i for i, p in enumerate(vision_options)}
+        self.vision_primary.setCurrentIndex(idx_map.get(primary, 0))
+        self.vision_secondary.setCurrentIndex(idx_map.get(secondary, 1))
+
+        row_v = QHBoxLayout()
+        row_v.addWidget(QLabel("Primary"))
+        row_v.addWidget(self.vision_primary, 1)
+        row_v.addSpacing(10)
+        row_v.addWidget(QLabel("Secondary"))
+        row_v.addWidget(self.vision_secondary, 1)
+        l.addLayout(row_v)
+
+        self.chk_vision_race = PremiumCheckBox("Race mode (send to both, take fastest)")
+        self.chk_vision_race.setChecked(bool(self.config.get("ai.vision.race_enabled", False)))
+        l.addWidget(self.chk_vision_race)
+
+        vprio_desc = QLabel(
+            "Primary/Secondary sets the order for screenshot analysis. Race mode runs both concurrently and uses the first successful response."
+        )
+        vprio_desc.setWordWrap(True)
+        vprio_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+        l.addWidget(vprio_desc)
         # Screenshot Interval
         lbl_interval = self._make_section_label("SCREEN CAPTURE INTERVAL")
         l.addWidget(lbl_interval)
@@ -1395,7 +1470,13 @@ class SettingsView(QWidget):
 
     def _test_pid(self, pid):
         self.status_labels[pid].setText("⏳")
-        worker = ProviderTestWorker(pid, self.config, self)
+        key_override = ""
+        if pid in self.api_inputs:
+            try:
+                key_override = self.api_inputs[pid].text().strip()
+            except Exception:
+                key_override = ""
+        worker = ProviderTestWorker(pid, self.config, self, key_override=key_override)
         self._test_workers[pid] = worker
         worker.result_ready.connect(self._on_provider_test_result)
         worker.finished.connect(lambda p=pid: self._test_workers.pop(p, None))
@@ -1501,6 +1582,22 @@ class SettingsView(QWidget):
                     self.chk_paid_vision_fallback.isChecked(),
                 )
             self.config.set("stealth.enabled", True)
+
+            # Save vision priority and race mode
+            if hasattr(self, "vision_primary") and hasattr(self, "vision_secondary"):
+                options = ["gemini", "ollama", "openai"]
+                p1 = options[self.vision_primary.currentIndex()] if self.vision_primary.currentIndex() < len(options) else "gemini"
+                p2 = options[self.vision_secondary.currentIndex()] if self.vision_secondary.currentIndex() < len(options) else "ollama"
+                order = [p1]
+                if p2 and p2 not in order:
+                    order.append(p2)
+                # Append openai only when paid fallback is allowed (prevents useless attempts)
+                allow_paid = bool(self.config.get("ai.vision.allow_paid_fallback", False))
+                if allow_paid and "openai" not in order:
+                    order.append("openai")
+                self.config.set("ai.vision.preferred_providers", order)
+            if hasattr(self, "chk_vision_race"):
+                self.config.set("ai.vision.race_enabled", self.chk_vision_race.isChecked())
 
             # Save screenshot interval
             if hasattr(self, "screenshot_interval"):

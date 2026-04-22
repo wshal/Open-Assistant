@@ -15,6 +15,11 @@ class GeminiProvider(BaseProvider):
         if not key:
             self.enabled = False
             return
+
+        # Default model when config.yaml doesn't specify one.
+        # Matches the cheating/ repo default and current Gemini API naming.
+        if not self.pcfg.get("model") and not self.pcfg.get("models"):
+            self.pcfg["model"] = "gemini-2.5-flash"
         try:
             from google import genai
             self.client = genai.Client(api_key=key)

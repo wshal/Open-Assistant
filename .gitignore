@@ -16,6 +16,7 @@ logs/
 ISSUES_ANALYSIS.md
 OPENASSIST_TECH_AUDIT.md
 latency_audit.md
+AUDIT_V2_IMPLEMENTATION_STATUS.md
 cheating/
 
 # ── Python Environment ────────────────────────────────────────────────────────

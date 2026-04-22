@@ -9,8 +9,8 @@ import time
 from typing import Optional, Tuple
 from PIL import Image
 import mss
+import ctypes
 from PyQt6.QtCore import QObject, pyqtSignal
-from PyQt6.QtWidgets import QApplication
 from capture.ocr import OCREngine
 from utils.logger import setup_logger
 
@@ -24,7 +24,6 @@ class ScreenCapture(QObject):
         super().__init__()
         self.config = config
         self.ocr = ocr
-        self.sct = mss.mss()
         self._last_text = ""
         self._last_time = 0.0
         # Prefer the explicit screen capture interval setting (P1.7). Fall back
@@ -41,6 +40,11 @@ class ScreenCapture(QObject):
         quality_jpeg = {"low": 40, "medium": 72, "high": 95}
         self._max_w = quality_widths.get(quality, 1920)
         self._jpeg_quality = quality_jpeg.get(quality, 72)
+
+        # Separate (lower) defaults for manual screenshot analysis to reduce latency.
+        analysis_quality = config.get("capture.screen.analysis_quality", quality)
+        self._analysis_max_w = quality_widths.get(analysis_quality, self._max_w)
+        self._analysis_jpeg_quality = quality_jpeg.get(analysis_quality, self._jpeg_quality)
 
         self._smart_crop_enabled = config.get("capture.screen.smart_crop", True)
         self._enabled = config.get("capture.screen.enabled", True)
@@ -144,8 +148,12 @@ class ScreenCapture(QObject):
         img.save(buf, format="PNG")
         return buf.getvalue(), text or ""
 
-    async def capture_image_bytes(self) -> bytes:
-        """Capture one screenshot as JPEG bytes (quality-tiered per config) without OCR."""
+    async def capture_image_bytes(self, for_analysis: bool = False) -> bytes:
+        """Capture one screenshot as JPEG bytes without OCR.
+
+        When `for_analysis=True`, uses a lower default quality and (if available)
+        Smart-Crop focus region to reduce latency for vision providers.
+        """
         if not self._enabled:
             return b""
 
@@ -153,9 +161,22 @@ class ScreenCapture(QObject):
         if img is None:
             return b""
 
+        if for_analysis and self._smart_crop_enabled and self._last_crop_box:
+            try:
+                img = img.crop(self._last_crop_box)
+            except Exception:
+                pass
+
+        # Downscale again for analysis if configured smaller than the default capture tier.
+        if for_analysis and img.width > self._analysis_max_w:
+            ratio = self._analysis_max_w / img.width
+            new_h = int(img.height * ratio)
+            img = img.resize((self._analysis_max_w, new_h), Image.LANCZOS)
+
         buf = io.BytesIO()
         # P2.2: Use JPEG with quality tier for faster network transfer and less memory
-        img.convert("RGB").save(buf, format="JPEG", quality=self._jpeg_quality)
+        q = self._analysis_jpeg_quality if for_analysis else self._jpeg_quality
+        img.convert("RGB").save(buf, format="JPEG", quality=q)
         return buf.getvalue()
 
     async def extract_text_from_image_bytes(self, image_bytes: bytes) -> str:
@@ -209,21 +230,43 @@ class ScreenCapture(QObject):
             self._last_crop_box = final_box
 
     def _screenshot(self) -> Optional[Image.Image]:
-        """Dynamic Monitor Selection: Captures the monitor where the application is located."""
+        """Capture a screenshot as a PIL image.
+
+        Important: Avoid calling Qt GUI APIs here. This method can be executed from
+        the background asyncio thread (e.g., Analyze Screen), and Qt widgets are
+        not thread-safe. We instead select the monitor by cursor position.
+        """
         try:
-            target_monitor = self.sct.monitors[1]
-            app = QApplication.instance()
-            if app and app.activeWindow():
-                window = app.activeWindow()
-                screen = window.screen()
-                if screen:
-                    rect = screen.geometry()
-                    for m in self.sct.monitors:
-                        if m["left"] == rect.left() and m["top"] == rect.top():
+            sct = mss.mss()
+            monitors = getattr(sct, "monitors", []) or []
+            if len(monitors) < 2:
+                # mss uses index 0 as the virtual "all monitors" region.
+                target_monitor = monitors[0] if monitors else None
+            else:
+                target_monitor = monitors[1]  # fallback: primary
+
+            # Prefer the monitor under the cursor (thread-safe via Win32).
+            try:
+                class _POINT(ctypes.Structure):
+                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+                pt = _POINT()
+                if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+                    cx, cy = int(pt.x), int(pt.y)
+                    for m in monitors[1:]:
+                        left, top = int(m.get("left", 0)), int(m.get("top", 0))
+                        width, height = int(m.get("width", 0)), int(m.get("height", 0))
+                        if left <= cx < (left + width) and top <= cy < (top + height):
                             target_monitor = m
                             break
+            except Exception:
+                # Cursor-based selection is best-effort; primary fallback remains.
+                pass
 
-            raw = self.sct.grab(target_monitor)
+            if not target_monitor:
+                return None
+
+            raw = sct.grab(target_monitor)
             img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
 
             if img.width > self._max_w:

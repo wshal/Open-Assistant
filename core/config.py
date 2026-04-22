@@ -124,6 +124,9 @@ class Config:
         self._data.setdefault("ai", {})
         self._data["ai"].setdefault("vision", {})
         self._data["ai"]["vision"].setdefault("allow_paid_fallback", False)
+        # Vision routing: provider priority + optional "race" for lowest latency.
+        self._data["ai"]["vision"].setdefault("preferred_providers", ["gemini", "ollama"])
+        self._data["ai"]["vision"].setdefault("race_enabled", False)
         self._data.setdefault("app", {})
         self._data["app"].setdefault("focus_on_show", False)
         self._data.setdefault("stealth", {})
@@ -182,10 +185,13 @@ class Config:
         for pid, meta in PROVIDERS.items():
             stored_key = self.secrets.get_api_key(pid)
             if stored_key:
-                prov_cfg = self._data.get("ai", {}).get("providers", {}).get(pid, {})
-                if prov_cfg:
-                    prov_cfg["api_key"] = stored_key
-                    os.environ[meta["env_key"]] = stored_key
+                # Ensure provider config exists so providers can read api_key from config.
+                ai_cfg = self._data.setdefault("ai", {})
+                provs = ai_cfg.setdefault("providers", {})
+                prov_cfg = provs.setdefault(pid, {})
+                prov_cfg["api_key"] = stored_key
+                prov_cfg["enabled"] = True
+                os.environ[meta["env_key"]] = stored_key
 
     # P1 FIX #6: API Key Validation
 
@@ -384,10 +390,11 @@ class Config:
         clean = key.strip().strip('"').strip("'").strip()
 
         self.secrets.set_api_key(provider, clean)
-        prov_cfg = self._data.get("ai", {}).get("providers", {}).get(provider, {})
-        if prov_cfg:
-            prov_cfg["api_key"] = clean
-            prov_cfg["enabled"] = bool(clean)
+        ai_cfg = self._data.setdefault("ai", {})
+        provs = ai_cfg.setdefault("providers", {})
+        prov_cfg = provs.setdefault(provider, {})
+        prov_cfg["api_key"] = clean
+        prov_cfg["enabled"] = bool(clean)
         from core.constants import PROVIDERS
         env_key = PROVIDERS.get(provider, {}).get("env_key", "")
         if env_key:

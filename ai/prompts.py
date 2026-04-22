@@ -352,7 +352,11 @@ RULES:
                 "[TASK]\nAnalyse the attached screenshot first. Treat the image as the primary source of truth. "
                 "Use [SCREEN] as OCR support, and use [AUDIO] and environment context only as support. "
                 "If the screenshot or OCR is partial, say what is visible, what it likely means, and the best next action.\n"
-                "FORMAT:\n- What I See\n- What It Means\n- What To Do Next"
+                "Your job is to identify the single primary task on-screen and complete it.\n"
+                "If the task is a programming/UI task: provide a minimal working implementation (include code), "
+                "then short notes on edge cases.\n"
+                "Avoid commentary sections like 'What I See'. Be task-first and output-first.\n"
+                "FORMAT:\n- Task (one line)\n- Solution (concise)\n- Code (fenced, if applicable)\n- Notes (optional)"
             )
         elif origin == "manual":
             if suppress_live_context:

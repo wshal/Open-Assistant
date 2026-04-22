@@ -674,13 +674,22 @@ class AIEngine(QObject):
         fixed = self.config.get("ai.fixed_provider", "")
         if fixed:
             preferred.append(fixed)
-        for name in ["gemini", "ollama"]:
-            if name not in preferred:
-                preferred.append(name)
-        if self.config.get("ai.vision.allow_paid_fallback", False):
-            for name in ["openai"]:
+
+        cfg_order = self.config.get("ai.vision.preferred_providers", None)
+        if isinstance(cfg_order, list) and cfg_order:
+            for name in cfg_order:
+                if name and name not in preferred:
+                    preferred.append(name)
+        else:
+            for name in ["gemini", "ollama"]:
                 if name not in preferred:
                     preferred.append(name)
+
+        if self.config.get("ai.vision.allow_paid_fallback", False):
+            if "openai" not in preferred:
+                preferred.append("openai")
+        else:
+            preferred = [p for p in preferred if p != "openai"]
 
         candidates = []
         for name in preferred:
@@ -697,13 +706,99 @@ class AIEngine(QObject):
             raise Exception("No vision-capable provider available for screenshot analysis.")
 
         last_error = None
+
+        # Optional low-latency "race": run providers concurrently and use the first success.
+        # Note: we race non-streaming calls to keep the implementation simple and deterministic.
+        # Allow providers to use a dedicated vision-tier model if configured.
+        vision_tier = "vision"
+
+        if bool(self.config.get("ai.vision.race_enabled", False)) and len(candidates) >= 2:
+            async def _run_one(p):
+                if getattr(p, "supports_vision_stream", lambda: False)():
+                    # Consume stream into a full string for parity with non-streaming.
+                    out = ""
+                    async for chunk in p.analyze_image_stream(
+                        sys_prompt,
+                        user_msg,
+                        image_bytes,
+                        mime_type="image/png",
+                        tier=vision_tier,
+                    ):
+                        if self._is_cancelled:
+                            return ""
+                        out += chunk
+                    return out
+                return await p.analyze_image(
+                    sys_prompt,
+                    user_msg,
+                    image_bytes,
+                    mime_type="image/png",
+                    tier=vision_tier,
+                )
+
+            tasks = {asyncio.create_task(_run_one(p)): p for p in candidates}
+            try:
+                while tasks:
+                    done, _pending = await asyncio.wait(
+                        tasks.keys(), return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for t in done:
+                        p = tasks.pop(t, None)
+                        try:
+                            response = t.result() or ""
+                        except Exception as exc:
+                            last_error = exc
+                            continue
+
+                        if self._is_cancelled:
+                            return ""
+
+                        # Cancel remaining attempts
+                        for other in list(tasks.keys()):
+                            other.cancel()
+                        tasks.clear()
+
+                        latency_ms = (time.time() - start_time) * 1000
+                        self.history.add(
+                            query,
+                            response,
+                            provider=p.name if p else "vision",
+                            mode=mode_id,
+                            latency=latency_ms,
+                            metadata={"vision": True},
+                        )
+                        self.history.add_screen_analysis(
+                            query,
+                            response,
+                            provider=p.name if p else "vision",
+                            metadata={"vision": True},
+                        )
+                        # Emit a single chunk so the UI doesn't look blank.
+                        if response:
+                            self.response_chunk.emit(response)
+                        self.response_complete.emit(response)
+                        logger.info(
+                            f"Vision race complete via {p.name if p else 'vision'} ({latency_ms:.0f}ms)"
+                        )
+                        return response
+            finally:
+                for t in list(tasks.keys()):
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+
         for provider in candidates:
             emitted_partial = False
             try:
                 response = ""
                 if getattr(provider, "supports_vision_stream", lambda: False)():
                     async for chunk in provider.analyze_image_stream(
-                        sys_prompt, user_msg, image_bytes, mime_type="image/png"
+                        sys_prompt,
+                        user_msg,
+                        image_bytes,
+                        mime_type="image/png",
+                        tier=vision_tier,
                     ):
                         if self._is_cancelled:
                             return ""
@@ -712,7 +807,11 @@ class AIEngine(QObject):
                         self.response_chunk.emit(chunk)
                 else:
                     response = await provider.analyze_image(
-                        sys_prompt, user_msg, image_bytes, mime_type="image/png"
+                        sys_prompt,
+                        user_msg,
+                        image_bytes,
+                        mime_type="image/png",
+                        tier=vision_tier,
                     )
                 if self._is_cancelled:
                     return ""

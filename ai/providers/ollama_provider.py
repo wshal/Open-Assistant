@@ -53,8 +53,27 @@ class OllamaProvider(BaseProvider):
         self._connect_timeout = aiohttp.ClientTimeout(total=5)
         self._generate_timeout = aiohttp.ClientTimeout(total=180)
         self._resolved_model = ""
+        self._resolved_vision_model = ""
+
+    def _get_configured_vision_model(self) -> str:
+        """
+        Read an explicitly configured vision model without falling back to the
+        provider's general `model` setting.
+        """
+        models = self.pcfg.get("models", {}) if isinstance(self.pcfg, dict) else {}
+        if isinstance(models, dict):
+            return (models.get("vision") or "").strip()
+        return ""
 
     def get_model(self, tier: str = None) -> str:
+        # Prefer a dedicated vision model for screenshot analysis if available.
+        if (tier or "").lower() == "vision":
+            configured = self._get_configured_vision_model()
+            if configured:
+                return configured
+            if self._resolved_vision_model:
+                return self._resolved_vision_model
+
         model = super().get_model(tier)
         if model:
             return model
@@ -92,6 +111,46 @@ class OllamaProvider(BaseProvider):
 
         return self._available_models[0]
 
+    def _pick_available_vision_model(self, requested: str = "") -> str:
+        """
+        Pick a locally available vision-capable model.
+        If `requested` is set, try to honor it; otherwise pick a fast/reasonable default.
+        """
+        if not self._available_models:
+            return ""
+
+        requested = (requested or "").strip()
+        if requested:
+            requested_base = requested.split(":")[0]
+            for model in self._available_models:
+                if model == requested or model.startswith(f"{requested}:"):
+                    return model
+            for model in self._available_models:
+                if model.split(":")[0] == requested_base:
+                    return model
+
+        vision_models = [m for m in self._available_models if self._looks_like_vision_model(m)]
+        if not vision_models:
+            return ""
+
+        # Prefer commonly fast + decent VL models first.
+        preferred_prefixes = (
+            "qwen3-vl",
+            "qwen2.5-vl",
+            "qwen2-vl",
+            "llama3.2-vision",
+            "minicpm-v",
+            "moondream",
+            "llava",
+            "bakllava",
+        )
+        for prefix in preferred_prefixes:
+            for model in vision_models:
+                if model.startswith(prefix):
+                    return model
+
+        return vision_models[0]
+
     async def check_availability(self) -> bool:
         """
         Check if Ollama is running and the required model exists.
@@ -126,6 +185,13 @@ class OllamaProvider(BaseProvider):
                 self._state = self.STATE_READY
                 self.enabled = True
                 logger.debug(f"  Ollama ready (model: {target})")
+
+                # Also resolve an optional vision model if present.
+                configured_vision = self._get_configured_vision_model()
+                vtarget = self._pick_available_vision_model(configured_vision)
+                if vtarget:
+                    self._resolved_vision_model = vtarget
+                    logger.info(f"  Ollama vision ready (model: {vtarget})")
 
                 return True
 
@@ -236,6 +302,7 @@ class OllamaProvider(BaseProvider):
             "minicpm-v",
             "qwen2-vl",
             "qwen2.5-vl",
+            "qwen3-vl",
             "llama3.2-vision",
             "phi3.5-vision",
             "granite3.2-vision",
@@ -336,6 +403,11 @@ class OllamaProvider(BaseProvider):
         return await self.check_availability()
 
     def supports_vision(self) -> bool:
+        # Allow a dedicated vision model without forcing the default text model
+        # to be multimodal (e.g., keep a coder model for chat, use a VL model for screenshots).
+        vision_model = self._get_configured_vision_model() or self._resolved_vision_model
+        if vision_model:
+            return self._looks_like_vision_model(vision_model)
         return self._looks_like_vision_model(self.get_model())
 
     async def analyze_image(
