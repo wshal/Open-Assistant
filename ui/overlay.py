@@ -100,6 +100,9 @@ class OverlayWindow(QMainWindow):
         self.btn_end_session.setVisible(True)
         self.btn_history.setVisible(False)
         self.btn_settings.setVisible(False)
+        # Reduce header clutter during an active session.
+        if hasattr(self, "btn_timeline"):
+            self.btn_timeline.setVisible(False)
         self.set_analysis_provider_badge()
         self.update_audio_state(self.app.state.is_muted)
         self._session_timer.start(1000)
@@ -112,6 +115,8 @@ class OverlayWindow(QMainWindow):
         self.btn_end_session.setVisible(False)
         self.btn_history.setVisible(True)
         self.btn_settings.setVisible(True)
+        if hasattr(self, "btn_timeline"):
+            self.btn_timeline.setVisible(True)
         self._session_timer.stop()
         self.session_timer.setText("00:00")
         self.set_analysis_provider_badge()
@@ -253,7 +258,6 @@ class OverlayWindow(QMainWindow):
             }
         """)
         self.btn_history.clicked.connect(self._show_history)
-        hl.addWidget(self.btn_history)
 
         # P2.9: Timeline button
         self.btn_timeline = QPushButton("⏱")
@@ -266,6 +270,7 @@ class OverlayWindow(QMainWindow):
         """)
         self.btn_timeline.clicked.connect(self._show_timeline)
         hl.addWidget(self.btn_timeline)
+        hl.addWidget(self.btn_history)
 
         self._status_snapshot = ""
 
@@ -405,6 +410,11 @@ class OverlayWindow(QMainWindow):
         if not content:
             return
 
+        # Avoid full HTML rebuild during streaming when fenced code blocks are present.
+        # We'll do the final markdown render on completion instead.
+        if self._is_streaming and "```" in content:
+            return
+
         self._last_rendered_content = content
 
         q_html = (
@@ -442,6 +452,11 @@ class OverlayWindow(QMainWindow):
             self._render_timer.start()
 
         self._raw_buffer += text
+
+        # Stop periodic markdown re-renders once a code fence appears to prevent
+        # layout wobble while code blocks stream in.
+        if self._render_timer.isActive() and "```" in self._raw_buffer:
+            self._render_timer.stop()
 
         # Immediate plaintext append — character-level, zero lag.
         # Use QTextCharFormat to keep text in the correct colour (#d0d0e8)

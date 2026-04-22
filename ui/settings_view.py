@@ -874,6 +874,51 @@ class SettingsView(QWidget):
         vprio_desc.setWordWrap(True)
         vprio_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
         l.addWidget(vprio_desc)
+
+        sep_text = QFrame()
+        sep_text.setFixedHeight(1)
+        sep_text.setStyleSheet("background: rgba(255,255,255,0.05);")
+        l.addWidget(sep_text)
+
+        # Text Priority + Race Mode (manual + audio queries)
+        lbl_tprio = self._make_section_label("TEXT PROVIDER PRIORITY (LOW LATENCY)")
+        l.addWidget(lbl_tprio)
+
+        self.text_primary = QComboBox()
+        self.text_secondary = QComboBox()
+        text_options = ["groq", "cerebras", "together", "gemini", "ollama"]
+        self.text_primary.addItems([p.capitalize() for p in text_options])
+        self.text_secondary.addItems([p.capitalize() for p in text_options])
+        self._style_combo(self.text_primary)
+        self._style_combo(self.text_secondary)
+
+        saved_text_order = (
+            self.config.get("ai.text.preferred_providers", text_options) or text_options
+        )
+        t1 = saved_text_order[0] if len(saved_text_order) > 0 else "groq"
+        t2 = saved_text_order[1] if len(saved_text_order) > 1 else "cerebras"
+        tidx = {p: i for i, p in enumerate(text_options)}
+        self.text_primary.setCurrentIndex(tidx.get(t1, 0))
+        self.text_secondary.setCurrentIndex(tidx.get(t2, 1))
+
+        row_t = QHBoxLayout()
+        row_t.addWidget(QLabel("Primary"))
+        row_t.addWidget(self.text_primary, 1)
+        row_t.addSpacing(10)
+        row_t.addWidget(QLabel("Secondary"))
+        row_t.addWidget(self.text_secondary, 1)
+        l.addLayout(row_t)
+
+        self.chk_text_race = PremiumCheckBox("Race mode for text (use fastest successful)")
+        self.chk_text_race.setChecked(bool(self.config.get("ai.text.race_enabled", False)))
+        l.addWidget(self.chk_text_race)
+
+        tprio_desc = QLabel(
+            "Controls provider order for manual + audio queries. Race mode runs the top providers concurrently (no token streaming)."
+        )
+        tprio_desc.setWordWrap(True)
+        tprio_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+        l.addWidget(tprio_desc)
         # Screenshot Interval
         lbl_interval = self._make_section_label("SCREEN CAPTURE INTERVAL")
         l.addWidget(lbl_interval)
@@ -1598,6 +1643,22 @@ class SettingsView(QWidget):
                 self.config.set("ai.vision.preferred_providers", order)
             if hasattr(self, "chk_vision_race"):
                 self.config.set("ai.vision.race_enabled", self.chk_vision_race.isChecked())
+
+            # Save text priority and race mode (manual + audio queries)
+            if hasattr(self, "text_primary") and hasattr(self, "text_secondary"):
+                options = ["groq", "cerebras", "together", "gemini", "ollama"]
+                p1 = options[self.text_primary.currentIndex()] if self.text_primary.currentIndex() < len(options) else "groq"
+                p2 = options[self.text_secondary.currentIndex()] if self.text_secondary.currentIndex() < len(options) else "cerebras"
+                order = [p1]
+                if p2 and p2 not in order:
+                    order.append(p2)
+                # Append remaining defaults to keep a complete fallback chain.
+                for p in options:
+                    if p not in order:
+                        order.append(p)
+                self.config.set("ai.text.preferred_providers", order)
+            if hasattr(self, "chk_text_race"):
+                self.config.set("ai.text.race_enabled", self.chk_text_race.isChecked())
 
             # Save screenshot interval
             if hasattr(self, "screenshot_interval"):

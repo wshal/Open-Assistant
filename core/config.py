@@ -122,6 +122,13 @@ class Config:
 
     def _apply_defaults(self):
         self._data.setdefault("ai", {})
+        self._data["ai"].setdefault("text", {})
+        # Text routing: provider priority + optional "race" for lowest latency.
+        self._data["ai"]["text"].setdefault(
+            "preferred_providers",
+            ["groq", "gemini", "cerebras", "together", "ollama"],
+        )
+        self._data["ai"]["text"].setdefault("race_enabled", False)
         self._data["ai"].setdefault("vision", {})
         self._data["ai"]["vision"].setdefault("allow_paid_fallback", False)
         # Vision routing: provider priority + optional "race" for lowest latency.

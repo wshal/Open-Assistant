@@ -170,9 +170,17 @@ class AIEngine(QObject):
 
         # Smart routing: analyse query complexity and select provider
         complexity = self._analyze_query_complexity(query)
-        preferred_providers = self._preferred_providers_for_complexity(
-            complexity, mode_obj or mode_id
-        )
+        preferred_providers = None
+        if origin in {"manual", "speech"}:
+            cfg_text = self.config.get("ai.text.preferred_providers", None)
+            if isinstance(cfg_text, list) and cfg_text:
+                # Respect explicit user priority order for manual/audio queries.
+                preferred_providers = [p for p in cfg_text if isinstance(p, str) and p.strip()]
+
+        if not preferred_providers:
+            preferred_providers = self._preferred_providers_for_complexity(
+                complexity, mode_obj or mode_id
+            )
 
         # Use parallel inference if enabled
         use_parallel = self._parallel and self.config.get("ai.parallel.enabled", False)
@@ -366,6 +374,78 @@ class AIEngine(QObject):
                 nexus=nexus_snapshot,
                 history=history_block,
             )
+
+            # Optional low-latency "race" for text: run top providers concurrently and use the first success.
+            # Note: we race non-streaming calls, so the UI won't see token-by-token streaming.
+            if (
+                origin in {"manual", "speech"}
+                and bool(self.config.get("ai.text.race_enabled", False))
+                and isinstance(preferred_providers, list)
+                and len(preferred_providers) >= 2
+            ):
+                candidates = []
+                for pid in preferred_providers:
+                    p = self._providers.get(pid)
+                    if p and getattr(p, "enabled", False) and p.check_rate():
+                        candidates.append(p)
+                    if len(candidates) >= 2:
+                        break
+
+                if len(candidates) >= 2:
+                    tasks = {
+                        asyncio.create_task(p.generate(sys_prompt, user_msg, tier)): p
+                        for p in candidates
+                    }
+                    try:
+                        while tasks:
+                            done, _pending = await asyncio.wait(
+                                tasks.keys(), return_when=asyncio.FIRST_COMPLETED
+                            )
+                            for t in done:
+                                p = tasks.pop(t, None)
+                                try:
+                                    raced = (t.result() or "").strip()
+                                except Exception:
+                                    continue
+
+                                if self._is_cancelled:
+                                    return
+
+                                for other in list(tasks.keys()):
+                                    other.cancel()
+                                tasks.clear()
+
+                                latency_ms = (time.time() - start_time) * 1000
+                                providers_tried = [pp.name for pp in candidates]
+                                self.history.add(
+                                    query,
+                                    raced,
+                                    provider=p.name if p else "race",
+                                    mode=mode_id,
+                                    latency=latency_ms,
+                                    metadata={
+                                        "stage_timings": {
+                                            **stage_timings,
+                                            "request_to_complete_ms": (time.time() - request_started_at) * 1000,
+                                        },
+                                        "request_metadata": request_metadata,
+                                        "providers_tried": providers_tried,
+                                        "race": True,
+                                        "had_screen": bool((nexus_snapshot or {}).get("latest_ocr", "").strip()),
+                                        "had_audio": bool((nexus_snapshot or {}).get("full_audio_history", "").strip()),
+                                        "had_rag": bool(rag_context.strip()) if rag_context else False,
+                                    },
+                                )
+                                if raced:
+                                    self.response_chunk.emit(raced)
+                                self.response_complete.emit(raced)
+                                return
+                    finally:
+                        for t in list(tasks.keys()):
+                            try:
+                                t.cancel()
+                            except Exception:
+                                pass
 
             # 4. Streamed Generation — with provider fallback chain (P1.4)
             # If the primary provider fails mid-stream, we transparently try the

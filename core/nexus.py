@@ -77,3 +77,22 @@ class ContextNexus:
             self.active_window = "Unknown"
             self._last_ocr = ""
             self._last_audio = ""
+
+    def get_timeline(self) -> List[Dict[str, Any]]:
+        """Return a UI-friendly, time-stamped list of recent context events."""
+        with self._lock:
+            self._cleanup_stale()
+            out: List[Dict[str, Any]] = []
+            for ts, source, data in list(self.history):
+                try:
+                    text = data if isinstance(data, str) else str(data)
+                except Exception:
+                    text = ""
+                out.append(
+                    {
+                        "ts": ts,
+                        "source": source,
+                        "text": (text or "")[:500],
+                    }
+                )
+            return out

@@ -185,6 +185,11 @@ class MiniOverlay(QMainWindow):
             return
         self._last_rendered = text
 
+        # Avoid full HTML rebuild during streaming when fenced code blocks are present.
+        # We'll do the final markdown render on completion instead.
+        if self._render_timer.isActive() and "```" in (text or ""):
+            return
+
         html = self.md.render(text or "Waiting...")
         self.response_area.setHtml(html)
         if text and not self._expanded:
@@ -201,6 +206,11 @@ class MiniOverlay(QMainWindow):
             self._render_timer.start()
 
         self._raw_buffer += text
+
+        # Stop periodic markdown re-renders once a code fence appears to prevent
+        # layout wobble while code blocks stream in.
+        if self._render_timer.isActive() and "```" in self._raw_buffer:
+            self._render_timer.stop()
 
         # Immediate colour-correct text append
         cursor = self.response_area.textCursor()

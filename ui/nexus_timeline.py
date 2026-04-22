@@ -202,10 +202,20 @@ class NexusTimelineView(QWidget):
         return card
 
     def _clear_log(self):
-        """Remove all rendered event cards from the layout."""
-        while self.log_layout.count() > 1:
-            item = self.log_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        """Clear Nexus history and remove rendered event cards (idempotent)."""
+        try:
+            if hasattr(self.nexus, "clear"):
+                self.nexus.clear()
+        except Exception as e:
+            logger.debug(f"Timeline clear error: {e}")
+
+        # Layout is: [empty_label][cards...][stretch]. Remove only cards.
+        # Remove from the end towards index 1 so we never delete the empty label or stretch.
+        for i in range(self.log_layout.count() - 2, 0, -1):
+            item = self.log_layout.takeAt(i)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
         self._last_entry_count = 0
         self._empty_label.show()
