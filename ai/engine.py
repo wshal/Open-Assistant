@@ -9,6 +9,7 @@ NEW: ModeManager wired in — engine reads live Mode objects, not bare strings.
 import asyncio
 import re
 import time
+import inspect
 from functools import lru_cache
 from typing import Optional, List, Dict, Any
 from collections import OrderedDict
@@ -50,6 +51,7 @@ class AIEngine(QObject):
         self._active_provider_id = config.get("ai.fixed_provider", "")
         self._is_cancelled = False
         self._health_task = None
+        self._loop = None
         self._router = None
         self._selected_tier = "balanced"
         self._parallel = None
@@ -136,6 +138,12 @@ class AIEngine(QObject):
     def warmup(self):
         """Initializes AI providers and checks availability."""
         try:
+            # If warmup is called multiple times (e.g. hot-apply settings), ensure
+            # we clean up any long-lived network resources (aiohttp sessions, etc.)
+            # from the previous provider instances to prevent leak warnings.
+            if self._providers:
+                self.close_providers()
+
             self._providers = init_providers(self.config)
             logger.info(f"AI Engine initialized: {list(self._providers.keys())}")
 
@@ -172,6 +180,50 @@ class AIEngine(QObject):
             logger.info(f"Active Provider: {self._active_provider_id}")
         except Exception as e:
             logger.error(f"AI Warmup Error: {e}")
+
+    async def aclose_providers(self):
+        """Async best-effort provider cleanup (aiohttp sessions, etc.)."""
+        providers = list((self._providers or {}).values())
+        for prov in providers:
+            close_fn = getattr(prov, "close", None)
+            if not close_fn:
+                continue
+            try:
+                if inspect.iscoroutinefunction(close_fn):
+                    await close_fn()
+                else:
+                    close_fn()
+            except Exception:
+                # Cleanup is best-effort; never fail app flow due to it.
+                pass
+
+    def close_providers(self, timeout_s: float = 2.0):
+        """Sync wrapper to close providers on the engine's asyncio loop when possible."""
+        try:
+            loop = self._loop
+            if loop and loop.is_running():
+                fut = asyncio.run_coroutine_threadsafe(self.aclose_providers(), loop)
+                try:
+                    fut.result(timeout=timeout_s)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            # Fall back to thread-local attempt below.
+            pass
+
+        # Fallback: try to run cleanup in this thread (may not match the original loop).
+        try:
+            asyncio.run(self.aclose_providers())
+        except RuntimeError:
+            # Already in an event loop in this thread; schedule and move on.
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.aclose_providers())
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def cancel(self):
         """Standardized cancellation flag for prioritized overrides."""
@@ -1265,6 +1317,7 @@ class AIEngine(QObject):
         """Start the provider health monitor once and reuse it for future calls."""
         if not loop or not loop.is_running():
             return None
+        self._loop = loop
         if self._health_task and not self._health_task.done():
             return self._health_task
 

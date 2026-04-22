@@ -366,6 +366,12 @@ class OpenAssistApp(QObject):
                 self.hotkeys.restart()
 
                 # 2. Process Warmup
+                # Close old provider network resources (e.g. Ollama aiohttp sessions)
+                # before re-initializing providers to avoid "Unclosed client session".
+                try:
+                    self.ai.close_providers()
+                except Exception:
+                    pass
                 self.ai.warmup()
 
                 # 3. UI Synchronization
