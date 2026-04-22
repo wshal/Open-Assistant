@@ -404,8 +404,8 @@ class StandbyView(QWidget):
                     data = _json.loads(r.read())
                 latest_tag = data.get("tag_name", "").lstrip("v")
                 try:
-                    from core.version import __version__ as local_ver
-                except ImportError:
+                    from core.constants import APP_VERSION as local_ver
+                except Exception:
                     local_ver = "0.0.0"
 
                 def _ver_tuple(v):

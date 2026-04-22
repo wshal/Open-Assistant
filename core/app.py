@@ -912,7 +912,8 @@ class OpenAssistApp(QObject):
         self.overlay.update_mode(m)
         self.mini_overlay.update_mode(m)
         # P2.10: Pin-to-top is only needed during an active session
-        self._topmost_timer.start(1500)
+        if hasattr(self, "_topmost_timer"):
+            self._topmost_timer.start(1500)
         logger.info("🚀 New Session Started — slate is clean.")
 
     def end_session(self):
@@ -977,7 +978,8 @@ class OpenAssistApp(QObject):
         self.mini_overlay.on_complete("", "")
         self.mini_overlay.set_ready()
         # P2.10: Stop pinning to top while on standby — no need to fight the OS scheduler
-        self._topmost_timer.stop()
+        if hasattr(self, "_topmost_timer"):
+            self._topmost_timer.stop()
         logger.info("🛑 Session Ended — history archived, slate wiped.")
 
     def set_current_mode(self, name):
@@ -1014,6 +1016,10 @@ class OpenAssistApp(QObject):
             self.simulator.type_text(response, target)
         else:
             logger.warning("Sim: No Snap-Locked target window available.")
+
+    def type_response(self):
+        """Compatibility alias for UI code that expects app.type_response()."""
+        return self.type_last_response()
 
     def _on_transcription(self, t):
         if not self.session_active:

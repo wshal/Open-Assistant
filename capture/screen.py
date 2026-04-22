@@ -27,7 +27,12 @@ class ScreenCapture(QObject):
         self.sct = mss.mss()
         self._last_text = ""
         self._last_time = 0.0
-        self._debounce = config.get("performance.debounce_ms", 400) / 1000.0
+        # Prefer the explicit screen capture interval setting (P1.7). Fall back
+        # to the legacy debounce key for backwards compatibility.
+        interval_ms = config.get("capture.screen.interval_ms", None)
+        if interval_ms is None:
+            interval_ms = config.get("performance.debounce_ms", 400)
+        self._debounce = float(interval_ms) / 1000.0
         self._threshold = config.get("capture.screen.change_threshold", 0.15)
 
         # Image quality affects capture resolution AND JPEG compression (P2.2)
