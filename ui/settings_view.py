@@ -615,12 +615,6 @@ class SettingsView(QWidget):
         l.setContentsMargins(15, 15, 15, 15)
         l.setSpacing(2)
 
-        hint = QLabel("`Ctrl+\\` hides or shows the HUD once per press. `Ctrl+M` controls click-through.")
-        hint.setStyleSheet(
-            f"{TEXT_MUTED} font-size: 10px; border: none; background: transparent;"
-        )
-        l.addWidget(hint)
-
         hdr = QHBoxLayout()
         hdr.setContentsMargins(10, 0, 10, 5)
         h1 = QLabel("COMMAND")
@@ -837,6 +831,21 @@ class SettingsView(QWidget):
         )
         l.addWidget(paid_fallback_desc)
 
+        self.chk_vision_local_only = PremiumCheckBox("Vision local-only (force Ollama)")
+        self.chk_vision_local_only.setChecked(
+            bool(self.config.get("ai.vision.local_only", False))
+        )
+        l.addWidget(self.chk_vision_local_only)
+
+        vlocal_desc = QLabel(
+            "Forces screenshot analysis to use only local Ollama vision models. Disables race + paid fallback."
+        )
+        vlocal_desc.setWordWrap(True)
+        vlocal_desc.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; background: transparent;"
+        )
+        l.addWidget(vlocal_desc)
+
         # Vision Priority + Race Mode
         lbl_vprio = self._make_section_label("VISION PRIORITY (LOW LATENCY)")
         l.addWidget(lbl_vprio)
@@ -919,6 +928,46 @@ class SettingsView(QWidget):
         tprio_desc.setWordWrap(True)
         tprio_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
         l.addWidget(tprio_desc)
+
+        self.chk_text_local_only = PremiumCheckBox("Text local-only (force Ollama)")
+        self.chk_text_local_only.setChecked(
+            bool(self.config.get("ai.text.local_only", False))
+        )
+        l.addWidget(self.chk_text_local_only)
+
+        tlocal_desc = QLabel(
+            "Forces manual + audio text replies to use only local Ollama. Disables race mode."
+        )
+        tlocal_desc.setWordWrap(True)
+        tlocal_desc.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; background: transparent;"
+        )
+        l.addWidget(tlocal_desc)
+
+        def _apply_local_only_lockouts():
+            try:
+                v_local = bool(getattr(self, "chk_vision_local_only", None) and self.chk_vision_local_only.isChecked())
+                t_local = bool(getattr(self, "chk_text_local_only", None) and self.chk_text_local_only.isChecked())
+                if hasattr(self, "chk_paid_vision_fallback"):
+                    self.chk_paid_vision_fallback.setEnabled(not v_local)
+                if hasattr(self, "vision_primary"):
+                    self.vision_primary.setEnabled(not v_local)
+                if hasattr(self, "vision_secondary"):
+                    self.vision_secondary.setEnabled(not v_local)
+                if hasattr(self, "chk_vision_race"):
+                    self.chk_vision_race.setEnabled(not v_local)
+                if hasattr(self, "text_primary"):
+                    self.text_primary.setEnabled(not t_local)
+                if hasattr(self, "text_secondary"):
+                    self.text_secondary.setEnabled(not t_local)
+                if hasattr(self, "chk_text_race"):
+                    self.chk_text_race.setEnabled(not t_local)
+            except Exception:
+                pass
+
+        self.chk_vision_local_only.toggled.connect(lambda _checked: _apply_local_only_lockouts())
+        self.chk_text_local_only.toggled.connect(lambda _checked: _apply_local_only_lockouts())
+        _apply_local_only_lockouts()
         # Screenshot Interval
         lbl_interval = self._make_section_label("SCREEN CAPTURE INTERVAL")
         l.addWidget(lbl_interval)
@@ -1626,39 +1675,66 @@ class SettingsView(QWidget):
                     "ai.vision.allow_paid_fallback",
                     self.chk_paid_vision_fallback.isChecked(),
                 )
+            if hasattr(self, "chk_vision_local_only"):
+                self.config.set(
+                    "ai.vision.local_only",
+                    self.chk_vision_local_only.isChecked(),
+                )
             self.config.set("stealth.enabled", True)
 
             # Save vision priority and race mode
             if hasattr(self, "vision_primary") and hasattr(self, "vision_secondary"):
-                options = ["gemini", "ollama", "openai"]
-                p1 = options[self.vision_primary.currentIndex()] if self.vision_primary.currentIndex() < len(options) else "gemini"
-                p2 = options[self.vision_secondary.currentIndex()] if self.vision_secondary.currentIndex() < len(options) else "ollama"
-                order = [p1]
-                if p2 and p2 not in order:
-                    order.append(p2)
-                # Append openai only when paid fallback is allowed (prevents useless attempts)
-                allow_paid = bool(self.config.get("ai.vision.allow_paid_fallback", False))
-                if allow_paid and "openai" not in order:
-                    order.append("openai")
-                self.config.set("ai.vision.preferred_providers", order)
+                vision_local = bool(self.config.get("ai.vision.local_only", False))
+                if vision_local:
+                    # Force local-only path without mutating provider enablement.
+                    self.config.set("ai.vision.allow_paid_fallback", False)
+                    self.config.set("ai.vision.race_enabled", False)
+                    self.config.set("ai.vision.preferred_providers", ["ollama"])
+                else:
+                    options = ["gemini", "ollama", "openai"]
+                    p1 = options[self.vision_primary.currentIndex()] if self.vision_primary.currentIndex() < len(options) else "gemini"
+                    p2 = options[self.vision_secondary.currentIndex()] if self.vision_secondary.currentIndex() < len(options) else "ollama"
+                    order = [p1]
+                    if p2 and p2 not in order:
+                        order.append(p2)
+                    # Append openai only when paid fallback is allowed (prevents useless attempts)
+                    allow_paid = bool(self.config.get("ai.vision.allow_paid_fallback", False))
+                    if allow_paid and "openai" not in order:
+                        order.append("openai")
+                    self.config.set("ai.vision.preferred_providers", order)
             if hasattr(self, "chk_vision_race"):
-                self.config.set("ai.vision.race_enabled", self.chk_vision_race.isChecked())
+                if not bool(self.config.get("ai.vision.local_only", False)):
+                    self.config.set("ai.vision.race_enabled", self.chk_vision_race.isChecked())
 
             # Save text priority and race mode (manual + audio queries)
             if hasattr(self, "text_primary") and hasattr(self, "text_secondary"):
-                options = ["groq", "cerebras", "together", "gemini", "ollama"]
-                p1 = options[self.text_primary.currentIndex()] if self.text_primary.currentIndex() < len(options) else "groq"
-                p2 = options[self.text_secondary.currentIndex()] if self.text_secondary.currentIndex() < len(options) else "cerebras"
-                order = [p1]
-                if p2 and p2 not in order:
-                    order.append(p2)
-                # Append remaining defaults to keep a complete fallback chain.
-                for p in options:
-                    if p not in order:
-                        order.append(p)
-                self.config.set("ai.text.preferred_providers", order)
+                text_local = bool(
+                    getattr(self, "chk_text_local_only", None)
+                    and self.chk_text_local_only.isChecked()
+                )
+                if text_local:
+                    self.config.set("ai.text.race_enabled", False)
+                    self.config.set("ai.text.preferred_providers", ["ollama"])
+                else:
+                    options = ["groq", "cerebras", "together", "gemini", "ollama"]
+                    p1 = options[self.text_primary.currentIndex()] if self.text_primary.currentIndex() < len(options) else "groq"
+                    p2 = options[self.text_secondary.currentIndex()] if self.text_secondary.currentIndex() < len(options) else "cerebras"
+                    order = [p1]
+                    if p2 and p2 not in order:
+                        order.append(p2)
+                    # Append remaining defaults to keep a complete fallback chain.
+                    for p in options:
+                        if p not in order:
+                            order.append(p)
+                    self.config.set("ai.text.preferred_providers", order)
             if hasattr(self, "chk_text_race"):
-                self.config.set("ai.text.race_enabled", self.chk_text_race.isChecked())
+                if not bool(
+                    getattr(self, "chk_text_local_only", None)
+                    and self.chk_text_local_only.isChecked()
+                ):
+                    self.config.set("ai.text.race_enabled", self.chk_text_race.isChecked())
+            if hasattr(self, "chk_text_local_only"):
+                self.config.set("ai.text.local_only", self.chk_text_local_only.isChecked())
 
             # Save screenshot interval
             if hasattr(self, "screenshot_interval"):

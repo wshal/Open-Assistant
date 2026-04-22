@@ -171,9 +171,12 @@ class MiniOverlay(QMainWindow):
             # Immediately show query + thinking state before any AI response
             self._raw_buffer = ""
             self.response_area.clear()
+            race_hint = ""
+            if bool(self.config.get("ai.text.race_enabled", False)):
+                race_hint = " (race mode — no streaming)"
             self.response_area.setHtml(
                 f"<div style='color:#64748b;font-size:10px;'><b>Q:</b> {q}</div>"
-                f"<div style='color:#f59e0b;font-size:11px;font-style:italic;'>⏳ Thinking...</div>"
+                f"<div style='color:#f59e0b;font-size:11px;font-style:italic;'>⏳ Thinking{race_hint}...</div>"
             )
             self._toggle_expand(True)
             self.set_thinking()

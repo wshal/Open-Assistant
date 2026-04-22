@@ -491,6 +491,13 @@ class OverlayWindow(QMainWindow):
         capture_screen=False,
         latency_ms=0,
         available_providers=None,
+        stage_timings=None,
+        request_metadata=None,
+        providers_tried=None,
+        race: bool = False,
+        had_screen: bool = False,
+        had_audio: bool = False,
+        had_rag: bool = False,
     ):
         """Update the status bar with current state."""
         parts = []
@@ -523,6 +530,42 @@ class OverlayWindow(QMainWindow):
             parts.append("⚡ Ready")
 
         self._status_snapshot = " | ".join(parts)
+
+        # Surface stage timings as a tooltip to aid latency debugging without UI clutter.
+        try:
+            st = stage_timings or {}
+            rm = request_metadata or {}
+            tip_parts = []
+            if race:
+                tip_parts.append("Text race mode: fastest success (no streaming)")
+            if providers_tried:
+                tip_parts.append(f"Providers tried: {', '.join(providers_tried)}")
+            ctx_parts = []
+            if had_screen:
+                ctx_parts.append("Screen")
+            if had_audio:
+                ctx_parts.append("Audio")
+            if had_rag:
+                ctx_parts.append("RAG")
+            if ctx_parts:
+                tip_parts.append(f"Context: {', '.join(ctx_parts)}")
+            speech_to_transcript = rm.get("speech_to_transcript_ms")
+            if speech_to_transcript is not None:
+                tip_parts.append(f"Speech->Transcript: {speech_to_transcript:.0f}ms")
+            ttfb = st.get("request_to_first_token_ms")
+            if ttfb is not None:
+                tip_parts.append(f"TTFB: {ttfb:.0f}ms")
+            total = st.get("request_to_complete_ms")
+            if total is not None:
+                tip_parts.append(f"Total: {total:.0f}ms")
+            rag_refine = st.get("rag_refine_parallel_ms")
+            if rag_refine is not None:
+                tip_parts.append(f"RAG+Refine: {rag_refine:.0f}ms")
+            tip = " | ".join(tip_parts).strip()
+            if tip:
+                self.transcript_lbl.setToolTip(tip)
+        except Exception:
+            pass
 
     # --- RESTORED BRIDGES ---
     def update_transcript(self, text: str, state: str = "auto"):

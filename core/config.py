@@ -129,11 +129,14 @@ class Config:
             ["groq", "gemini", "cerebras", "together", "ollama"],
         )
         self._data["ai"]["text"].setdefault("race_enabled", False)
+        # P2: Local-only mode to force Ollama usage without YAML edits.
+        self._data["ai"]["text"].setdefault("local_only", False)
         self._data["ai"].setdefault("vision", {})
         self._data["ai"]["vision"].setdefault("allow_paid_fallback", False)
         # Vision routing: provider priority + optional "race" for lowest latency.
         self._data["ai"]["vision"].setdefault("preferred_providers", ["gemini", "ollama"])
         self._data["ai"]["vision"].setdefault("race_enabled", False)
+        self._data["ai"]["vision"].setdefault("local_only", False)
         self._data.setdefault("app", {})
         self._data["app"].setdefault("focus_on_show", False)
         self._data.setdefault("stealth", {})

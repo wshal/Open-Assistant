@@ -93,6 +93,41 @@ class AIEngine(QObject):
         # Injected as the top block of every system prompt for the session.
         self._session_context: str = ""
 
+    @staticmethod
+    def _cooldown_seconds_for_error(exc: Exception) -> int:
+        """
+        Best-effort cooldown for transient provider failures so we don't keep
+        hammering an overloaded endpoint on the next request.
+        """
+        msg = str(exc or "").lower()
+        if any(
+            k in msg
+            for k in [
+                "503",
+                "unavailable",
+                "overloaded",
+                "high demand",
+                "service unavailable",
+            ]
+        ):
+            return 60
+        if any(k in msg for k in ["429", "rate limit", "ratelimit", "too many requests"]):
+            return 20
+        if any(k in msg for k in ["timeout", "timed out", "connection", "connectorerror"]):
+            return 10
+        return 0
+
+    def _maybe_cooldown_provider(self, provider, exc: Exception) -> None:
+        seconds = self._cooldown_seconds_for_error(exc)
+        if seconds <= 0:
+            return
+        try:
+            if provider and hasattr(provider, "disable"):
+                provider.disable(seconds=seconds)
+        except Exception:
+            # Cooldown is best-effort; never fail the request flow due to it.
+            pass
+
     def set_session_context(self, text: str):
         """Update the active session context injected into all system prompts."""
         self._session_context = (text or "").strip()
@@ -486,6 +521,7 @@ class AIEngine(QObject):
                         f"AI: Provider '{current_provider.name}' failed during stream "
                         f"({stream_err}). Trying fallback..."
                     )
+                    self._maybe_cooldown_provider(current_provider, stream_err)
                     full_response = ""  # Discard any partial output
 
                     if not fallback_queue:
@@ -670,20 +706,36 @@ class AIEngine(QObject):
 
         try:
             full_response = ""
+            first_token_time = None
             async for chunk in provider.generate_stream(sys_prompt, user_msg):
                 if self._is_cancelled:
                     return ""
+                if first_token_time is None:
+                    first_token_time = time.time()
                 full_response += chunk
                 self.response_chunk.emit(chunk)
 
             latency_ms = (time.time() - start_time) * 1000
+            stage_timings = {"request_to_complete_ms": latency_ms}
+            if first_token_time is not None:
+                stage_timings["request_to_first_token_ms"] = (first_token_time - start_time) * 1000
+
+            had_screen = bool((screen_context or nexus_snapshot.get("latest_ocr", "")).strip())
+            had_audio = bool((summarized_audio or "").strip())
             self.history.add(
                 query,
                 full_response,
                 provider=provider.name,
                 mode=mode_id,
                 latency=latency_ms,
-                metadata={"quick": True},
+                metadata={
+                    "quick": True,
+                    "stage_timings": stage_timings,
+                    "providers_tried": [provider.name],
+                    "had_screen": had_screen,
+                    "had_audio": had_audio,
+                    "had_rag": False,
+                },
             )
             self.response_complete.emit(full_response)
             return full_response
@@ -765,7 +817,9 @@ class AIEngine(QObject):
                 if name not in preferred:
                     preferred.append(name)
 
-        if self.config.get("ai.vision.allow_paid_fallback", False):
+        if bool(self.config.get("ai.vision.local_only", False)):
+            preferred = ["ollama"]
+        elif self.config.get("ai.vision.allow_paid_fallback", False):
             if "openai" not in preferred:
                 preferred.append("openai")
         else:
@@ -786,28 +840,16 @@ class AIEngine(QObject):
             raise Exception("No vision-capable provider available for screenshot analysis.")
 
         last_error = None
+        providers_tried = []
 
         # Optional low-latency "race": run providers concurrently and use the first success.
         # Note: we race non-streaming calls to keep the implementation simple and deterministic.
         # Allow providers to use a dedicated vision-tier model if configured.
         vision_tier = "vision"
 
-        if bool(self.config.get("ai.vision.race_enabled", False)) and len(candidates) >= 2:
-            async def _run_one(p):
-                if getattr(p, "supports_vision_stream", lambda: False)():
-                    # Consume stream into a full string for parity with non-streaming.
-                    out = ""
-                    async for chunk in p.analyze_image_stream(
-                        sys_prompt,
-                        user_msg,
-                        image_bytes,
-                        mime_type="image/png",
-                        tier=vision_tier,
-                    ):
-                        if self._is_cancelled:
-                            return ""
-                        out += chunk
-                    return out
+        async def _analyze_one(p):
+            """Call provider vision method with best-effort tier support."""
+            try:
                 return await p.analyze_image(
                     sys_prompt,
                     user_msg,
@@ -815,6 +857,54 @@ class AIEngine(QObject):
                     mime_type="image/png",
                     tier=vision_tier,
                 )
+            except TypeError as exc:
+                # Backward-compatible: some providers/test doubles don't accept tier.
+                if "unexpected keyword argument" in str(exc) and "tier" in str(exc):
+                    return await p.analyze_image(
+                        sys_prompt, user_msg, image_bytes, mime_type="image/png"
+                    )
+                raise
+
+        async def _analyze_one_stream(p):
+            """Stream provider vision output with best-effort tier support."""
+            try:
+                async for chunk in p.analyze_image_stream(
+                    sys_prompt,
+                    user_msg,
+                    image_bytes,
+                    mime_type="image/png",
+                    tier=vision_tier,
+                ):
+                    yield chunk
+                return
+            except TypeError as exc:
+                if "unexpected keyword argument" in str(exc) and "tier" in str(exc):
+                    async for chunk in p.analyze_image_stream(
+                        sys_prompt,
+                        user_msg,
+                        image_bytes,
+                        mime_type="image/png",
+                    ):
+                        yield chunk
+                    return
+                raise
+
+        if (
+            bool(self.config.get("ai.vision.race_enabled", False))
+            and not bool(self.config.get("ai.vision.local_only", False))
+            and len(candidates) >= 2
+        ):
+            providers_tried = [p.name for p in candidates]
+            async def _run_one(p):
+                if getattr(p, "supports_vision_stream", lambda: False)():
+                    # Consume stream into a full string for parity with non-streaming.
+                    out = ""
+                    async for chunk in _analyze_one_stream(p):
+                        if self._is_cancelled:
+                            return ""
+                        out += chunk
+                    return out
+                return await _analyze_one(p)
 
             tasks = {asyncio.create_task(_run_one(p)): p for p in candidates}
             try:
@@ -828,6 +918,7 @@ class AIEngine(QObject):
                             response = t.result() or ""
                         except Exception as exc:
                             last_error = exc
+                            self._maybe_cooldown_provider(p, exc)
                             continue
 
                         if self._is_cancelled:
@@ -845,13 +936,28 @@ class AIEngine(QObject):
                             provider=p.name if p else "vision",
                             mode=mode_id,
                             latency=latency_ms,
-                            metadata={"vision": True},
+                            metadata={
+                                "vision": True,
+                                "vision_race": True,
+                                "stage_timings": {"request_to_complete_ms": latency_ms},
+                                "providers_tried": providers_tried,
+                                "had_screen": True,
+                                "had_audio": bool((nexus_snapshot or {}).get("full_audio_history", "").strip()),
+                                "had_rag": False,
+                            },
                         )
                         self.history.add_screen_analysis(
                             query,
                             response,
                             provider=p.name if p else "vision",
-                            metadata={"vision": True},
+                            metadata={
+                                "vision": True,
+                                "vision_race": True,
+                                "providers_tried": providers_tried,
+                                "had_screen": True,
+                                "had_audio": bool((nexus_snapshot or {}).get("full_audio_history", "").strip()),
+                                "had_rag": False,
+                            },
                         )
                         # Emit a single chunk so the UI doesn't look blank.
                         if response:
@@ -870,29 +976,18 @@ class AIEngine(QObject):
 
         for provider in candidates:
             emitted_partial = False
+            providers_tried.append(provider.name)
             try:
                 response = ""
                 if getattr(provider, "supports_vision_stream", lambda: False)():
-                    async for chunk in provider.analyze_image_stream(
-                        sys_prompt,
-                        user_msg,
-                        image_bytes,
-                        mime_type="image/png",
-                        tier=vision_tier,
-                    ):
+                    async for chunk in _analyze_one_stream(provider):
                         if self._is_cancelled:
                             return ""
                         response += chunk
                         emitted_partial = True
                         self.response_chunk.emit(chunk)
                 else:
-                    response = await provider.analyze_image(
-                        sys_prompt,
-                        user_msg,
-                        image_bytes,
-                        mime_type="image/png",
-                        tier=vision_tier,
-                    )
+                    response = await _analyze_one(provider)
                 if self._is_cancelled:
                     return ""
 
@@ -903,13 +998,26 @@ class AIEngine(QObject):
                     provider=provider.name,
                     mode=mode_id,
                     latency=latency_ms,
-                    metadata={"vision": True},
+                    metadata={
+                        "vision": True,
+                        "stage_timings": {"request_to_complete_ms": latency_ms},
+                        "providers_tried": list(providers_tried),
+                        "had_screen": True,
+                        "had_audio": bool((nexus_snapshot or {}).get("full_audio_history", "").strip()),
+                        "had_rag": False,
+                    },
                 )
                 self.history.add_screen_analysis(
                     query,
                     response,
                     provider=provider.name,
-                    metadata={"vision": True},
+                    metadata={
+                        "vision": True,
+                        "providers_tried": list(providers_tried),
+                        "had_screen": True,
+                        "had_audio": bool((nexus_snapshot or {}).get("full_audio_history", "").strip()),
+                        "had_rag": False,
+                    },
                 )
                 self.response_complete.emit(response)
                 return response
@@ -917,6 +1025,7 @@ class AIEngine(QObject):
                 if emitted_partial:
                     self.response_complete.emit("")
                 last_error = exc
+                self._maybe_cooldown_provider(provider, exc)
                 logger.warning(f"Vision analysis failed on {provider.name}: {exc}")
 
         raise Exception(str(last_error) if last_error else "Vision analysis failed.")
@@ -1097,6 +1206,15 @@ class AIEngine(QObject):
         Accepts a Mode object or a string mode name.
         When a Mode object is given, its preferred_tier is passed to the router.
         """
+        # P2: Local-only mode (Ollama) overrides routing for privacy/offline use.
+        if bool(self.config.get("ai.text.local_only", False)):
+            provider = self._providers.get("ollama")
+            if provider and getattr(provider, "enabled", False) and provider.check_rate():
+                mode_name = mode.name if hasattr(mode, "name") else str(mode or "general")
+                tier = self._router._tier_for_task(mode_name) if self._router else "balanced"
+                return provider, tier
+            return None, ""
+
         prefer_speed = complexity in {"simple", "moderate"}
         prefer_quality = complexity in {"complex", "reasoning"}
 
@@ -1184,10 +1302,11 @@ class AIEngine(QObject):
         for pid, prov in list(self._providers.items()):
             info = dict(results.get(pid, {}))
             state = info.get("state", "unknown")
+            locked_state = state in {"cooldown", "rate_limited", "disabled"}
             try:
                 if hasattr(prov, "check_availability"):
                     is_ok = await asyncio.wait_for(prov.check_availability(), timeout=5)
-                    if is_ok:
+                    if is_ok and not locked_state:
                         state = "active"
                     elif getattr(prov, "state", "") == "missing":
                         state = "missing"
@@ -1196,7 +1315,8 @@ class AIEngine(QObject):
                     elif state not in {"cooldown", "rate_limited", "disabled"}:
                         state = "down"
             except Exception:
-                state = "down"
+                if not locked_state:
+                    state = "down"
 
             info["state"] = state
             info["selected"] = pid == self._active_provider_id

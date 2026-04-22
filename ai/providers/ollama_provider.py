@@ -54,6 +54,25 @@ class OllamaProvider(BaseProvider):
         self._generate_timeout = aiohttp.ClientTimeout(total=180)
         self._resolved_model = ""
         self._resolved_vision_model = ""
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Reuse a single aiohttp session to avoid per-request TCP overhead."""
+        if self._session and not self._session.closed:
+            return self._session
+        if self._connector is None or self._connector.closed:
+            self._connector = aiohttp.TCPConnector(keepalive_timeout=30, limit=8)
+        self._session = aiohttp.ClientSession(connector=self._connector)
+        return self._session
+
+    async def close(self):
+        """Best-effort cleanup (optional)."""
+        try:
+            if self._session and not self._session.closed:
+                await self._session.close()
+        except Exception:
+            pass
 
     def _get_configured_vision_model(self) -> str:
         """
@@ -161,21 +180,19 @@ class OllamaProvider(BaseProvider):
         self._state = self.STATE_CHECKING
 
         try:
-            async with aiohttp.ClientSession() as session:
-                # Step 1: Check if Ollama server is running
-                async with session.get(
-                    f"{self.endpoint}/api/tags", timeout=self._connect_timeout
-                ) as resp:
-                    if resp.status != 200:
-                        self._state = self.STATE_UNAVAILABLE
-                        self.enabled = False
-                        logger.warning("  Ollama: Server returned non-200")
-                        return False
+            session = await self._get_session()
+            # Step 1: Check if Ollama server is running
+            async with session.get(
+                f"{self.endpoint}/api/tags", timeout=self._connect_timeout
+            ) as resp:
+                if resp.status != 200:
+                    self._state = self.STATE_UNAVAILABLE
+                    self.enabled = False
+                    logger.warning("  Ollama: Server returned non-200")
+                    return False
 
-                    data = await resp.json()
-                    self._available_models = [
-                        model["name"] for model in data.get("models", [])
-                    ]
+                data = await resp.json()
+                self._available_models = [model["name"] for model in data.get("models", [])]
 
             # Step 2: Check if our target model is available
             configured_target = super().get_model()
@@ -236,35 +253,35 @@ class OllamaProvider(BaseProvider):
         logger.info(f"Pulling Ollama model: {model}...")
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.endpoint}/api/pull",
-                    json={"name": model},
-                    timeout=aiohttp.ClientTimeout(total=3600),
-                ) as resp:
-                    last_status = ""
-                    async for line in resp.content:
-                        if not line:
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
+            session = await self._get_session()
+            async with session.post(
+                f"{self.endpoint}/api/pull",
+                json={"name": model},
+                timeout=aiohttp.ClientTimeout(total=3600),
+            ) as resp:
+                last_status = ""
+                async for line in resp.content:
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
 
-                        status = data.get("status", "")
-                        if status == last_status:
-                            continue
+                    status = data.get("status", "")
+                    if status == last_status:
+                        continue
 
-                        last_status = status
-                        total = data.get("total", 0)
-                        completed = data.get("completed", 0)
-                        percent = (completed / total * 100) if total > 0 else 0
+                    last_status = status
+                    total = data.get("total", 0)
+                    completed = data.get("completed", 0)
+                    percent = (completed / total * 100) if total > 0 else 0
 
-                        if progress_callback:
-                            progress_callback(status, percent)
+                    if progress_callback:
+                        progress_callback(status, percent)
 
-                        if "pulling" in status.lower():
-                            logger.info(f"  Download {status}: {percent:.0f}%")
+                    if "pulling" in status.lower():
+                        logger.info(f"  Download {status}: {percent:.0f}%")
 
             # Verify the model is now available
             self._state = self.STATE_READY
@@ -324,29 +341,29 @@ class OllamaProvider(BaseProvider):
         model = self.get_model(tier)
         t0 = time.time()
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.endpoint}/api/chat",
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "stream": False,
-                    "options": {"num_ctx": 8192, "temperature": 0.7},
-                },
-                timeout=self._generate_timeout,
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    raise Exception(f"Ollama error {resp.status}: {body[:200]}")
+        session = await self._get_session()
+        async with session.post(
+            f"{self.endpoint}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "stream": False,
+                "options": {"num_ctx": 8192, "temperature": 0.7},
+            },
+            timeout=self._generate_timeout,
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise Exception(f"Ollama error {resp.status}: {body[:200]}")
 
-                data = await resp.json()
-                text = data.get("message", {}).get("content", "")
-                tok = data.get("eval_count", len(text) // 4)
-                self.stats.record(tok, time.time() - t0)
-                return text
+            data = await resp.json()
+            text = data.get("message", {}).get("content", "")
+            tok = data.get("eval_count", len(text) // 4)
+            self.stats.record(tok, time.time() - t0)
+            return text
 
     async def generate_stream(
         self, system: str, user: str, tier: str = None
@@ -366,35 +383,35 @@ class OllamaProvider(BaseProvider):
         t0 = time.time()
         tok = 0
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.endpoint}/api/chat",
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "stream": True,
-                    "options": {"num_ctx": 8192, "temperature": 0.7},
-                },
-                timeout=self._generate_timeout,
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    raise Exception(f"Ollama error {resp.status}: {body[:200]}")
+        session = await self._get_session()
+        async with session.post(
+            f"{self.endpoint}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "stream": True,
+                "options": {"num_ctx": 8192, "temperature": 0.7},
+            },
+            timeout=self._generate_timeout,
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise Exception(f"Ollama error {resp.status}: {body[:200]}")
 
-                async for line in resp.content:
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    chunk = data.get("message", {}).get("content", "")
-                    if chunk:
-                        tok += 1
-                        yield chunk
+            async for line in resp.content:
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                chunk = data.get("message", {}).get("content", "")
+                if chunk:
+                    tok += 1
+                    yield chunk
 
         self.stats.record(tok, time.time() - t0)
 
@@ -432,33 +449,33 @@ class OllamaProvider(BaseProvider):
         t0 = time.time()
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.endpoint}/api/chat",
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {
-                            "role": "user",
-                            "content": user,
-                            "images": [image_b64],
-                        },
-                    ],
-                    "stream": False,
-                    "options": {"num_ctx": 8192, "temperature": 0.4},
-                },
-                timeout=self._generate_timeout,
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    raise Exception(f"Ollama error {resp.status}: {body[:200]}")
+        session = await self._get_session()
+        async with session.post(
+            f"{self.endpoint}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": user,
+                        "images": [image_b64],
+                    },
+                ],
+                "stream": False,
+                "options": {"num_ctx": 8192, "temperature": 0.4},
+            },
+            timeout=self._generate_timeout,
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise Exception(f"Ollama error {resp.status}: {body[:200]}")
 
-                data = await resp.json()
-                text = data.get("message", {}).get("content", "")
-                tok = data.get("eval_count", len(text) // 4)
-                self.stats.record(tok, time.time() - t0)
-                return text
+            data = await resp.json()
+            text = data.get("message", {}).get("content", "")
+            tok = data.get("eval_count", len(text) // 4)
+            self.stats.record(tok, time.time() - t0)
+            return text
 
     def supports_vision_stream(self) -> bool:
         return self.supports_vision()
@@ -489,38 +506,38 @@ class OllamaProvider(BaseProvider):
         tok = 0
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.endpoint}/api/chat",
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {
-                            "role": "user",
-                            "content": user,
-                            "images": [image_b64],
-                        },
-                    ],
-                    "stream": True,
-                    "options": {"num_ctx": 8192, "temperature": 0.4},
-                },
-                timeout=self._generate_timeout,
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    raise Exception(f"Ollama error {resp.status}: {body[:200]}")
+        session = await self._get_session()
+        async with session.post(
+            f"{self.endpoint}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": user,
+                        "images": [image_b64],
+                    },
+                ],
+                "stream": True,
+                "options": {"num_ctx": 8192, "temperature": 0.4},
+            },
+            timeout=self._generate_timeout,
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise Exception(f"Ollama error {resp.status}: {body[:200]}")
 
-                async for line in resp.content:
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    chunk = data.get("message", {}).get("content", "")
-                    if chunk:
-                        tok += 1
-                        yield chunk
+            async for line in resp.content:
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                chunk = data.get("message", {}).get("content", "")
+                if chunk:
+                    tok += 1
+                    yield chunk
 
         self.stats.record(tok, time.time() - t0)

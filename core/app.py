@@ -157,6 +157,14 @@ class OpenAssistApp(QObject):
         entries = self.history.get_last(1)
         latency_ms = 0
         provider = None
+        metadata = {}
+        stage_timings = {}
+        req_meta = {}
+        providers_tried = []
+        race = False
+        had_screen = False
+        had_audio = False
+        had_rag = False
         if entries:
             entry = entries[-1]
             latency_ms = getattr(entry, "latency", 0)
@@ -164,6 +172,11 @@ class OpenAssistApp(QObject):
             metadata = getattr(entry, "metadata", {}) or {}
             stage_timings = metadata.get("stage_timings", {})
             req_meta = metadata.get("request_metadata", {})
+            providers_tried = metadata.get("providers_tried", []) or []
+            race = bool(metadata.get("race", False))
+            had_screen = bool(metadata.get("had_screen", False))
+            had_audio = bool(metadata.get("had_audio", False))
+            had_rag = bool(metadata.get("had_rag", False))
             if stage_timings:
                 summary_parts = []
                 speech_to_transcript = req_meta.get("speech_to_transcript_ms")
@@ -203,6 +216,13 @@ class OpenAssistApp(QObject):
             capture_screen=capture_active and screen_enabled,
             latency_ms=latency_ms if entries else 0,
             available_providers=available,
+            stage_timings=stage_timings,
+            request_metadata=req_meta,
+            providers_tried=providers_tried,
+            race=race,
+            had_screen=had_screen,
+            had_audio=had_audio,
+            had_rag=had_rag,
         )
 
         # ── Reset transcript label to Listening/Ready ─────────────────────────────
@@ -217,6 +237,11 @@ class OpenAssistApp(QObject):
             # Reset to listening/ready based on session state
             if getattr(self, "session_active", False):
                 latency_str = f" ({latency_ms:.0f}ms)" if latency_ms else ""
+                ttfb = stage_timings.get("request_to_first_token_ms") if stage_timings else None
+                if ttfb is not None:
+                    latency_str = f"{latency_str} ttfb={ttfb:.0f}ms"
+                if race:
+                    latency_str = f"{latency_str} race"
                 self.overlay.update_transcript(
                     f"🌐 Listening{latency_str}...",
                     state="listening",
@@ -491,10 +516,13 @@ class OpenAssistApp(QObject):
             self.overlay.show_chat_view()
             self.overlay._current_query = q
             self.overlay.response_area.clear()
+            race_hint = ""
+            if s in {"manual", "speech"} and bool(self.config.get("ai.text.race_enabled", False)):
+                race_hint = " (race mode — no streaming)"
             self.overlay.response_area.setHtml(
                 f"<div style='color:#64748b;font-size:10px;margin-bottom:5px;'>"
                 f"<b>QUERY:</b> {q}</div>"
-                f"<div style='color:#f59e0b;font-size:11px;font-style:italic;'>⏳ Thinking...</div>"
+                f"<div style='color:#f59e0b;font-size:11px;font-style:italic;'>⏳ Thinking{race_hint}...</div>"
             )
 
         # Start timing for instrumentation

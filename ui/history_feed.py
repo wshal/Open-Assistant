@@ -273,7 +273,10 @@ class HistoryFeedView(QWidget):
             sources.append("📚 RAG")
         providers_tried = metadata.get("providers_tried", [])
         if len(providers_tried) > 1:
-            sources.append(f"↩ Fallback ({' → '.join(providers_tried)})")
+            if metadata.get("race") or metadata.get("vision_race"):
+                sources.append(f"⚡ Race ({' | '.join(providers_tried)})")
+            else:
+                sources.append(f"↩ Fallback ({' → '.join(providers_tried)})")
         if not sources:
             return None
         strip = QLabel("  ".join(sources))
