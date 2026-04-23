@@ -54,7 +54,6 @@ class StandbyView(QWidget):
             padding: 9px 14px;
             font-size: 10px;
             font-weight: 700;
-            letter-spacing: 1px;
         }
         QPushButton:hover {
             background: rgba(40, 42, 65, 240);
@@ -77,7 +76,6 @@ class StandbyView(QWidget):
             padding: 9px 14px;
             font-size: 10px;
             font-weight: 800;
-            letter-spacing: 1px;
         }
     """
 
@@ -93,7 +91,6 @@ class StandbyView(QWidget):
             border-radius: 26px;
             font-weight: 900;
             font-size: 13px;
-            letter-spacing: 3px;
             border: 1px solid rgba(255, 255, 255, 18);
         }
         QPushButton:hover:enabled {
@@ -122,7 +119,6 @@ class StandbyView(QWidget):
             border-radius: 26px;
             font-weight: 900;
             font-size: 13px;
-            letter-spacing: 3px;
             border: 1px solid rgba(255, 255, 255, 18);
         }
         QPushButton:hover:enabled {
@@ -143,7 +139,7 @@ class StandbyView(QWidget):
     # ── Section header shared style ──────────────────────────────────────────
     _SS_SECTION = (
         "font-size: 9px; color: #475569; font-weight: 900; "
-        "letter-spacing: 2.5px; background: transparent;"
+        "background: transparent;"
     )
 
     def __init__(self, parent=None):
@@ -225,7 +221,6 @@ class StandbyView(QWidget):
         self.subtitle.setStyleSheet("""
             font-size: 9px;
             color: #7c86cc;
-            letter-spacing: 2.8px;
             font-weight: 800;
             background: transparent;
         """)
@@ -328,7 +323,7 @@ class StandbyView(QWidget):
         self._update_badge.setStyleSheet(
             "background: rgba(251,191,36,0.15); color: #fbbf24;"
             " border: 1px solid rgba(251,191,36,0.4); border-radius: 10px;"
-            " font-size: 9px; font-weight: 800; letter-spacing: 1px; padding: 3px 10px;"
+            " font-size: 9px; font-weight: 800; padding: 3px 10px;"
         )
         self._update_badge.setText("⬆ UPDATE AVAILABLE — github.com/OpenAssist")
         self._update_badge.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -396,28 +391,21 @@ class StandbyView(QWidget):
 
         def _fetch():
             try:
-                import urllib.request, json as _json
+                from core.updater import get_latest_release_info, is_newer
+
                 REPO = "OpenAssist/OpenAssist"
-                url = f"https://api.github.com/repos/{REPO}/releases/latest"
-                req = urllib.request.Request(url, headers={"User-Agent": "OpenAssist-Updater/1.0"})
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    data = _json.loads(r.read())
-                latest_tag = data.get("tag_name", "").lstrip("v")
+                info = get_latest_release_info(REPO, timeout_s=5.0)
+                if not info:
+                    return
+                latest_tag = info.tag
                 try:
                     from core.constants import APP_VERSION as local_ver
                 except Exception:
                     local_ver = "0.0.0"
 
-                def _ver_tuple(v):
-                    try:
-                        return tuple(int(x) for x in str(v).split(".")[:3])
-                    except Exception:
-                        return (0, 0, 0)
-
-                if _ver_tuple(latest_tag) > _ver_tuple(local_ver):
-                    tag = data.get("tag_name", latest_tag)
+                if is_newer(latest_tag, local_ver):
                     # Update badge text on main thread via QTimer trick
-                    QTimer.singleShot(0, lambda: self._show_update_badge(tag))
+                    QTimer.singleShot(0, lambda: self._show_update_badge(info))
             except Exception:
                 pass  # Non-fatal — silently ignore (offline, rate limit, etc.)
 
@@ -426,6 +414,28 @@ class StandbyView(QWidget):
 
     def _show_update_badge(self, tag: str):
         """Show the update badge with the new version tag."""
+        # Backward/forward compatible: accept either a tag string or a ReleaseInfo.
+        if not isinstance(tag, str):
+            info = tag
+            self._latest_release = info
+            tag_str = str(getattr(info, "tag", "") or "")
+            asset = str(getattr(info, "asset_name", "") or "")
+            if asset:
+                self._update_badge.setText(
+                    f"UPDATE AVAILABLE  v{tag_str}  - click to download"
+                )
+                self._update_badge.setToolTip(
+                    f"Click to download: {asset}\n(Installer will open after download)"
+                )
+                self._update_badge.mousePressEvent = lambda e: self._download_update()
+            else:
+                self._update_badge.setText(
+                    f"UPDATE AVAILABLE  v{tag_str}  - click to visit releases"
+                )
+                self._update_badge.setToolTip("Click to open releases page")
+                self._update_badge.mousePressEvent = lambda e: self._open_releases()
+            self._update_badge.show()
+            return
         self._update_badge.setText(f"⬆ UPDATE AVAILABLE  v{tag}  — click to visit releases")
         self._update_badge.mousePressEvent = lambda e: self._open_releases()
         self._update_badge.show()
@@ -438,18 +448,87 @@ class StandbyView(QWidget):
         except Exception:
             pass
 
+    def _download_update(self):
+        """Best-effort download of latest release asset (does not self-install)."""
+        import threading
+
+        info = getattr(self, "_latest_release", None)
+        url = getattr(info, "asset_url", "") if info else ""
+        name = getattr(info, "asset_name", "") if info else ""
+        if not url or not name:
+            self._open_releases()
+            return
+
+        def _do():
+            try:
+                from pathlib import Path
+                import urllib.request
+
+                dest_dir = Path("data") / "updates"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = dest_dir / name
+
+                QTimer.singleShot(0, lambda: self._update_badge.setText("DOWNLOADING UPDATE..."))
+                urllib.request.urlretrieve(url, dest)  # nosec B310 (trusted GitHub asset URL)
+
+                def _open():
+                    try:
+                        from PyQt6.QtGui import QDesktopServices
+                        from PyQt6.QtCore import QUrl
+
+                        QDesktopServices.openUrl(QUrl.fromLocalFile(str(dest)))
+                    except Exception:
+                        self._open_releases()
+
+                QTimer.singleShot(0, _open)
+            except Exception:
+                QTimer.singleShot(0, self._open_releases)
+
+        threading.Thread(target=_do, daemon=True, name="update-download").start()
+
     # ── Provider status bar ──────────────────────────────────────────────────
 
     def set_provider_statuses(self, statuses: dict):
+        meta = statuses.get("_meta", {}) if isinstance(statuses, dict) else {}
+        # Filter out meta/non-provider entries.
+        if isinstance(statuses, dict):
+            statuses = {
+                pid: info
+                for pid, info in statuses.items()
+                if not str(pid).startswith("_") and isinstance(info, dict)
+            }
+        else:
+            statuses = {}
+
         while self.model_bar_layout.count():
             item = self.model_bar_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
+        # P2: Local-only visibility indicator (routing clarity)
+        try:
+            t_local = bool(meta.get("text_local_only"))
+            v_local = bool(meta.get("vision_local_only"))
+            if t_local or v_local:
+                badge = QLabel("LOCAL ONLY")
+                badge.setStyleSheet(
+                    "color: #fbbf24; font-size: 8px; font-weight: 900;"
+                    " background: rgba(251,191,36,0.10); border: 1px solid rgba(251,191,36,0.35);"
+                    " border-radius: 9px; padding: 2px 7px;"
+                )
+                badge.setToolTip(
+                    "Local-only routing is enabled.\n"
+                    + ("Text: Ollama only\n" if t_local else "Text: normal\n")
+                    + ("Vision: Ollama only" if v_local else "Vision: normal")
+                )
+                self.model_bar_layout.addWidget(badge)
+        except Exception:
+            pass
+
         if not statuses:
             badge = QLabel("WAITING FOR PROVIDERS")
             badge.setStyleSheet(
-                "color: #3b4266; font-size: 8px; font-weight: 900; letter-spacing: 1.5px;"
+                "color: #3b4266; font-size: 8px; font-weight: 900;"
             )
             self.model_bar_layout.addWidget(badge)
             return
@@ -463,7 +542,7 @@ class StandbyView(QWidget):
         if not ready_statuses:
             badge = QLabel("NO PROVIDERS READY")
             badge.setStyleSheet(
-                "color: #3b4266; font-size: 8px; font-weight: 900; letter-spacing: 1.5px;"
+                "color: #3b4266; font-size: 8px; font-weight: 900;"
             )
             self.model_bar_layout.addWidget(badge)
             return
@@ -480,15 +559,24 @@ class StandbyView(QWidget):
             )
             label = f"\u25cf {pid.upper()}" if selected else pid.upper()
             badge = QLabel(label)
+            if state == "cooldown":
+                reason = str(info.get("cooldown_reason", "") or "").strip()
+                remaining = int(info.get("cooldown_remaining_s", 0) or 0)
+                tip = "Provider cooldown"
+                if reason:
+                    tip += f"\nReason: {reason}"
+                if remaining > 0:
+                    tip += f"\nRemaining: ~{remaining}s"
+                badge.setToolTip(tip)
             if selected:
                 badge.setStyleSheet(
-                    f"color: {color}; font-size: 8px; font-weight: 900; letter-spacing: 1.2px; "
+                    f"color: {color}; font-size: 8px; font-weight: 900; "
                     "background: rgba(255,255,255,0.05); "
                     f"border: 1px solid {color}30; border-radius: 9px; padding: 2px 7px;"
                 )
             else:
                 badge.setStyleSheet(
-                    f"color: {color}; font-size: 8px; font-weight: 800; letter-spacing: 1.2px;"
+                    f"color: {color}; font-size: 8px; font-weight: 800;"
                 )
             self.model_bar_layout.addWidget(badge)
 
@@ -542,7 +630,7 @@ class StandbyView(QWidget):
             self._ctx_chip.setText(f"✓ Context: {preset_name}")
             self._ctx_chip.setStyleSheet(
                 "color: #4ade80; font-size: 8px; font-weight: 800; "
-                "letter-spacing: 1.2px; background: rgba(74,222,128,0.08); "
+                "background: rgba(74,222,128,0.08); "
                 "border: 1px solid rgba(74,222,128,0.25); border-radius: 8px; "
                 "padding: 1px 10px;"
             )
@@ -551,7 +639,7 @@ class StandbyView(QWidget):
             self._ctx_chip.setText(f"⚡ Suggested: {preset_name} (Settings › CONTEXT)")
             self._ctx_chip.setStyleSheet(
                 "color: #f59e0b; font-size: 8px; font-weight: 700; "
-                "letter-spacing: 0.8px; background: rgba(245,158,11,0.07); "
+                "background: rgba(245,158,11,0.07); "
                 "border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; "
                 "padding: 1px 10px;"
             )

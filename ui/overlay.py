@@ -364,7 +364,6 @@ class OverlayWindow(QMainWindow):
                 padding: 8px 12px;
                 font-size: 10px;
                 font-weight: 800;
-                letter-spacing: 1px;
             }
             QPushButton:hover {
                 background: rgba(56, 189, 248, 0.18);

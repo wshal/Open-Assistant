@@ -84,41 +84,18 @@ class ContextRanker:
 
 
 class PromptBuilder:
-    SYSTEMS = {
-        "general": """You are OpenAssist AI, a real-time assistant with screen and audio access.
+    # Single source of truth for system prompts per mode.
+    # (Consolidated to reduce drift between SYSTEMS vs PROMPT_PACKS.)
+    PROMPT_PACKS = {
+        "general": {
+            "system": """You are OpenAssist AI, a real-time assistant with screen and audio access.
 Rules:
 - Prefer a fast, direct answer. Use screen/audio context only when it is relevant to the question.
 - Use recent audio and session context as supporting evidence.
 - Distinguish clearly between observed facts and inference.
 - Be concise, useful, and action-oriented.
 - Use bullets when scanning is easier. Code in fenced blocks. No filler.""",
-        "interview": """You are an interview coach with real-time screen/audio access.
-FORMAT:
-- Key Points (3-5 bullets)
-- STAR Answer (Behavioral)
-- Technical Detail (Technical)
-- Sample Phrasing (1-2 sentences)
-PRIORITY:
-- Use the most recent audio first.
-- Use the visible on-screen question as support if present.
-- Keep answer framing concise and interview-ready.
-Keep scannable for quick reading.""",
-        "meeting": """You are a real-time meeting assistant.
-TRACK: Key Points | Action Items | Decisions | Suggested Responses
-Bullet points only. Ultra-concise.
-Prefer fast, direct responses over long analysis.""",
-        "coding": """You are a senior engineer. Screen shows code.
-Rules: Fix > explain. Code in fenced blocks. Production-ready.
-FORMAT: Issue | Fix | Why (1 line)""",
-        "writing": """You are a professional editor.
-Show before/after rewrites. Be specific. Check tone/clarity.""",
-        "exam": """You are an exam assistant with screen access.
-See questions and provide accurate answers.
-FORMAT: Answer | Explanation (brief) | Key Concept
-For MCQ: state correct answer first.""",
-    }
-
-    PROMPT_PACKS = {
+        },
         "meeting": {
             "system": """You are a real-time meeting copilot.
 CONTEXT TRACKING:
@@ -201,6 +178,12 @@ RULES:
 - Prefer specific data over general claims""",
             "user_template": "[Screen/Content]\n{screen}\n\n[Research Query]\n{query}\n\n[Knowledge Base]\n{rag}",
         },
+        "exam": {
+            "system": """You are an exam assistant with screen access.
+See questions and provide accurate answers.
+FORMAT: Answer | Explanation (brief) | Key Concept
+For MCQ: state correct answer first.""",
+        },
     }
 
     UNCERTAINTY_MARKERS = {
@@ -251,12 +234,10 @@ RULES:
         else:
             name = mode.name if mode and hasattr(mode, "name") else "general"
 
-        if name in self.PROMPT_PACKS:
-            base = self.PROMPT_PACKS[name]["system"]
-        else:
-            base = self.SYSTEMS.get(name, self.SYSTEMS["general"])
-            if mode and hasattr(mode, "custom_instructions") and mode.custom_instructions:
-                base += f"\n\nCustom: {mode.custom_instructions}"
+        pack = self.PROMPT_PACKS.get(name) or self.PROMPT_PACKS.get("general") or {}
+        base = pack.get("system", "")
+        if mode and hasattr(mode, "custom_instructions") and mode.custom_instructions:
+            base += f"\n\nCustom: {mode.custom_instructions}"
 
         if session_context:
             return (
@@ -266,38 +247,6 @@ RULES:
                 f"{base}"
             )
         return base
-
-    def build_from_pack(
-        self,
-        mode,
-        screen: str = "",
-        audio: str = "",
-        rag: str = "",
-        query: str = "",
-        nexus: Dict[str, Any] = None,
-    ) -> tuple:
-        """Build system and user prompts from prompt pack, respecting Mode limits."""
-        mode_name = mode.name if hasattr(mode, "name") else str(mode)
-        pack = self.PROMPT_PACKS.get(mode_name)
-        if not pack:
-            return self.system(mode), self.user(query, screen, audio, rag, nexus=nexus)
-
-        # Use mode-specific limits if available
-        screen_limit = mode.limit("screen") if hasattr(mode, "limit") else 4000
-        audio_limit  = mode.limit("audio")  if hasattr(mode, "limit") else 2500
-        rag_limit    = mode.limit("rag")    if hasattr(mode, "limit") else 2000
-
-        user_prompt = pack["user_template"].format(
-            screen=screen[:screen_limit] if screen else "",
-            audio=audio[-audio_limit:]   if audio  else "",
-            rag=rag[:rag_limit]          if rag    else "",
-            query=query,
-        )
-
-        if nexus:
-            user_prompt = f"[ACTIVE WINDOW: {nexus.get('active_window', 'Unknown')}]\n" + user_prompt
-
-        return pack["system"], user_prompt
 
     def user(
         self,

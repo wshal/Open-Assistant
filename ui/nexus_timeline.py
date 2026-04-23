@@ -63,7 +63,7 @@ class NexusTimelineView(QWidget):
         hdr = QHBoxLayout()
         title = QLabel("⏱ CONTEXT TIMELINE")
         title.setStyleSheet(
-            "color: #a0a0cc; font-weight: 900; font-size: 11px; letter-spacing: 1.5px;"
+            "color: #a0a0cc; font-weight: 900; font-size: 11px;"
         )
         hdr.addWidget(title)
         hdr.addStretch()

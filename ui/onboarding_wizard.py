@@ -40,7 +40,6 @@ STYLE_BTN_PRIMARY = """
         border-radius: 12px;
         font-weight: 800;
         font-size: 12px;
-        letter-spacing: 1px;
         padding: 15px 30px;
         border: none;
     }
@@ -150,7 +149,7 @@ class OnboardingWizard(QWidget):
 
         lbl_title = QLabel("🧠 OPENASSIST SETUP")
         lbl_title.setStyleSheet(
-            "color: #f1f5f9; font-size: 14px; font-weight: 800; letter-spacing: 2px; background: transparent;"
+            "color: #f1f5f9; font-size: 14px; font-weight: 800; background: transparent;"
         )
         hl.addWidget(lbl_title)
 
@@ -576,7 +575,7 @@ class OnboardingWizard(QWidget):
         self.content_layout.addWidget(icon)
 
         title = QLabel("SYSTEM READY")
-        title.setStyleSheet("color: #f1f5f9; font-size: 18px; font-weight: 900; letter-spacing: 2px;")
+        title.setStyleSheet("color: #f1f5f9; font-size: 18px; font-weight: 900;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.content_layout.addWidget(title)
 

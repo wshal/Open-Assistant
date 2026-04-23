@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -21,6 +22,9 @@ from PyQt6.QtWidgets import (
 )
 
 from ui.markdown_renderer import MarkdownRenderer
+from utils.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class HistoryFeedView(QWidget):
@@ -243,14 +247,22 @@ class HistoryFeedView(QWidget):
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(md_content)
             except Exception as ex:
-                pass  # Silently ignore write errors (user cancelled or permission denied)
+                logger.warning(f"History export failed: {ex}")
+                try:
+                    QMessageBox.warning(
+                        self,
+                        "Export Failed",
+                        f"Could not export session history.\n\n{ex}",
+                    )
+                except Exception:
+                    pass
 
     # ── Card builders ─────────────────────────────────────────────────────────
 
     def _section_label(self, text: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setStyleSheet(
-            "color: #8b9cff; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; margin-top: 8px;"
+            "color: #8b9cff; font-size: 11px; font-weight: bold; margin-top: 8px;"
         )
         return lbl
 
@@ -281,7 +293,7 @@ class HistoryFeedView(QWidget):
             return None
         strip = QLabel("  ".join(sources))
         strip.setStyleSheet(
-            "color: #475569; font-size: 9px; font-weight: 700; letter-spacing: 0.5px;"
+            "color: #475569; font-size: 9px; font-weight: 700;"
             " background: rgba(255,255,255,0.02); border-radius: 4px; padding: 2px 6px;"
         )
         return strip

@@ -55,7 +55,6 @@ QPushButton {{
     border-radius: 12px;
     font-weight: 800;
     font-size: 12px;
-    letter-spacing: 1px;
     padding: 15px 30px;
     border: none;
 }}
@@ -336,7 +335,7 @@ class SettingsView(QWidget):
     def _make_section_label(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setStyleSheet(
-            f"{TEXT_MUTED} font-size: 10px; font-weight: 800; letter-spacing: 1px; background: transparent;"
+            f"{TEXT_MUTED} font-size: 10px; font-weight: 800; background: transparent;"
         )
         label.setWordWrap(True)
         return label
@@ -405,7 +404,7 @@ class SettingsView(QWidget):
         hdr = QHBoxLayout()
         t = QLabel("⚙️ SYSTEM CONFIG")
         t.setStyleSheet(
-            f"{TEXT_PRIMARY} font-weight: 900; letter-spacing: 2px; font-size: 12px; background: transparent;"
+            f"{TEXT_PRIMARY} font-weight: 900; font-size: 12px; background: transparent;"
         )
         hdr.addWidget(t)
         hdr.addStretch()
@@ -441,7 +440,7 @@ class SettingsView(QWidget):
         self.btn_save.setStyleSheet("""
             QPushButton { 
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #4f46e5, stop:1 #7c3aed); 
-                color: white; border-radius: 24px; font-weight: 900; font-size: 11px; letter-spacing: 2px;
+                color: white; border-radius: 24px; font-weight: 900; font-size: 11px;
             }
             QPushButton:hover { background: #6366f1; border: 1px solid rgba(255,255,255,30); }
         """)
@@ -585,7 +584,7 @@ class SettingsView(QWidget):
 
         lbl_parallel = QLabel("⚡ PARALLEL INFERENCE")
         lbl_parallel.setStyleSheet(
-            "font-size: 10px; color: #475569; font-weight: 800; letter-spacing: 2px;"
+            "font-size: 10px; color: #475569; font-weight: 800;"
         )
         l.addWidget(lbl_parallel)
 
@@ -1044,7 +1043,7 @@ class SettingsView(QWidget):
 
         lbl_opacity_main = QLabel("STEALTH VISIBILITY")
         lbl_opacity_main.setStyleSheet(
-            f"{TEXT_PRIMARY} font-size: 11px; font-weight: 800; letter-spacing: 1px; background: transparent;"
+            f"{TEXT_PRIMARY} font-size: 11px; font-weight: 800; background: transparent;"
         )
         l.addWidget(lbl_opacity_main)
 
@@ -1103,7 +1102,7 @@ class SettingsView(QWidget):
 
         lbl_normal_opacity = QLabel("NORMAL HUD VISIBILITY")
         lbl_normal_opacity.setStyleSheet(
-            f"{TEXT_PRIMARY} font-size: 11px; font-weight: 800; letter-spacing: 1px; background: transparent;"
+            f"{TEXT_PRIMARY} font-size: 11px; font-weight: 800; background: transparent;"
         )
         l.addWidget(lbl_normal_opacity)
 
@@ -1161,7 +1160,7 @@ class SettingsView(QWidget):
         # Gaze Fade Section
         lbl_gaze = QLabel("NEURAL GAZE DETECTION")
         lbl_gaze.setStyleSheet(
-            f"{TEXT_PRIMARY} font-size: 11px; font-weight: 800; letter-spacing: 1px; background: transparent;"
+            f"{TEXT_PRIMARY} font-size: 11px; font-weight: 800; background: transparent;"
         )
         l.addWidget(lbl_gaze)
 
@@ -1311,7 +1310,7 @@ class SettingsView(QWidget):
         # Header
         hdr = QLabel("📝 SESSION CONTEXT")
         hdr.setStyleSheet(
-            f"{TEXT_PRIMARY} font-size: 11px; font-weight: 900; letter-spacing: 1.5px; background: transparent;"
+            f"{TEXT_PRIMARY} font-size: 11px; font-weight: 900; background: transparent;"
         )
         l.addWidget(hdr)
 
@@ -1333,7 +1332,7 @@ class SettingsView(QWidget):
         preset_row = QHBoxLayout()
         preset_lbl = QLabel("PRESETS")
         preset_lbl.setStyleSheet(
-            f"{TEXT_MUTED} font-size: 9px; font-weight: 800; letter-spacing: 1.5px; background: transparent;"
+            f"{TEXT_MUTED} font-size: 9px; font-weight: 800; background: transparent;"
         )
         preset_row.addWidget(preset_lbl)
 
@@ -1617,7 +1616,7 @@ class SettingsView(QWidget):
         self.btn_save.setStyleSheet("""
             QPushButton { 
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #4f46e5, stop:1 #7c3aed); 
-                color: white; border-radius: 24px; font-weight: 900; font-size: 11px; letter-spacing: 2px;
+                color: white; border-radius: 24px; font-weight: 900; font-size: 11px;
             }
             QPushButton:hover { background: #6366f1; border: 1px solid rgba(255,255,255,30); }
         """)
@@ -1627,7 +1626,7 @@ class SettingsView(QWidget):
             self.btn_save.setText("APPLYING...")
             self.btn_save.setEnabled(False)
             self.btn_save.setStyleSheet(
-                "background: #312e81; color: #6366f1; border-radius: 24px; font-weight: 900; font-size: 11px; letter-spacing: 2px;"
+                "background: #312e81; color: #6366f1; border-radius: 24px; font-weight: 900; font-size: 11px;"
             )
 
             for pid, inp in self.api_inputs.items():

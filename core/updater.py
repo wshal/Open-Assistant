@@ -1,101 +1,118 @@
-"""Auto-updater - checks GitHub for new releases."""
+"""
+Update helper (best-effort).
 
-import asyncio
-from typing import Optional, Tuple
+This is NOT a full self-updater (replacing a running EXE is non-trivial),
+but it provides:
+- GitHub releases check
+- Optional asset selection
+- Optional asset download path
+"""
 
-import aiohttp
-from packaging import version as pkg_version
+from __future__ import annotations
 
-from core.constants import APP_VERSION
-from utils.logger import setup_logger
-
-logger = setup_logger(__name__)
-
-GITHUB_REPO = "openassist-ai/openassist"
-RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+import json
+import platform
+import re
+import urllib.request
+from dataclasses import dataclass
+from typing import Optional
 
 
-class Updater:
-    """Check for and download updates from GitHub."""
+_VER_RE = re.compile(r"[^0-9.]")
 
-    def __init__(self, config):
-        self.config = config
-        self.current_version = APP_VERSION
-        self.latest_version = None
-        self.download_url = None
-        self.release_notes = None
 
-    async def check_for_update(self) -> Tuple[bool, Optional[str], Optional[str]]:
-        """
-        Check GitHub for newer version.
-        Returns: (update_available, latest_version, release_notes)
-        """
+def version_tuple(v: str) -> tuple[int, int, int]:
+    v = (v or "").strip().lstrip("v")
+    v = _VER_RE.sub("", v)
+    parts = [p for p in v.split(".") if p]
+    nums = []
+    for p in parts[:3]:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    RELEASES_URL,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                    headers={"Accept": "application/vnd.github.v3+json"},
-                ) as resp:
-                    if resp.status != 200:
-                        return False, None, None
+            nums.append(int(p))
+        except Exception:
+            nums.append(0)
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums[:3])
 
-                    data = await resp.json()
-                    tag = data.get("tag_name", "").lstrip("v")
-                    notes = data.get("body", "")
-                    assets = data.get("assets", [])
 
-                    self.latest_version = tag
-                    self.release_notes = notes
+def is_newer(latest: str, current: str) -> bool:
+    return version_tuple(latest) > version_tuple(current)
 
-                    # Find download URL for current platform
-                    import platform
 
-                    os_name = platform.system().lower()
-                    for asset in assets:
-                        name = asset.get("name", "").lower()
-                        if os_name in name or "universal" in name:
-                            self.download_url = asset.get("browser_download_url")
-                            break
+@dataclass
+class ReleaseInfo:
+    tag: str
+    html_url: str
+    asset_url: str = ""
+    asset_name: str = ""
 
-                    # Compare versions
-                    try:
-                        current = pkg_version.parse(self.current_version)
-                        latest = pkg_version.parse(tag)
-                        update_available = latest > current
-                    except Exception:
-                        update_available = tag != self.current_version
 
-                    if update_available:
-                        logger.info(
-                            f"Update available: v{self.current_version} -> v{tag}"
-                        )
-                    else:
-                        logger.debug(f"Up to date (v{self.current_version})")
+def _user_agent() -> str:
+    return f"OpenAssist-Updater/1.0 ({platform.system()}; {platform.machine()})"
 
-                    return update_available, tag, notes
 
-        except Exception as exc:
-            logger.debug(f"Update check failed: {exc}")
-            return False, None, None
+def fetch_latest_release(repo: str, timeout_s: float = 5.0) -> Optional[dict]:
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    req = urllib.request.Request(url, headers={"User-Agent": _user_agent()})
+    with urllib.request.urlopen(req, timeout=timeout_s) as r:
+        return json.loads(r.read())
 
-    def get_download_url(self) -> Optional[str]:
-        return self.download_url
 
-    async def download_update(self, save_path: str) -> bool:
-        """Download the update file."""
-        if not self.download_url:
-            return False
+def select_best_asset(release: dict) -> tuple[str, str]:
+    assets = release.get("assets", []) if isinstance(release, dict) else []
+    if not isinstance(assets, list) or not assets:
+        return "", ""
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.download_url) as resp:
-                    if resp.status == 200:
-                        with open(save_path, "wb") as file_obj:
-                            async for chunk in resp.content.iter_chunked(8192):
-                                file_obj.write(chunk)
-                        logger.info(f"Update downloaded to {save_path}")
-                        return True
-        except Exception as exc:
-            logger.error(f"Download failed: {exc}")
-        return False
+    sysname = (platform.system() or "").lower()
+    arch = (platform.machine() or "").lower()
+
+    preferred_ext = []
+    if sysname.startswith("win"):
+        preferred_ext = [".exe", ".msi", ".zip"]
+    elif sysname.startswith("darwin") or sysname.startswith("mac"):
+        preferred_ext = [".dmg", ".zip"]
+    else:
+        preferred_ext = [".appimage", ".tar.gz", ".zip"]
+
+    def score(name: str) -> int:
+        n = (name or "").lower()
+        s = 0
+        for i, ext in enumerate(preferred_ext):
+            if n.endswith(ext):
+                s += 100 - i * 10
+                break
+        if arch and arch in n:
+            s += 15
+        if "portable" in n:
+            s -= 5
+        return s
+
+    best = None
+    best_score = -1
+    for a in assets:
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name", "")
+        url = a.get("browser_download_url", "")
+        if not url:
+            continue
+        sc = score(name)
+        if sc > best_score:
+            best_score = sc
+            best = a
+
+    if not best:
+        return "", ""
+    return best.get("browser_download_url", ""), best.get("name", "")
+
+
+def get_latest_release_info(repo: str, timeout_s: float = 5.0) -> Optional[ReleaseInfo]:
+    data = fetch_latest_release(repo, timeout_s=timeout_s)
+    if not data:
+        return None
+    tag = str(data.get("tag_name", "") or "").lstrip("v")
+    html_url = str(data.get("html_url", "") or "")
+    asset_url, asset_name = select_best_asset(data)
+    return ReleaseInfo(tag=tag, html_url=html_url, asset_url=asset_url, asset_name=asset_name)
+

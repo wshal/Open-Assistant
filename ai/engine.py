@@ -7,11 +7,12 @@ NEW: ModeManager wired in — engine reads live Mode objects, not bare strings.
 """
 
 import asyncio
+import io
 import re
 import time
 import inspect
 from functools import lru_cache
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, AsyncGenerator
 from collections import OrderedDict
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -21,6 +22,7 @@ from ai.history import ResponseHistory
 from ai.detectors.question_detector import QuestionDetector
 from ai.router import SmartRouter
 from ai.parallel import ParallelInference
+from ai.cache import ShortQueryCache
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -83,6 +85,18 @@ class AIEngine(QObject):
         self._cache_ttl = 60
         self._max_cache_size = 100
 
+        # --- Short-query response cache (P1) ---
+        cache_cfg = (config.get("ai.cache", {}) or {}) if hasattr(config, "get") else {}
+        self._short_cache = ShortQueryCache(
+            ttl_s=float(cache_cfg.get("ttl_s", 25) or 25),
+            max_items=int(cache_cfg.get("max_items", 128) or 128),
+            enable_fuzzy=bool(cache_cfg.get("enable_fuzzy", False)),
+            fuzzy_threshold=float(cache_cfg.get("fuzzy_threshold", 0.92) or 0.92),
+        )
+
+        # --- Health polling adaptivity (P1) ---
+        self._last_request_at = 0.0
+
         # ── Background RAG Prefetch ───────────────────────────────────────────
         # Stores pre-fetched RAG results keyed by a short context fingerprint.
         # Populated by prefetch_rag() before the user submits a query.
@@ -119,13 +133,39 @@ class AIEngine(QObject):
             return 10
         return 0
 
+    @staticmethod
+    def _cooldown_reason_for_error(exc: Exception) -> str:
+        msg = str(exc or "").lower()
+        if any(
+            k in msg
+            for k in [
+                "503",
+                "unavailable",
+                "overloaded",
+                "high demand",
+                "service unavailable",
+            ]
+        ):
+            return "503 overload"
+        if any(k in msg for k in ["429", "rate limit", "ratelimit", "too many requests"]):
+            return "429 rate limit"
+        if any(k in msg for k in ["timeout", "timed out"]):
+            return "timeout"
+        if any(k in msg for k in ["connection", "connectorerror"]):
+            return "connection"
+        return ""
+
     def _maybe_cooldown_provider(self, provider, exc: Exception) -> None:
         seconds = self._cooldown_seconds_for_error(exc)
         if seconds <= 0:
             return
+        reason = self._cooldown_reason_for_error(exc)
         try:
             if provider and hasattr(provider, "disable"):
-                provider.disable(seconds=seconds)
+                try:
+                    provider.disable(seconds=seconds, reason=reason)
+                except TypeError:
+                    provider.disable(seconds=seconds)
         except Exception:
             # Cooldown is best-effort; never fail the request flow due to it.
             pass
@@ -245,6 +285,7 @@ class AIEngine(QObject):
         """
         self._is_cancelled = False
         start_time = time.time()
+        self._last_request_at = start_time
         stage_timings = {}
         first_token_time = None
         request_metadata = dict(request_metadata or {})
@@ -254,6 +295,71 @@ class AIEngine(QObject):
         # Resolve the live Mode object — use ModeManager if available
         mode_obj = self._mode_manager.current if self._mode_manager else None
         mode_id = mode_obj.name if mode_obj else self.config.get("ai.mode", "general")
+
+        # P1: Short-query cache (exact + optional conservative fuzzy)
+        cache_cfg = self.config.get("ai.cache", {}) or {}
+        cache_enabled = bool(cache_cfg.get("enabled", True))
+        max_q_chars = int(cache_cfg.get("max_query_chars", 120) or 120)
+        allow_cache = (
+            cache_enabled
+            and origin in {"manual", "speech"}
+            and isinstance(query, str)
+            and len(query.strip()) > 0
+            and len(query.strip()) <= max_q_chars
+            and (not self.rag)  # conservative: avoid caching RAG-conditioned answers
+        )
+        context_fp = ""
+        history_fp = ""
+        if allow_cache:
+            snap = nexus_snapshot or {}
+            context_fp = self._short_cache.context_fingerprint(
+                active_window=str(snap.get("active_window", "")),
+                screen=str(screen_context or snap.get("latest_ocr", "")),
+                audio=str(audio_context or snap.get("recent_audio", "")),
+            )
+            try:
+                last = self.history.entries[-1] if getattr(self.history, "entries", None) else None
+                history_fp = self._short_cache.history_fingerprint(
+                    last_query=getattr(last, "query", "") if last else "",
+                    last_response=getattr(last, "response", "") if last else "",
+                )
+            except Exception:
+                history_fp = self._short_cache.history_fingerprint()
+
+            cached = self._short_cache.get(
+                mode=mode_id,
+                query=query,
+                context_fp=context_fp,
+                history_fp=history_fp,
+            )
+            if cached and (cached.response or "").strip():
+                latency_ms = (time.time() - start_time) * 1000
+                self.history.add(
+                    query,
+                    cached.response,
+                    provider=cached.provider or "cache",
+                    mode=mode_id,
+                    latency=latency_ms,
+                    metadata={
+                        "cache_hit": True,
+                        "stage_timings": {
+                            **stage_timings,
+                            "request_to_complete_ms": (time.time() - request_started_at) * 1000,
+                        },
+                        "request_metadata": request_metadata,
+                        "providers_tried": [cached.provider or "cache"],
+                        "had_screen": bool((screen_context or (nexus_snapshot or {}).get("latest_ocr", "")).strip()),
+                        "had_audio": bool((audio_context or (nexus_snapshot or {}).get("full_audio_history", "")).strip()),
+                        "had_rag": False,
+                    },
+                )
+                for ch in self._chunk_response(cached.response, chunk_size=8):
+                    if self._is_cancelled:
+                        return
+                    self.response_chunk.emit(ch)
+                    await asyncio.sleep(0)
+                self.response_complete.emit(cached.response)
+                return
 
         # Smart routing: analyse query complexity and select provider
         complexity = self._analyze_query_complexity(query)
@@ -492,7 +598,10 @@ class AIEngine(QObject):
                                 p = tasks.pop(t, None)
                                 try:
                                     raced = (t.result() or "").strip()
-                                except Exception:
+                                except Exception as exc:
+                                    # If a raced provider errors, immediately apply cooldown heuristics
+                                    # so we don't keep hammering an overloaded endpoint.
+                                    self._maybe_cooldown_provider(p, exc)
                                     continue
 
                                 if self._is_cancelled:
@@ -518,8 +627,17 @@ class AIEngine(QObject):
                                         "request_metadata": request_metadata,
                                         "providers_tried": providers_tried,
                                         "race": True,
-                                        "had_screen": bool((nexus_snapshot or {}).get("latest_ocr", "").strip()),
-                                        "had_audio": bool((nexus_snapshot or {}).get("full_audio_history", "").strip()),
+                                        "had_screen": bool(
+                                            (screen_context or (nexus_snapshot or {}).get("latest_ocr", "") or "").strip()
+                                        ),
+                                        "had_audio": bool(
+                                            (
+                                                audio_context
+                                                or locals().get("refined_audio")
+                                                or (nexus_snapshot or {}).get("full_audio_history", "")
+                                                or ""
+                                            ).strip()
+                                        ),
                                         "had_rag": bool(rag_context.strip()) if rag_context else False,
                                     },
                                 )
@@ -552,7 +670,15 @@ class AIEngine(QObject):
             current_provider = provider
             while True:
                 try:
-                    async for chunk in current_provider.generate_stream(sys_prompt, user_msg):
+                    ft_ms = int(self.config.get("ai.text.first_token_timeout_ms", 0) or 0)
+                    ft_timeout_s = max(ft_ms / 1000.0, 0.0) if ft_ms > 0 else 0.0
+
+                    async for chunk in self._stream_with_first_token_timeout(
+                        current_provider,
+                        sys_prompt,
+                        user_msg,
+                        first_token_timeout_s=ft_timeout_s,
+                    ):
                         if self._is_cancelled:
                             logger.warning("AI: Stream cancelled mid-token")
                             return
@@ -591,6 +717,21 @@ class AIEngine(QObject):
             # 5. Finalize
             if not self._is_cancelled:
                 latency_ms = (time.time() - start_time) * 1000
+
+                # P1: populate short-query cache after a successful response.
+                if allow_cache and (full_response or "").strip():
+                    try:
+                        self._short_cache.set(
+                            mode=mode_id,
+                            query=query,
+                            context_fp=context_fp,
+                            history_fp=history_fp,
+                            response=full_response,
+                            provider=current_provider.name,
+                        )
+                    except Exception:
+                        pass
+
                 self.history.add(
                     query,
                     full_response,
@@ -605,8 +746,17 @@ class AIEngine(QObject):
                         "request_metadata": request_metadata,
                         "providers_tried": providers_tried,
                         # P2.7: Provenance flags — which context sources contributed
-                        "had_screen": bool((nexus_snapshot or {}).get("latest_ocr", "").strip()),
-                        "had_audio": bool((nexus_snapshot or {}).get("full_audio_history", "").strip()),
+                        "had_screen": bool(
+                            (screen_context or (nexus_snapshot or {}).get("latest_ocr", "") or "").strip()
+                        ),
+                        "had_audio": bool(
+                            (
+                                audio_context
+                                or locals().get("refined_audio")
+                                or (nexus_snapshot or {}).get("full_audio_history", "")
+                                or ""
+                            ).strip()
+                        ),
                         "had_rag": bool(rag_context.strip()) if rag_context else False,
                     }
                 )
@@ -616,6 +766,33 @@ class AIEngine(QObject):
         except Exception as e:
             logger.error(f"AI Engine Runtime Error: {e}")
             self.error_occurred.emit(str(e))
+
+    async def _stream_with_first_token_timeout(
+        self,
+        provider,
+        sys_prompt: str,
+        user_msg: str,
+        *,
+        first_token_timeout_s: float = 0.0,
+    ) -> AsyncGenerator[str, None]:
+        stream = provider.generate_stream(sys_prompt, user_msg)
+        if not first_token_timeout_s or first_token_timeout_s <= 0:
+            async for chunk in stream:
+                yield chunk
+            return
+
+        try:
+            first = await asyncio.wait_for(stream.__anext__(), timeout=first_token_timeout_s)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"First token timeout ({first_token_timeout_s:.2f}s) from {getattr(provider, 'name', 'provider')}"
+            ) from exc
+
+        yield first
+        async for chunk in stream:
+            yield chunk
 
     # ── Conversation memory helpers ─────────────────────────────────────────────
 
@@ -831,6 +1008,77 @@ class AIEngine(QObject):
         except Exception:
             return audio_text
 
+    def _is_vision_retryable_error(self, exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        return any(
+            k in msg
+            for k in [
+                "413",
+                "payload",
+                "too large",
+                "request entity too large",
+                "content too large",
+                "max size",
+                "timeout",
+                "timed out",
+            ]
+        )
+
+    def _prepare_vision_payload_for_provider(
+        self,
+        provider_name: str,
+        image_bytes: bytes,
+        *,
+        max_bytes_factor: float = 1.0,
+    ) -> tuple[bytes, str]:
+        """
+        P1: Enforce a conservative payload budget and downscale/recompress if needed.
+
+        Returns (payload_bytes, mime_type).
+        """
+        if not image_bytes:
+            return b"", "image/jpeg"
+
+        base_max = self.config.get(
+            f"ai.vision.provider_limits.{provider_name}.max_bytes",
+            self.config.get("ai.vision.max_bytes", 1_800_000),
+        )
+        try:
+            max_bytes = int(float(base_max or 1_800_000) * float(max_bytes_factor or 1.0))
+        except Exception:
+            max_bytes = 1_800_000
+        max_bytes = max(250_000, max_bytes)
+
+        min_w = int(self.config.get("ai.vision.min_downscale_w", 720) or 720)
+        mime = "image/jpeg"
+        if len(image_bytes) <= max_bytes:
+            return image_bytes, mime
+
+        try:
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            w, h = img.size
+            quality = int(self.config.get("capture.screen.analysis_jpeg_quality", 70) or 70)
+            quality = max(35, min(quality, 92))
+
+            attempts = 0
+            out = image_bytes
+            while len(out) > max_bytes and w > min_w and attempts < 5:
+                attempts += 1
+                w = max(min_w, int(w * 0.82))
+                new_h = max(1, int(h * (w / max(1, img.size[0]))))
+                resized = img.resize((w, new_h), Image.LANCZOS)
+                buf = io.BytesIO()
+                resized.save(buf, format="JPEG", quality=quality, optimize=True)
+                out = buf.getvalue()
+                quality = max(35, quality - 12)
+
+            return out, mime
+        except Exception:
+            # If PIL fails for any reason, fall back to the original bytes.
+            return image_bytes, mime
+
     async def analyze_image_response(
         self,
         query: str,
@@ -842,6 +1090,11 @@ class AIEngine(QObject):
         """Run screenshot analysis through the best available vision-capable provider."""
         self._is_cancelled = False
         start_time = time.time()
+        self._last_request_at = start_time
+        budget_s = float(self.config.get("ai.vision.budget_s", 10) or 10)
+        if budget_s <= 0:
+            budget_s = 10
+        deadline = start_time + budget_s
         mode_id = self.config.get("ai.mode", "general")
         sys_prompt = self.prompts.system(mode_id)
         user_msg = self.prompts.user(
@@ -901,32 +1154,57 @@ class AIEngine(QObject):
 
         async def _analyze_one(p):
             """Call provider vision method with best-effort tier support."""
+            payload, mime = self._prepare_vision_payload_for_provider(p.name, image_bytes)
             try:
                 return await p.analyze_image(
                     sys_prompt,
                     user_msg,
-                    image_bytes,
-                    mime_type="image/png",
+                    payload,
+                    mime_type=mime,
                     tier=vision_tier,
                 )
             except TypeError as exc:
                 # Backward-compatible: some providers/test doubles don't accept tier.
                 if "unexpected keyword argument" in str(exc) and "tier" in str(exc):
                     return await p.analyze_image(
-                        sys_prompt, user_msg, image_bytes, mime_type="image/png"
+                        sys_prompt, user_msg, payload, mime_type=mime
                     )
+                raise
+            except Exception as exc:
+                # If payload is too large / times out immediately, retry once smaller.
+                if self._is_vision_retryable_error(exc):
+                    payload2, mime2 = self._prepare_vision_payload_for_provider(
+                        p.name, image_bytes, max_bytes_factor=0.70
+                    )
+                    try:
+                        return await p.analyze_image(
+                            sys_prompt,
+                            user_msg,
+                            payload2,
+                            mime_type=mime2,
+                            tier=vision_tier,
+                        )
+                    except TypeError as exc2:
+                        if "unexpected keyword argument" in str(exc2) and "tier" in str(exc2):
+                            return await p.analyze_image(
+                                sys_prompt, user_msg, payload2, mime_type=mime2
+                            )
+                        raise
                 raise
 
         async def _analyze_one_stream(p):
             """Stream provider vision output with best-effort tier support."""
+            payload, mime = self._prepare_vision_payload_for_provider(p.name, image_bytes)
             try:
+                emitted = False
                 async for chunk in p.analyze_image_stream(
                     sys_prompt,
                     user_msg,
-                    image_bytes,
-                    mime_type="image/png",
+                    payload,
+                    mime_type=mime,
                     tier=vision_tier,
                 ):
+                    emitted = True
                     yield chunk
                 return
             except TypeError as exc:
@@ -934,11 +1212,39 @@ class AIEngine(QObject):
                     async for chunk in p.analyze_image_stream(
                         sys_prompt,
                         user_msg,
-                        image_bytes,
-                        mime_type="image/png",
+                        payload,
+                        mime_type=mime,
                     ):
                         yield chunk
                     return
+                raise
+            except Exception as exc:
+                # Retry only if we haven't emitted anything yet (payload errors are immediate).
+                if not locals().get("emitted", False) and self._is_vision_retryable_error(exc):
+                    payload2, mime2 = self._prepare_vision_payload_for_provider(
+                        p.name, image_bytes, max_bytes_factor=0.70
+                    )
+                    try:
+                        async for chunk in p.analyze_image_stream(
+                            sys_prompt,
+                            user_msg,
+                            payload2,
+                            mime_type=mime2,
+                            tier=vision_tier,
+                        ):
+                            yield chunk
+                        return
+                    except TypeError as exc2:
+                        if "unexpected keyword argument" in str(exc2) and "tier" in str(exc2):
+                            async for chunk in p.analyze_image_stream(
+                                sys_prompt,
+                                user_msg,
+                                payload2,
+                                mime_type=mime2,
+                            ):
+                                yield chunk
+                            return
+                        raise
                 raise
 
         if (
@@ -971,7 +1277,8 @@ class AIEngine(QObject):
             def _launch_one(idx: int):
                 nonlocal next_idx
                 p = candidates[idx]
-                tasks[asyncio.create_task(_run_one(p))] = p
+                remaining = max(0.05, deadline - time.time())
+                tasks[asyncio.create_task(asyncio.wait_for(_run_one(p), timeout=remaining))] = p
                 providers_tried.append(p.name)
                 next_idx = idx + 1
 
@@ -980,6 +1287,9 @@ class AIEngine(QObject):
             try:
                 # Keep going until we have no running tasks AND no remaining providers to launch.
                 while tasks or next_idx < len(candidates):
+                    if time.time() >= deadline:
+                        last_error = Exception("Vision analysis timed out (budget exceeded)")
+                        break
                     if not tasks and next_idx < len(candidates):
                         # All running attempts failed quickly; launch the next immediately.
                         _launch_one(next_idx)
@@ -988,6 +1298,8 @@ class AIEngine(QObject):
                     timeout = None
                     if next_idx < len(candidates):
                         timeout = max(0.0, next_launch_at - time.time())
+                    # Respect global vision budget.
+                    timeout = min(timeout, max(0.0, deadline - time.time())) if timeout is not None else max(0.0, deadline - time.time())
 
                     done, _pending = await asyncio.wait(
                         tasks.keys(),
@@ -996,6 +1308,9 @@ class AIEngine(QObject):
                     )
 
                     if not done:
+                        if time.time() >= deadline:
+                            last_error = Exception("Vision analysis timed out (budget exceeded)")
+                            break
                         # Time to launch the next provider in the race.
                         if next_idx < len(candidates):
                             _launch_one(next_idx)
@@ -1078,16 +1393,21 @@ class AIEngine(QObject):
             emitted_partial = False
             providers_tried.append(provider.name)
             try:
+                if time.time() >= deadline:
+                    raise Exception("Vision analysis timed out (budget exceeded)")
                 response = ""
                 if getattr(provider, "supports_vision_stream", lambda: False)():
                     async for chunk in _analyze_one_stream(provider):
                         if self._is_cancelled:
                             return ""
+                        if time.time() >= deadline:
+                            raise Exception("Vision analysis timed out (budget exceeded)")
                         response += chunk
                         emitted_partial = True
                         self.response_chunk.emit(chunk)
                 else:
-                    response = await _analyze_one(provider)
+                    remaining = max(0.05, deadline - time.time())
+                    response = await asyncio.wait_for(_analyze_one(provider), timeout=remaining)
                 if self._is_cancelled:
                     return ""
 
@@ -1349,11 +1669,20 @@ class AIEngine(QObject):
         return None, ""
 
     async def poll_provider_health_loop(self):
-        """Midnight Restoration: Background health monitor (60s interval)."""
+        """P1: Background health monitor (adaptive interval)."""
         while True:
             try:
                 await self.poll_provider_health()
-                await asyncio.sleep(60)
+
+                health_cfg = self.config.get("ai.health", {}) or {}
+                idle_after_s = float(health_cfg.get("idle_after_s", 15) or 15)
+                poll_active_s = float(health_cfg.get("poll_active_s", 30) or 30)
+                poll_idle_s = float(health_cfg.get("poll_idle_s", 120) or 120)
+
+                now = time.time()
+                idle = bool(self._last_request_at) and (now - self._last_request_at) >= idle_after_s
+                sleep_s = poll_idle_s if idle else poll_active_s
+                await asyncio.sleep(max(1.0, sleep_s))
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1400,12 +1729,19 @@ class AIEngine(QObject):
     async def poll_provider_health(self):
         """Polls providers and emits status to UI badges."""
         results = self._router.get_provider_health() if self._router else {}
+        results["_meta"] = {
+            "text_local_only": bool(self.config.get("ai.text.local_only", False)),
+            "vision_local_only": bool(self.config.get("ai.vision.local_only", False)),
+        }
         for pid, prov in list(self._providers.items()):
             info = dict(results.get(pid, {}))
             state = info.get("state", "unknown")
             locked_state = state in {"cooldown", "rate_limited", "disabled"}
             try:
-                if hasattr(prov, "check_availability"):
+                # Only call availability checks for providers that explicitly
+                # advertise a health check (avoids expensive/noisy network calls).
+                supports_hc = bool(getattr(prov, "supports_health_check", lambda: False)())
+                if supports_hc and hasattr(prov, "check_availability"):
                     is_ok = await asyncio.wait_for(prov.check_availability(), timeout=5)
                     if is_ok and not locked_state:
                         state = "active"
@@ -1415,6 +1751,21 @@ class AIEngine(QObject):
                         state = "down"
                     elif state not in {"cooldown", "rate_limited", "disabled"}:
                         state = "down"
+
+                # Reflect local cooldown state even without a health check.
+                if not locked_state and hasattr(prov, "is_disabled") and prov.is_disabled():
+                    state = "cooldown"
+
+                if state == "cooldown":
+                    try:
+                        info["cooldown_reason"] = (
+                            prov.disabled_reason() if hasattr(prov, "disabled_reason") else ""
+                        )
+                        info["cooldown_remaining_s"] = (
+                            prov.cooldown_remaining_s() if hasattr(prov, "cooldown_remaining_s") else 0
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 if not locked_state:
                     state = "down"

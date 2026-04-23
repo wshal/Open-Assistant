@@ -672,10 +672,12 @@ class OpenAssistApp(QObject):
             snapshot = self.nexus.get_snapshot()
             ocr_task = asyncio.create_task(self.screen.extract_text_from_image_bytes(image_bytes))
             try:
-                # Prefer OCR extracted from the *same* screenshot so "Analyze Screen"
-                # is task-directed even when the periodic OCR loop is idle.
+                # P0: Start vision immediately (don't block on OCR).
+                # We only use OCR if it's ready fast; otherwise we proceed with
+                # snapshot OCR and let OCR finish in the background for fallback.
+                ocr_text = ""
                 try:
-                    ocr_text = await asyncio.wait_for(ocr_task, timeout=3.0)
+                    ocr_text = await asyncio.wait_for(ocr_task, timeout=0.35)
                 except Exception:
                     ocr_text = ""
 
@@ -738,7 +740,14 @@ class OpenAssistApp(QObject):
                         screen_context=screen_text,
                         audio_context=audio_text,
                     )
+                    # Best-effort: if OCR wasn't ready earlier, try to grab it quickly
+                    # after vision completes so Nexus stays up-to-date.
                     latest_ocr = ocr_text
+                    if not latest_ocr:
+                        try:
+                            latest_ocr = await asyncio.wait_for(ocr_task, timeout=0.25)
+                        except Exception:
+                            latest_ocr = ""
                     if latest_ocr and request_epoch == self._generation_epoch:
                         self.nexus.push("screen", latest_ocr)
                     return

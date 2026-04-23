@@ -52,6 +52,8 @@ class BaseProvider(ABC):
         self.stats = Stats(name)
         self._req_times = []
         self._disabled_until = 0.0
+        self._disabled_reason = ""
+        self._disabled_at = 0.0
         self.failure_cooldown = self.pcfg.get("failure_cooldown", 30)
 
     def get_model(self, tier: str = None) -> str:
@@ -89,11 +91,21 @@ class BaseProvider(ABC):
     def is_disabled(self) -> bool:
         return time.time() < self._disabled_until
 
-    def disable(self, seconds: int = None):
+    def cooldown_remaining_s(self) -> int:
+        return max(0, int(self._disabled_until - time.time()))
+
+    def disabled_reason(self) -> str:
+        return str(self._disabled_reason or "").strip()
+
+    def disable(self, seconds: int = None, reason: str = ""):
         duration = seconds if seconds is not None else self.failure_cooldown
-        self._disabled_until = time.time() + duration
+        now = time.time()
+        self._disabled_until = now + duration
+        self._disabled_at = now
+        self._disabled_reason = str(reason or "").strip()
         logger.warning(
             f"{self.name}: temporarily disabled for {duration}s after failure"
+            + (f" ({self._disabled_reason})" if self._disabled_reason else "")
         )
 
     def check_rate(self) -> bool:

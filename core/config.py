@@ -2,6 +2,7 @@
 
 import os
 import re
+import copy
 import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -104,10 +105,19 @@ class Config:
                 logger.error(f"Config: Malformed YAML in {self._path}: {e}")
                 logger.warning("Config: Reverting to empty/default state.")
                 self._data = {}
+
+        migrated = self._migrate_plaintext_keys_from_yaml()
         self._apply_defaults()
         self.set("stealth.enabled", True)
         self._resolve_env(self._data)
         self._inject_secrets()
+        self._disable_providers_without_keys()
+        if migrated:
+            # Persist immediately to scrub any plaintext keys from disk.
+            try:
+                self.save()
+            except Exception:
+                pass
 
         # P1 FIX: Validate keys on load
         validation = self.validate_api_keys()
@@ -120,6 +130,45 @@ class Config:
         else:
             logger.info("Config loaded (no API keys configured)")
 
+    def _migrate_plaintext_keys_from_yaml(self) -> bool:
+        """
+        One-time migration: if `config.yaml` contains plaintext API keys,
+        move them into SecureStorage and scrub them from `_data`.
+        """
+        migrated_any = False
+        try:
+            ai_cfg = self._data.get("ai", {}) if isinstance(self._data, dict) else {}
+            provs = ai_cfg.get("providers", {}) if isinstance(ai_cfg, dict) else {}
+            if not isinstance(provs, dict):
+                return False
+
+            for pid, cfg in list(provs.items()):
+                if not isinstance(cfg, dict):
+                    continue
+                if str(pid).lower() == "ollama":
+                    continue
+                key = str(cfg.get("api_key", "") or "").strip()
+                if not key:
+                    continue
+
+                # Only store if secure storage doesn't already have a key.
+                existing = self.secrets.get_api_key(str(pid))
+                if not existing:
+                    try:
+                        self.secrets.set_api_key(str(pid), key)
+                    except Exception:
+                        pass
+
+                cfg["api_key"] = ""
+                migrated_any = True
+
+            if migrated_any:
+                logger.warning("Config: Plaintext API keys detected in config.yaml; migrated to secure storage and scrubbed.")
+        except Exception:
+            return False
+
+        return migrated_any
+
     def _apply_defaults(self):
         self._data.setdefault("ai", {})
         self._data["ai"].setdefault("text", {})
@@ -129,6 +178,8 @@ class Config:
             ["groq", "gemini", "cerebras", "together", "ollama"],
         )
         self._data["ai"]["text"].setdefault("race_enabled", False)
+        # P1: First-token timeout for streaming (0 disables).
+        self._data["ai"]["text"].setdefault("first_token_timeout_ms", 1200)
         # P2: Local-only mode to force Ollama usage without YAML edits.
         self._data["ai"]["text"].setdefault("local_only", False)
         self._data["ai"].setdefault("vision", {})
@@ -137,6 +188,26 @@ class Config:
         self._data["ai"]["vision"].setdefault("preferred_providers", ["gemini", "ollama"])
         self._data["ai"]["vision"].setdefault("race_enabled", False)
         self._data["ai"]["vision"].setdefault("local_only", False)
+        # P0: Hard budget to prevent "stuck" vision analysis.
+        self._data["ai"]["vision"].setdefault("budget_s", 10)
+        # P1: Vision payload controls (JPEG bytes). Keep conservative defaults.
+        self._data["ai"]["vision"].setdefault("max_bytes", 1_800_000)  # ~1.8MB
+        self._data["ai"]["vision"].setdefault("min_downscale_w", 720)
+
+        # P1: Provider health polling (adaptive)
+        self._data["ai"].setdefault("health", {})
+        self._data["ai"]["health"].setdefault("idle_after_s", 15)
+        self._data["ai"]["health"].setdefault("poll_active_s", 30)
+        self._data["ai"]["health"].setdefault("poll_idle_s", 120)
+
+        # P1: Short-query cache
+        self._data["ai"].setdefault("cache", {})
+        self._data["ai"]["cache"].setdefault("enabled", True)
+        self._data["ai"]["cache"].setdefault("ttl_s", 25)
+        self._data["ai"]["cache"].setdefault("max_items", 128)
+        self._data["ai"]["cache"].setdefault("max_query_chars", 120)
+        self._data["ai"]["cache"].setdefault("enable_fuzzy", False)
+        self._data["ai"]["cache"].setdefault("fuzzy_threshold", 0.92)
         self._data.setdefault("app", {})
         self._data["app"].setdefault("focus_on_show", False)
         self._data.setdefault("stealth", {})
@@ -202,6 +273,28 @@ class Config:
                 prov_cfg["api_key"] = stored_key
                 prov_cfg["enabled"] = True
                 os.environ[meta["env_key"]] = stored_key
+
+    def _disable_providers_without_keys(self):
+        """
+        UX/security hardening: when no secure key is present for a provider,
+        do not keep it enabled by accident just because a provider block exists
+        in YAML (common after redaction).
+        """
+        try:
+            from core.constants import PROVIDERS
+
+            ai_cfg = self._data.setdefault("ai", {})
+            provs = ai_cfg.setdefault("providers", {})
+            for pid in PROVIDERS:
+                if str(pid).lower() == "ollama":
+                    continue
+                stored = self.secrets.get_api_key(pid)
+                prov_cfg = provs.get(pid, {}) if isinstance(provs, dict) else {}
+                raw = str(prov_cfg.get("api_key", "") or "").strip() if isinstance(prov_cfg, dict) else ""
+                if not stored and not raw and isinstance(prov_cfg, dict):
+                    prov_cfg["enabled"] = False
+        except Exception:
+            pass
 
     # P1 FIX #6: API Key Validation
 
@@ -383,9 +476,40 @@ class Config:
             d = d.setdefault(k, {})
         d[keys[-1]] = value
 
+    def _data_for_save(self) -> Dict[str, Any]:
+        """
+        Serialize config for disk WITHOUT persisting secrets.
+
+        Security invariant: `config.yaml` must never contain real API keys.
+        Keys live only in SecureStorage / env (injected at runtime).
+        """
+        data = copy.deepcopy(self._data or {})
+        try:
+            providers = (
+                data.get("ai", {}).get("providers", {})
+                if isinstance(data.get("ai", {}), dict)
+                else {}
+            )
+            if isinstance(providers, dict):
+                for pid, cfg in providers.items():
+                    if not isinstance(cfg, dict):
+                        continue
+                    if "api_key" not in cfg:
+                        continue
+
+                    # Keep Ollama endpoint/url if present; everything else is treated as secret.
+                    if str(pid).lower() == "ollama":
+                        continue
+
+                    cfg["api_key"] = ""
+        except Exception:
+            # Never fail saving due to redaction logic.
+            pass
+        return data
+
     def save(self):
         with open(self._path, 'w') as f:
-            yaml.dump(self._data, f, default_flow_style=False)
+            yaml.dump(self._data_for_save(), f, default_flow_style=False, allow_unicode=True)
 
     def reset_all(self):
         """Restore config to first-run state and wipe encrypted secrets."""
