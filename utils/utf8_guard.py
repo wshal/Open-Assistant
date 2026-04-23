@@ -2,7 +2,7 @@
 UTF-8 / mojibake guard (P3).
 
 This does NOT rewrite files. It scans for common mojibake sequences that usually
-indicate encoding drift (e.g. "â€”", "â€™", "Ã…").
+indicate encoding drift (e.g. "—", "’", "Ã…").
 
 Usage (PowerShell):
   python utils/utf8_guard.py
@@ -19,10 +19,10 @@ from pathlib import Path
 DEFAULT_PATHS = ["ai", "core", "ui", "utils", "modes", "capture", "stealth"]
 
 SUSPICIOUS = [
-    "â€”",
-    "â€“",
-    "â€™",
-    "â€œ",
+    "—",
+    "–",
+    "’",
+    "“",
     "â€",
     "â€˜",
     "â€‹",

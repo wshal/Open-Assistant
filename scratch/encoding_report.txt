@@ -1,0 +1,3 @@
+Scanning for mojibake in C:\Users\Vishal\Desktop\Open Assist...
+
+Run with --fix to automatically correct known mojibake.

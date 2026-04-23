@@ -493,6 +493,10 @@ class OpenAssistApp(QObject):
         if not q or not self._ai_lock_ready.wait(timeout=2):
             return
 
+        # P2: Self-Learning Detector Hook
+        if hasattr(self.ai, "detector") and hasattr(self.ai.detector, "learn_from_query"):
+            self.ai.detector.learn_from_query(q)
+
         # Background session-triggered queries should never outlive the session.
         if s in {"speech", "auto"} and not self.session_active:
             return
@@ -1197,7 +1201,9 @@ class OpenAssistApp(QObject):
             )
 
         q = self.ai.detector.detect_with_confidence(t, source="audio")
+        logger.info(f"🎙️ Transcribed: '{t}'")
         if q.triggered:
+            logger.info(f"⚡ Question detected (Auto-respond: {q.should_auto_respond()})")
             if q.should_auto_respond():
                 self.generate_response(q.detected_text, "speech", {"audio": t})
             else:

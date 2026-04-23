@@ -153,6 +153,17 @@ class QuestionDetector:
             "tell me",
             "explain",
             "describe",
+            "can we ",
+            "could we ",
+            "is there ",
+            "are there ",
+            "hey can you",
+            "i was wondering",
+            "do you know",
+            "i'd like to know",
+            "could you please",
+            "would you mind",
+            "i have a question",
         ]
         self.fragment_continuations = [
             "and ",
@@ -237,26 +248,48 @@ class QuestionDetector:
 
         score = 0.0
 
+        # P0: Trust Whisper's punctuation. If it explicitly punctuates with a ?, it's a question.
+        if text.strip().endswith("?"):
+            score += 0.8
+        elif "?" in text:
+            score += 0.4
+
         # Strong signals
-        if "?" in text:
-            score += 0.3
         if any(lower.startswith(prefix) for prefix in self.question_prefixes):
-            score += 0.2
+            score += 0.4
         if any(pattern in lower for pattern in self.question_patterns):
-            score += 0.2
+            score += 0.3
 
         # Context signals
         if (
             any(pattern in lower for pattern in self.coding_patterns)
             and len(words) >= 3
         ):
-            score += 0.15
+            score += 0.2
         if any(pattern in lower for pattern in self.followup_patterns):
-            score += 0.1
+            score += 0.2
 
-        # Normalize by sensitivity (lower sensitivity = higher confidence required)
-        adjusted = score * (0.5 + self.sensitivity * 0.5)
-        return min(adjusted, 1.0)
+        # P0: Do not artificially dampen the score. Let the absolute score speak for itself.
+        return min(score, 1.0)
+
+    def learn_from_query(self, query: str):
+        """Learn a successful query prefix to dynamically improve detection."""
+        text = query.strip().lower()
+        if not text or not text.endswith("?"):
+            return
+            
+        words = text.replace("?", "").split()
+        if len(words) >= 2:
+            prefix = " ".join(words[:2]) + " "
+            if prefix not in self.question_prefixes:
+                logger.info(f"QuestionDetector: Learned new dynamic prefix: '{prefix}'")
+                self.question_prefixes.append(prefix)
+            
+            if len(words) >= 3:
+                prefix_3 = " ".join(words[:3]) + " "
+                if prefix_3 not in self.question_prefixes:
+                    logger.info(f"QuestionDetector: Learned new dynamic prefix: '{prefix_3}'")
+                    self.question_prefixes.append(prefix_3)
 
     def _classify_trigger(self, text: str) -> str:
         """Classify the type of trigger."""
@@ -341,8 +374,11 @@ class QuestionDetector:
         score = 0.0
 
         # 1. Strong Triggers (Auto-Pass or High Score)
-        if "?" in text:
+        if text.strip().endswith("?"):
+            score += 1.0 * weights["q"]
+        elif "?" in text:
             score += 0.8 * weights["q"]
+            
         if any(lower.startswith(prefix) for prefix in self.question_prefixes):
             score += 0.6 * weights["q"]
         if any(pattern in lower for pattern in self.question_patterns):

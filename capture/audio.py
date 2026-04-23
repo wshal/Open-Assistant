@@ -49,7 +49,7 @@ class AudioCapture(QObject):
         self.silence_blocks = int(900 / self.block_ms)  # 900ms balanced default
 
         self.model = None
-        self._model_name = config.get("capture.audio.whisper_model", "tiny")
+        self._model_name = config.get("capture.audio.whisper_model", "base.en")
         # P2.3: Language hint for Faster Whisper (empty string = auto-detect)
         self._language = config.get("capture.audio.language", "") or None
         self._model_loaded = False
@@ -366,7 +366,8 @@ class AudioCapture(QObject):
                 continue
 
             rms = np.sqrt(np.mean(data**2))
-            has_speech = rms > 0.005
+            # P0.5: Highly sensitive pre-gate (0.001). Let Silero VAD handle the actual noise filtering.
+            has_speech = rms > 0.001
             if has_speech or is_speaking:
                 speech_buffer.append(data)
             if has_speech:
@@ -396,7 +397,13 @@ class AudioCapture(QObject):
         try:
             audio = np.concatenate(buffer, axis=0).flatten()
             # P2.3: Use configured language hint; None = Whisper auto-detects
-            segments, _ = self.model.transcribe(audio, language=self._language)
+            # P0.5: Enable highly-accurate Silero VAD to cleanly separate speech from noise/breathing.
+            segments, _ = self.model.transcribe(
+                audio, 
+                language=self._language,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500)
+            )
             text = " ".join(
                 [s.text.strip() for s in segments if not self._is_hall(s.text)]
             )

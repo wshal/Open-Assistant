@@ -31,7 +31,7 @@ def iter_files(root: Path):
 
 
 def looks_mojibake(text: str) -> bool:
-    return any(s in text for s in ["â€”", "â€“", "â€™", "â€œ", "â€", "â€˜", "Ã"])
+    return any(s in text for s in ["—", "–", "’", "“", "â€", "â€˜", "Ã"])
 
 
 def fix_mojibake_cp1252(text: str) -> str:
@@ -41,13 +41,13 @@ def fix_mojibake_cp1252(text: str) -> str:
     except Exception:
         # Fall back to a conservative replacement map (doesn't risk losing chars).
         repl = {
-            "â€”": "—",
-            "â€“": "–",
-            "â€™": "’",
-            "â€œ": "“",
+            "—": "—",
+            "–": "–",
+            "’": "’",
+            "“": "“",
             "â€": "”",
             "â€˜": "‘",
-            "â€¦": "…",
+            "…": "…",
         }
         out = text
         for k, v in repl.items():
