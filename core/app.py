@@ -1177,9 +1177,83 @@ class OpenAssistApp(QObject):
         """Compatibility alias for UI code that expects app.type_response()."""
         return self.type_last_response()
 
-    def _on_transcription(self, t):
+    def analyze_current_screen(self):
+        """Phase 3: Immediate Screen Analysis (Context-Aware Toggle)."""
         if not self.session_active:
+            # Context-Aware: If session is off, hotkey acts as Start Session
+            self.start_session()
             return
+
+        if not getattr(self, "ai", None) or not getattr(self, "screen", None):
+            return
+
+        # Triggered from UI. Run the capture and analysis via asyncio
+        if self.loop and self.loop.is_running():
+            import asyncio
+            asyncio.run_coroutine_threadsafe(self._do_analyze_screen(), self.loop)
+
+    async def _do_analyze_screen(self):
+        try:
+            # 1. Fast UI feedback
+            if hasattr(self.overlay, "set_analysis_provider_badge"):
+                self.overlay.set_analysis_provider_badge(pending=True)
+            
+            # 2. Capture optimized image bytes
+            image_bytes = await self.screen.capture_image_bytes(for_analysis=True)
+            if not image_bytes:
+                if hasattr(self.overlay, "set_analysis_provider_badge"):
+                    self.overlay.set_analysis_provider_badge(pending=False)
+                return
+            
+            # 3. Fire to Vision AI
+            snap = self.nexus.get_snapshot()
+            prompt = "Analyze the current screen and concisely explain what the user is looking at or doing."
+            
+            resp = await self.ai.analyze_image_response(
+                query=prompt,
+                image_bytes=image_bytes,
+                nexus_snapshot=snap,
+                audio_context=snap.get("recent_audio", "")
+            )
+            
+            if resp:
+                # 4. Save to history
+                self.history.add(
+                    query="[Screen Analysis]",
+                    response=resp,
+                    provider="vision",
+                    mode=self.state.mode,
+                    metadata={"had_screen": True}
+                )
+                if hasattr(self.overlay, "set_analysis_provider_badge"):
+                    self.overlay.set_analysis_provider_badge(provider="gemini")
+                
+                # Force the UI to reflect the new history item immediately
+                self.overlay.update_transcript("Screen analysis complete", "auto")
+                # Trigger history feed refresh in overlay if visible
+                if hasattr(self.overlay, "history_feed"):
+                    self.overlay.history_feed.refresh()
+                self.overlay._current_query = "[Screen Analysis]"
+                self.overlay._raw_buffer = resp
+                self.overlay._is_streaming = False
+                self.overlay._render_markdown_now()
+                self.overlay.show_chat_view()
+
+        except Exception as e:
+            logger.error(f"Analyze screen failed: {e}")
+            if hasattr(self.overlay, "set_analysis_provider_badge"):
+                self.overlay.set_analysis_provider_badge(pending=False)
+
+    def _on_transcription(self, t):
+        if not self.session_active or not t:
+            return
+
+        # Phase 1: Smart Transcription Repair
+        from utils.text_utils import clean_question_text, glue_fragments, is_question_complete
+        t = clean_question_text(glue_fragments(t))
+        if not t:
+            return
+
         self.nexus.push("audio", t)
         self.overlay.update_transcript(t)
         transcription_metrics = self.audio.get_last_transcription_metrics()
@@ -1214,11 +1288,13 @@ class OpenAssistApp(QObject):
         q = self.ai.detector.detect_with_confidence(t, source="audio")
         logger.info(f"🎙️ Transcribed: '{t}'")
         if q.triggered:
-            logger.info(f"⚡ Question detected (Auto-respond: {q.should_auto_respond()})")
-            if q.should_auto_respond():
+            # Phase 1: Strict Gating for Ultra-Low Latency Auto-Response
+            can_auto = q.should_auto_respond() and is_question_complete(q.detected_text)
+            logger.info(f"⚡ Question detected (Auto-respond: {can_auto})")
+            if can_auto:
                 self.generate_response(q.detected_text, "speech", {"audio": t})
             else:
-                # P2.1: Low-confidence — surface hint without auto-firing
+                # P2.1: Low-confidence or incomplete question — surface hint without auto-firing
                 self.overlay.update_transcript(
                     f"🤔 Possible question detected (tap ⎨ to answer)",
                     state="processing",
@@ -1231,8 +1307,11 @@ class OpenAssistApp(QObject):
         - Never pushes interim text into the Nexus history (avoids unstable context)
         - Only early-triggers when the detector reports a stable question clause
         """
-        if not self.session_active:
+        if not self.session_active or not t:
             return
+            
+        from utils.text_utils import clean_question_text, glue_fragments
+        t = clean_question_text(glue_fragments(t))
         if not t or not hasattr(self.ai, "detector"):
             return
 

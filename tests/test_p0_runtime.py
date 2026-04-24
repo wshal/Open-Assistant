@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 import numpy as np
 import json
+from itertools import count
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -354,7 +355,7 @@ class ResponseHistoryReadOnlyTests(unittest.TestCase):
 
         with patch(
             "ai.history.time.time",
-            side_effect=[1000, 1000, 1000, 1000, 1001, 1001, 1001, 1001, 1002, 1002],
+            side_effect=count(1000),
         ):
             history = ResponseHistory(history_dir=str(history_dir))
             history.start_new_session()

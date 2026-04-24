@@ -1649,6 +1649,15 @@ class AIEngine(QObject):
         else:
             tier_hint = None
 
+        # Phase 2: Ultra-Low Latency dynamic tier override.
+        # If the query is simple, aggressively target the 'fast' tier for <500ms TTFB.
+        if complexity == "simple":
+            tier_hint = "fast"
+            prefer_speed = True
+        elif complexity == "reasoning":
+            tier_hint = "reasoning"
+            prefer_quality = True
+
         mode_name = mode.name if hasattr(mode, "name") else str(mode or "general")
 
         if self._router:

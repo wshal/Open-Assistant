@@ -194,6 +194,7 @@ class EmbeddingTier:
 
         self._model = None          # None = not loaded yet, False = failed, model otherwise
         self._model_lock = threading.Lock()
+        self._data_lock = threading.RLock()
 
         # In-memory index: parallel lists for fast numpy batch cosine similarity
         self._vectors: List[np.ndarray] = []   # each shape (384,) float32
@@ -201,7 +202,8 @@ class EmbeddingTier:
         self._timestamps: List[float] = []     # created_at for TTL pruning
 
         self._dirty = False   # True when vectors need to be flushed to disk
-        self._load_persisted()
+        with self._data_lock:
+            self._load_persisted()
 
     # ------------------------------------------------------------------
     # Model loading (lazy, thread-safe)
@@ -224,11 +226,12 @@ class EmbeddingTier:
         vec = self._embed(query)
         if vec is None:
             return
-        self._vectors.append(vec)
-        self._records.append(record)
-        self._timestamps.append(time.time())
-        self._dirty = True
-        self._persist()
+        with self._data_lock:
+            self._vectors.append(vec)
+            self._records.append(record)
+            self._timestamps.append(time.time())
+            self._dirty = True
+            self._persist()
 
     def find(
         self,
@@ -244,7 +247,12 @@ class EmbeddingTier:
             return None
 
         now = time.time()
-        matrix = np.stack(self._vectors)  # (N, D) — already L2-normalized
+        with self._data_lock:
+            if not self._vectors:
+                return None
+            matrix = np.stack(self._vectors)  # (N, D) — already L2-normalized
+            records = list(self._records)
+            timestamps = list(self._timestamps)
 
         # Cosine similarity = dot product (since both sides are normalized)
         scores = matrix @ vec  # (N,)
@@ -252,7 +260,7 @@ class EmbeddingTier:
         # Filter by mode + context scope and TTL
         best_score = self.threshold - 1e-9  # below threshold
         best_idx = -1
-        for i, (rec, ts) in enumerate(zip(self._records, self._timestamps)):
+        for i, (rec, ts) in enumerate(zip(records, timestamps)):
             if rec.mode != mode or rec.context_fp != context_fp:
                 continue
             if (now - ts) > self.ttl_s:
@@ -265,22 +273,23 @@ class EmbeddingTier:
             logger.debug(
                 f"EmbeddingTier: hit (cosine={best_score:.3f}) for query: {query[:50]!r}"
             )
-            return self._records[best_idx]
+            return records[best_idx]
         return None
 
     def prune_expired(self) -> None:
         """Remove entries older than TTL — called periodically from _prune()."""
-        if not self._timestamps:
-            return
-        now = time.time()
-        keep = [i for i, ts in enumerate(self._timestamps) if (now - ts) <= self.ttl_s]
-        if len(keep) == len(self._timestamps):
-            return
-        self._vectors = [self._vectors[i] for i in keep]
-        self._records = [self._records[i] for i in keep]
-        self._timestamps = [self._timestamps[i] for i in keep]
-        self._dirty = True
-        self._persist()
+        with self._data_lock:
+            if not self._timestamps:
+                return
+            now = time.time()
+            keep = [i for i, ts in enumerate(self._timestamps) if (now - ts) <= self.ttl_s]
+            if len(keep) == len(self._timestamps):
+                return
+            self._vectors = [self._vectors[i] for i in keep]
+            self._records = [self._records[i] for i in keep]
+            self._timestamps = [self._timestamps[i] for i in keep]
+            self._dirty = True
+            self._persist()
 
     # ------------------------------------------------------------------
     # Disk persistence

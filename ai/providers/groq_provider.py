@@ -15,6 +15,8 @@ class GroqProvider(BaseProvider):
         if not key:
             self.enabled = False
             return
+        if not self.pcfg.get("model") and not self.pcfg.get("models"):
+            self.pcfg["model"] = "llama-3.1-8b-instant"
         try:
             from groq import AsyncGroq
             self.client = AsyncGroq(api_key=key)
