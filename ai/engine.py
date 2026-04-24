@@ -93,7 +93,11 @@ class AIEngine(QObject):
             enable_fuzzy=bool(cache_cfg.get("enable_fuzzy", False)),
             fuzzy_threshold=float(cache_cfg.get("fuzzy_threshold", 0.85) or 0.85),
             enable_semantic=bool(cache_cfg.get("enable_semantic", True)),
+            enable_embedding=bool(cache_cfg.get("enable_embedding", True)),
+            embedding_threshold=float(cache_cfg.get("embedding_threshold", 0.88) or 0.88),
         )
+        # Pre-load embedding model in background so first query has zero extra latency
+        self._short_cache.warmup()
 
         # --- Health polling adaptivity (P1) ---
         self._last_request_at = 0.0
@@ -1693,8 +1697,18 @@ class AIEngine(QObject):
 
     def ensure_health_monitor(self, loop: asyncio.AbstractEventLoop):
         """Start the provider health monitor once and reuse it for future calls."""
-        if not loop or not loop.is_running():
+        if not loop:
             return None
+        # The async thread may still be spinning up — wait briefly for the loop to be running
+        for _ in range(10):
+            if loop.is_running():
+                break
+            import time as _time
+            _time.sleep(0.1)
+        if not loop.is_running():
+            logger.warning("Health monitor: loop not running after wait — skipping")
+            return None
+
         self._loop = loop
         if self._health_task and not self._health_task.done():
             return self._health_task
@@ -1705,11 +1719,14 @@ class AIEngine(QObject):
             self._health_task = loop.create_task(self.poll_provider_health_loop())
             return self._health_task
 
-        future = asyncio.run_coroutine_threadsafe(self._call_in_loop(_create), loop)
+        async def _spawn():
+            return _create()
+
+        future = asyncio.run_coroutine_threadsafe(_spawn(), loop)
         try:
-            return future.result(timeout=2)
+            return future.result(timeout=5)
         except Exception as e:
-            logger.error(f"Failed to start provider health monitor: {e}")
+            logger.error(f"Failed to start provider health monitor: {type(e).__name__}: {e}")
             return None
 
     async def stop_health_monitor(self):

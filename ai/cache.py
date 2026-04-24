@@ -4,22 +4,44 @@ Short-query response cache (P1).
 Goal: return instantly for repeated small questions when the live context
 fingerprint hasn't changed materially.
 
-Three-Tier Lookup:
-  Tier 1 - Exact match (fast path, hash lookup)
-  Tier 2 - Semantic signature match (smart path, intent + canonical entities)
-  Tier 3 - Conservative fuzzy Jaccard match (safety path, optional)
+Four-Tier Lookup:
+  Tier 1 - Exact match      (fast path,    hash lookup,         ~0ms)
+  Tier 2 - Semantic Sig     (smart path,   intent+entities,     ~0.1ms)
+  Tier 3 - Embedding Sim    (smarter path, MiniLM ONNX cosine,  ~15ms)
+  Tier 4 - Fuzzy Jaccard    (safety path,  token overlap,       ~1ms, optional)
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
+import os
 import re
+import threading
 import time
+import warnings
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Set, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
+import numpy as np
+
+# Suppress the noisy HuggingFace Hub unauthenticated-request warning.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+warnings.filterwarnings("ignore", message="Cannot enable progress bars.*")
+
+logger = logging.getLogger(__name__)
 
 _WS_RE = re.compile(r"\s+")
+
+# ---------------------------------------------------------------------------
+# Embedding persistence paths (inside data/cache/ — already gitignored)
+# ---------------------------------------------------------------------------
+_EMBED_VECTORS_PATH = Path("data/cache/embed_vectors.npy")
+_EMBED_META_PATH    = Path("data/cache/embed_meta.json")
+_EMBED_MODEL_NAME   = "BAAI/bge-small-en-v1.5"   # 24MB ONNX, best quality/size ratio
 
 
 # ---------------------------------------------------------------------------
@@ -73,44 +95,28 @@ _CANONICAL_ENTITIES: Dict[str, List[str]] = {
     "angular": ["angular", "angularjs"],
 }
 
-# ---------------------------------------------------------------------------
-# P2: Intent Patterns (compiled regex with word boundaries — no false positives
-# like "fix" matching "fixed", or "build" matching "rebuilding")
-# ---------------------------------------------------------------------------
+# Use word-boundary patterns for intent matching to avoid e.g. "fix" matching "fixed"
 _INTENT_PATTERNS: Dict[str, List[re.Pattern]] = {
     "EXPLAIN": [
-        re.compile(r"\bwhat is\b"),
-        re.compile(r"\bwhat are\b"),
-        re.compile(r"\bexplain\b"),
-        re.compile(r"\btell me about\b"),
-        re.compile(r"\bdescribe\b"),
-        re.compile(r"\bdefine\b"),
+        re.compile(r"\bwhat is\b"), re.compile(r"\bwhat are\b"),
+        re.compile(r"\bexplain\b"), re.compile(r"\btell me about\b"),
+        re.compile(r"\bdescribe\b"), re.compile(r"\bdefine\b"),
     ],
     "HOW_TO": [
-        re.compile(r"\bhow do i\b"),
-        re.compile(r"\bhow do\b"),
-        re.compile(r"\bhow to\b"),
-        re.compile(r"\bsteps to\b"),
-        re.compile(r"\bimplement\b"),
-        re.compile(r"\bbuild\b"),
-        re.compile(r"\bcreate\b"),
-        re.compile(r"\bsetup\b"),
+        re.compile(r"\bhow do i\b"), re.compile(r"\bhow do\b"),
+        re.compile(r"\bhow to\b"), re.compile(r"\bsteps to\b"),
+        re.compile(r"\bimplement\b"), re.compile(r"\bbuild\b"),
+        re.compile(r"\bcreate\b"), re.compile(r"\bsetup\b"),
     ],
     "TROUBLESHOOT": [
-        re.compile(r"\bwhy is\b"),
-        re.compile(r"\bfix\b"),
-        re.compile(r"\bdebug\b"),
-        re.compile(r"\berror\b"),
-        re.compile(r"\bnot working\b"),
-        re.compile(r"\bproblem\b"),
-        re.compile(r"\bissue\b"),
-        re.compile(r"\bfail\b"),
+        re.compile(r"\bwhy is\b"), re.compile(r"\bfix\b"),
+        re.compile(r"\bdebug\b"), re.compile(r"\berror\b"),
+        re.compile(r"\bnot working\b"), re.compile(r"\bproblem\b"),
+        re.compile(r"\bissue\b"), re.compile(r"\bfail\b"),
     ],
     "COMPARE": [
-        re.compile(r"\bvs\b"),
-        re.compile(r"\bversus\b"),
-        re.compile(r"\bdifference between\b"),
-        re.compile(r"\bcompare\b"),
+        re.compile(r"\bvs\b"), re.compile(r"\bversus\b"),
+        re.compile(r"\bdifference between\b"), re.compile(r"\bcompare\b"),
     ],
 }
 
@@ -151,13 +157,257 @@ class CacheEntry:
     expires_at: float
 
 
+# ---------------------------------------------------------------------------
+# Tier 3: Embedding-based semantic similarity
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _EmbedRecord:
+    """One entry in the embedding index."""
+    mode: str
+    context_fp: str
+    cache_query: str    # normalized — used to reconstruct CacheKey
+    history_fp: str
+
+
+class EmbeddingTier:
+    """
+    Tier 3 semantic cache backed by ONNX MiniLM embeddings.
+
+    Model:  BAAI/bge-small-en-v1.5  (~24MB ONNX, auto-downloaded on first use)
+    Speed:  ~10-15ms per query on CPU
+    Benefit: Catches paraphrased questions that signature+fuzzy both miss,
+             e.g. 'centering a div' ↔ 'horizontal alignment issue'
+    """
+
+    def __init__(
+        self,
+        threshold: float = 0.88,
+        vectors_path: Path = _EMBED_VECTORS_PATH,
+        meta_path: Path = _EMBED_META_PATH,
+        ttl_s: float = 120.0,
+    ):
+        self.threshold = threshold
+        self.ttl_s = ttl_s
+        self._vectors_path = Path(vectors_path)
+        self._meta_path = Path(meta_path)
+
+        self._model = None          # None = not loaded yet, False = failed, model otherwise
+        self._model_lock = threading.Lock()
+
+        # In-memory index: parallel lists for fast numpy batch cosine similarity
+        self._vectors: List[np.ndarray] = []   # each shape (384,) float32
+        self._records: List[_EmbedRecord] = []
+        self._timestamps: List[float] = []     # created_at for TTL pruning
+
+        self._dirty = False   # True when vectors need to be flushed to disk
+        self._load_persisted()
+
+    # ------------------------------------------------------------------
+    # Model loading (lazy, thread-safe)
+    # ------------------------------------------------------------------
+
+    def warmup(self) -> None:
+        """Pre-load the model at app startup so first query has zero extra latency."""
+        self._load_model()
+
+    def _load_model(self) -> None:
+        if self._model is not None:
+            return
+        with self._model_lock:
+            if self._model is not None:
+                return
+
+            # Fallback chain:
+            #   1. fastembed      — ONNX-native, ~24MB, fastest (fails on Python 3.14 due to py-rust-stemmers)
+            #   2. sentence-transformers ONNX backend — requires `optimum` package
+            #   3. sentence-transformers PyTorch      — always works, ~30ms CPU, still background-threaded
+
+            # Path 1: fastembed (best)
+            try:
+                from fastembed import TextEmbedding  # type: ignore
+                self._model = TextEmbedding(model_name=_EMBED_MODEL_NAME)
+                logger.info(f"✅ Embedding model loaded via fastembed ONNX ({_EMBED_MODEL_NAME})")
+                return
+            except ImportError:
+                pass
+            except Exception as e:
+                logger.debug(f"fastembed unavailable: {e}")
+
+            # Path 2: sentence-transformers with ONNX backend
+            try:
+                from sentence_transformers import SentenceTransformer  # type: ignore
+                self._model = SentenceTransformer(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    backend="onnx",
+                )
+                logger.info("✅ Embedding model loaded via sentence-transformers (ONNX backend)")
+                return
+            except Exception:
+                pass
+
+            # Path 3: sentence-transformers PyTorch (universal fallback)
+            try:
+                from sentence_transformers import SentenceTransformer  # type: ignore
+                self._model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+                logger.info("✅ Embedding model loaded via sentence-transformers (PyTorch)")
+                return
+            except Exception as e:
+                self._model = False  # sentinel: stop retrying
+                logger.warning(f"Embedding model unavailable — Tier 3 disabled: {e}")
+
+    def _embed(self, text: str) -> Optional[np.ndarray]:
+        self._load_model()
+        if not self._model:
+            return None
+        try:
+            if hasattr(self._model, "embed"):
+                # fastembed API
+                vecs = list(self._model.embed([text]))
+            else:
+                # sentence-transformers API
+                vecs = self._model.encode([text], normalize_embeddings=True)
+            v = np.array(vecs[0], dtype=np.float32)
+            # L2-normalize for cosine similarity via dot product
+            norm = np.linalg.norm(v)
+            return v / norm if norm > 1e-8 else v
+        except Exception as e:
+            logger.debug(f"Embedding error: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Index operations
+    # ------------------------------------------------------------------
+
+    def add(self, query: str, record: _EmbedRecord) -> None:
+        vec = self._embed(query)
+        if vec is None:
+            return
+        self._vectors.append(vec)
+        self._records.append(record)
+        self._timestamps.append(time.time())
+        self._dirty = True
+        self._persist()
+
+    def find(
+        self,
+        query: str,
+        mode: str,
+        context_fp: str,
+    ) -> Optional[_EmbedRecord]:
+        """Return the best matching record above threshold, or None."""
+        if not self._vectors:
+            return None
+        vec = self._embed(query)
+        if vec is None:
+            return None
+
+        now = time.time()
+        matrix = np.stack(self._vectors)  # (N, D) — already L2-normalized
+
+        # Cosine similarity = dot product (since both sides are normalized)
+        scores = matrix @ vec  # (N,)
+
+        # Filter by mode + context scope and TTL
+        best_score = self.threshold - 1e-9  # below threshold
+        best_idx = -1
+        for i, (rec, ts) in enumerate(zip(self._records, self._timestamps)):
+            if rec.mode != mode or rec.context_fp != context_fp:
+                continue
+            if (now - ts) > self.ttl_s:
+                continue
+            if scores[i] > best_score:
+                best_score = scores[i]
+                best_idx = i
+
+        if best_idx >= 0:
+            logger.debug(
+                f"EmbeddingTier: hit (cosine={best_score:.3f}) for query: {query[:50]!r}"
+            )
+            return self._records[best_idx]
+        return None
+
+    def prune_expired(self) -> None:
+        """Remove entries older than TTL — called periodically from _prune()."""
+        if not self._timestamps:
+            return
+        now = time.time()
+        keep = [i for i, ts in enumerate(self._timestamps) if (now - ts) <= self.ttl_s]
+        if len(keep) == len(self._timestamps):
+            return
+        self._vectors = [self._vectors[i] for i in keep]
+        self._records = [self._records[i] for i in keep]
+        self._timestamps = [self._timestamps[i] for i in keep]
+        self._dirty = True
+        self._persist()
+
+    # ------------------------------------------------------------------
+    # Disk persistence
+    # ------------------------------------------------------------------
+
+    def _persist(self) -> None:
+        if not self._dirty or not self._vectors:
+            return
+        try:
+            self._vectors_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(str(self._vectors_path), np.stack(self._vectors))
+            meta = [
+                {
+                    "mode": r.mode,
+                    "context_fp": r.context_fp,
+                    "cache_query": r.cache_query,
+                    "history_fp": r.history_fp,
+                    "ts": ts,
+                }
+                for r, ts in zip(self._records, self._timestamps)
+            ]
+            self._meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            self._dirty = False
+        except Exception as e:
+            logger.debug(f"EmbeddingTier: persist failed: {e}")
+
+    def _load_persisted(self) -> None:
+        try:
+            if not self._vectors_path.exists() or not self._meta_path.exists():
+                return
+            raw_meta = json.loads(self._meta_path.read_text(encoding="utf-8"))
+            raw_vecs = np.load(str(self._vectors_path))
+            if len(raw_vecs) != len(raw_meta):
+                logger.debug("EmbeddingTier: length mismatch on load — resetting.")
+                return
+            now = time.time()
+            for i, m in enumerate(raw_meta):
+                ts = float(m.get("ts", 0))
+                if (now - ts) > self.ttl_s:
+                    continue  # skip expired on load
+                self._vectors.append(raw_vecs[i].astype(np.float32))
+                self._records.append(_EmbedRecord(
+                    mode=m["mode"],
+                    context_fp=m["context_fp"],
+                    cache_query=m["cache_query"],
+                    history_fp=m["history_fp"],
+                ))
+                self._timestamps.append(ts)
+            logger.info(f"EmbeddingTier: Loaded {len(self._vectors)} persisted embeddings.")
+        except Exception as e:
+            logger.debug(f"EmbeddingTier: load failed (fresh start): {e}")
+            self._vectors = []
+            self._records = []
+            self._timestamps = []
+
+
+# ---------------------------------------------------------------------------
+# Main cache class
+# ---------------------------------------------------------------------------
+
 class ShortQueryCache:
     """
-    Three-tier in-memory cache.
+    Four-tier in-memory + disk-backed cache.
 
-    Tier 1 - Exact match: always checked, O(1) hash lookup.
-    Tier 2 - Semantic signature: Intent + Canonical Entities, scoped by mode+context.
-    Tier 3 - Conservative fuzzy Jaccard (optional, ASCII-only, ≤240 chars).
+    Tier 1 - Exact match:      O(1) hash,     ~0ms
+    Tier 2 - Semantic sig:     intent+entity, ~0.1ms
+    Tier 3 - Embedding sim:    MiniLM ONNX,   ~15ms CPU  (default ON)
+    Tier 4 - Fuzzy Jaccard:    token overlap, ~1ms       (optional)
     """
 
     def __init__(
@@ -167,17 +417,37 @@ class ShortQueryCache:
         enable_fuzzy: bool = False,
         fuzzy_threshold: float = 0.85,
         enable_semantic: bool = True,
+        enable_embedding: bool = True,
+        embedding_threshold: float = 0.88,
     ):
         self.ttl_s = float(ttl_s or 0)
         self.max_items = int(max_items or 0)
         self.enable_fuzzy = bool(enable_fuzzy)
         self.fuzzy_threshold = float(fuzzy_threshold or 0.85)
         self.enable_semantic = bool(enable_semantic)
+        self.enable_embedding = bool(enable_embedding)
+
         self._items: dict[CacheKey, CacheEntry] = {}
         # Composite key: (signature, mode, context_fp) → CacheKey
-        # Scoped per mode+context to prevent cross-contamination.
         self._semantic_items: dict[Tuple[str, str, str], CacheKey] = {}
         self._lru: list[CacheKey] = []
+
+        # Tier 3: embedding index
+        self._embed: Optional[EmbeddingTier] = None
+        if self.enable_embedding:
+            self._embed = EmbeddingTier(
+                threshold=float(embedding_threshold or 0.88),
+                ttl_s=self.ttl_s,
+            )
+
+    def warmup(self) -> None:
+        """Pre-load the embedding model during app warmup — zero cold-start latency."""
+        if self._embed:
+            threading.Thread(
+                target=self._embed.warmup,
+                daemon=True,
+                name="embed-warmup",
+            ).start()
 
     @staticmethod
     def context_fingerprint(
@@ -188,7 +458,7 @@ class ShortQueryCache:
     ) -> str:
         aw = (active_window or "").strip()[:80]
         sc = (screen or "").strip()[:400]
-        # P2: Audio deliberately excluded — highly volatile in live meetings.
+        # Audio deliberately excluded — highly volatile in live meetings.
         # Cache is stable as long as the visual/window context remains the same.
         return _sha1(f"aw={aw}||sc={sc}")
 
@@ -222,6 +492,10 @@ class ShortQueryCache:
         active_keys = set(self._items.keys())
         self._semantic_items = {sk: ck for sk, ck in self._semantic_items.items() if ck in active_keys}
 
+        # Prune embedding tier (runs cheaply — just checks timestamps)
+        if self._embed:
+            self._embed.prune_expired()
+
     def get(
         self,
         *,
@@ -234,14 +508,14 @@ class ShortQueryCache:
             return None
         self._prune()
 
-        # Tier 1: Exact match
+        # ── Tier 1: Exact match ─────────────────────────────────────────
         key = CacheKey(str(mode or "general"), _norm_query(query), context_fp, history_fp)
         entry = self._items.get(key)
         if entry and entry.expires_at > time.time():
             self._touch_lru(key)
             return entry
 
-        # Tier 2: Semantic Signature (Smart Path)
+        # ── Tier 2: Semantic Signature ──────────────────────────────────
         if self.enable_semantic:
             signature = self._get_semantic_signature(query)
             sem_lookup_key = (signature, key.mode, key.context_fp)
@@ -252,7 +526,17 @@ class ShortQueryCache:
                     self._touch_lru(semantic_key)
                     return entry
 
-        # Tier 3: Conservative Fuzzy (Safety Path)
+        # ── Tier 3: Embedding Similarity ────────────────────────────────
+        if self._embed:
+            rec = self._embed.find(query, mode=key.mode, context_fp=key.context_fp)
+            if rec:
+                embed_key = CacheKey(rec.mode, rec.cache_query, rec.context_fp, rec.history_fp)
+                entry = self._items.get(embed_key)
+                if entry and entry.expires_at > time.time():
+                    self._touch_lru(embed_key)
+                    return entry
+
+        # ── Tier 4: Conservative Fuzzy ──────────────────────────────────
         if not self.enable_fuzzy:
             return None
 
@@ -306,16 +590,33 @@ class ShortQueryCache:
             created_at=now,
             expires_at=now + self.ttl_s,
         )
+
+        # Tier 1: Exact
         self._items[key] = entry
 
-        # Tier 2: also store by semantic signature (scoped by mode + context)
+        # Tier 2: Semantic signature
         if self.enable_semantic:
             try:
                 signature = self._get_semantic_signature(query)
                 sem_key = (signature, key.mode, key.context_fp)
                 self._semantic_items[sem_key] = key
             except Exception:
-                pass  # Never fail caching due to signature errors
+                pass
+
+        # Tier 3: Embedding (runs in background thread — never blocks the response path)
+        if self._embed:
+            rec = _EmbedRecord(
+                mode=key.mode,
+                context_fp=key.context_fp,
+                cache_query=nq,
+                history_fp=key.history_fp,
+            )
+            threading.Thread(
+                target=self._embed.add,
+                args=(query, rec),
+                daemon=True,
+                name="embed-index",
+            ).start()
 
         self._touch_lru(key)
         self._prune()
@@ -328,13 +629,7 @@ class ShortQueryCache:
         self._lru.append(key)
 
     def _get_semantic_signature(self, query: str) -> str:
-        """P2: Versioned semantic signature = Intent + sorted canonical entities.
-
-        Guarantees:
-        - 'React hooks' and 'hooks in React' → same signature (sorted)
-        - 'fix' does NOT match 'fixed' (word-boundary regex patterns)
-        - Empty entity list → no trailing colon (clean fallback)
-        """
+        """P2: Versioned semantic signature = Intent + sorted canonical entities."""
         lower = (query or "").lower().strip()
 
         # 1. Detect intent using compiled word-boundary patterns

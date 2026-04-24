@@ -21,6 +21,7 @@ OpenAssist is a premium AI-powered overlay assistant for Windows. It analyzes yo
 
 ### 🧠 Intelligent Brain
 - **Smart Router** — dynamically switches between high-speed cloud providers (Groq, Gemini, Cerebras, Together) and local inference (Ollama) based on query complexity.
+- **Four-Tier Semantic Cache** — high-performance engine using local ONNX embeddings (`BAAI/bge-small-en-v1.5`) and Jaccard token overlap to autonomously resolve paraphrased questions with sub-20ms latency.
 - **RAG Engine** — built-in local vector database (ChromaDB) for instant indexing and retrieval from project directories or knowledge bases.
 - **Conversation History** — maintains multi-turn context across a session and resolves follow-up queries automatically.
 - **Parallel Inference** — optional mode that fires multiple providers simultaneously and uses the fastest valid response.
@@ -68,7 +69,7 @@ All actions are hotkey-driven so the HUD stays invisible:
 | **Audio** | SoundDevice + Faster-Whisper (tiny/base) |
 | **AI Cloud** | Groq · Gemini · Cerebras · Together AI |
 | **AI Local** | Ollama (any pulled model) |
-| **RAG** | ChromaDB + FastEmbed |
+| **RAG & Cache** | ChromaDB + FastEmbed ONNX |
 | **Config** | Encrypted YAML (`cryptography` / Fernet) |
 | **Orchestration** | asyncio multi-model routing with smart fallback |
 
@@ -105,6 +106,11 @@ Supported providers and where to get keys:
 - [Together AI](https://api.together.xyz/) — wide model selection
 - [Ollama](https://ollama.ai/) — fully local, no key required
 
+### ⚠️ Troubleshooting Windows Defender Application Control (WDAC)
+Because OpenAssist uses compiled local AI engines (Whisper via `ctranslate2` and RAG via `chromadb`), **Windows Smart App Control** may block these DLLs upon first launch, showing a `DLL load failed` error in the logs.
+- **Fix 1 (Recommended):** Turn off "Smart App Control" in Windows settings if you are a developer running local Python AI scripts.
+- **Fix 2:** Open Windows Security, go to "Virus & threat protection settings" → "Exclusions", and add your `venv` folder as an exclusion.
+
 ### Launch
 ```bash
 python main.py
@@ -117,13 +123,13 @@ python main.py
 ```
 openassist/
 ├── core/           # App controller, config, state, hotkeys
-├── ai/             # Engine, prompt builder, router, providers, RAG
+├── ai/             # Engine, prompt builder, router, providers, RAG, Semantic Cache
 ├── capture/        # Screen OCR, audio capture pipeline
 ├── modes/          # Capture mode profiles (Interview, Coding, etc.)
 ├── ui/             # HUD overlay, standby view, settings, mini-HUD
 ├── utils/          # Logger, context store, platform utilities
 ├── stealth/        # Anti-screen-capture and input simulator
-├── tests/          # Unit test suite (109 tests)
+├── tests/          # Unit test suite (127 tests)
 └── data/           # Runtime data (encrypted, gitignored)
 ```
 
@@ -135,7 +141,7 @@ openassist/
 python -m unittest discover -s tests
 ```
 
-All 109 tests should pass. Tests cover session lifecycle, context store, mode switching, prompt injection, and audio pipeline behavior.
+All **127 tests** should pass. Tests cover session lifecycle, context store, mode switching, prompt injection, audio pipeline behavior, semantic caching, and question detection.
 
 ---
 

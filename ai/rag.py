@@ -90,6 +90,7 @@ class RAGEngine:
 
                 # Initialize Embeddings (Fallback to SentenceTransformers if FastEmbed missing)
                 try:
+                    os.environ.setdefault("FASTEMBED_CACHE_PATH", "./data/cache/fastembed")
                     from fastembed import TextEmbedding
 
                     emb = TextEmbedding(
@@ -106,7 +107,7 @@ class RAGEngine:
                             "embedding model unavailable during startup; RAG warmup skipped"
                         ) from embed_error
                     raise RuntimeError(
-                        "fastembed is unavailable; install local embedding support to enable RAG"
+                        f"fastembed is unavailable ({embed_error}); install local embedding support to enable RAG"
                     ) from embed_error
 
                 self._loaded = True

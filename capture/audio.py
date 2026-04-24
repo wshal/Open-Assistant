@@ -380,7 +380,15 @@ class AudioCapture(QObject):
                 self.level.emit(self._current_rms)
                 time.sleep(0.1)
         except Exception as e:
-            logger.error(f"❌ Final Capture Loop Failure: {e}")
+            err = str(e)
+            if "9996" in err or "Invalid device" in err or "Busy" in err.lower():
+                logger.error(
+                    f"❌ Audio device unavailable: {e}\n"
+                    "   → Close any app holding exclusive audio access "
+                    "(Discord, Zoom, Teams, another OpenAssist instance) and restart."
+                )
+            else:
+                logger.error(f"❌ Final Capture Loop Failure: {e}")
         finally:
             self._close_streams()
 

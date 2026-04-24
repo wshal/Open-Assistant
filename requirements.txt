@@ -46,8 +46,10 @@ httpx>=0.27.0
 # -- RAG & Knowledge Base ----------------------------------------------
 chromadb>=0.5.0
 
-# Embeddings - fastembed may fail on Python 3.14 (py-rust-stemmers build issue)
-# Sentence-transformers is used as fallback
+# Embeddings - fastembed (ONNX-native, ~24MB, fast CPU inference)
+# Falls back to sentence-transformers ONNX backend if fastembed unavailable
+fastembed>=0.3.0
+# sentence-transformers is used as fallback
 sentence-transformers>=3.0.0
 
 # Text splitting

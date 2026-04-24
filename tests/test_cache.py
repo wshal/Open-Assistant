@@ -1,10 +1,14 @@
 import unittest
 import time
-from ai.cache import ShortQueryCache
+import numpy as np
+from unittest.mock import patch, MagicMock
+from ai.cache import ShortQueryCache, EmbeddingTier, _EmbedRecord
+
 
 class TestShortQueryCacheSemantic(unittest.TestCase):
     def setUp(self):
-        self.cache = ShortQueryCache(ttl_s=10.0, enable_fuzzy=True)
+        # Disable embedding tier for signature/fuzzy tests (avoids model download)
+        self.cache = ShortQueryCache(ttl_s=10.0, enable_fuzzy=True, enable_embedding=False)
         self.ctx = "visual_state_1"
         self.hist = "history_1"
 
@@ -121,6 +125,109 @@ class TestShortQueryCacheSemantic(unittest.TestCase):
         # Should NOT classify as TROUBLESHOOT
         self.assertNotIn("TROUBLESHOOT", sig)
 
+
+
+class TestEmbeddingTier(unittest.TestCase):
+    """Tests for the ONNX embedding tier using a mocked model."""
+
+    def _make_tier(self, threshold=0.88):
+        tier = EmbeddingTier(
+            threshold=threshold,
+            vectors_path=Path("data/cache/_test_embed_vectors.npy"),
+            meta_path=Path("data/cache/_test_embed_meta.json"),
+            ttl_s=30.0,
+        )
+        return tier
+
+    def _inject_mock_embed(self, tier, vectors: dict):
+        """Patch _embed to return deterministic vectors from a dict."""
+        def fake_embed(text):
+            v = np.array(vectors.get(text, [0.0] * 384), dtype=np.float32)
+            norm = np.linalg.norm(v)
+            return v / norm if norm > 1e-8 else v
+        tier._embed = fake_embed
+
+    def test_exact_hit_above_threshold(self):
+        tier = self._make_tier(threshold=0.85)
+        # Two nearly identical vectors → cosine ~ 1.0 → hit
+        v1 = np.random.rand(384).astype(np.float32)
+        v2 = v1 + np.random.rand(384).astype(np.float32) * 0.02  # tiny noise
+
+        def fake_embed(text):
+            raw = v1 if text == "stored" else v2
+            norm = np.linalg.norm(raw)
+            return raw / norm
+        tier._embed = fake_embed
+
+        rec = _EmbedRecord(mode="general", context_fp="ctx1", cache_query="stored", history_fp="h1")
+        tier.add("stored", rec)
+
+        result = tier.find("query", mode="general", context_fp="ctx1")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.cache_query, "stored")
+
+    def test_no_hit_below_threshold(self):
+        tier = self._make_tier(threshold=0.99)  # impossibly high → no hit
+        v1 = np.random.rand(384).astype(np.float32)
+        v2 = np.random.rand(384).astype(np.float32)  # completely different
+
+        def fake_embed(text):
+            raw = v1 if text == "stored" else v2
+            norm = np.linalg.norm(raw)
+            return raw / norm
+        tier._embed = fake_embed
+
+        rec = _EmbedRecord(mode="general", context_fp="ctx1", cache_query="stored", history_fp="h1")
+        tier.add("stored", rec)
+        result = tier.find("query", mode="general", context_fp="ctx1")
+        self.assertIsNone(result)
+
+    def test_mode_isolation(self):
+        tier = self._make_tier(threshold=0.85)
+        v = np.random.rand(384).astype(np.float32)
+
+        def fake_embed(text):
+            norm = np.linalg.norm(v)
+            return v / norm
+        tier._embed = fake_embed
+
+        rec = _EmbedRecord(mode="coding", context_fp="ctx1", cache_query="stored", history_fp="h1")
+        tier.add("stored", rec)
+
+        # Same vector but looking up with mode="general" — must NOT return
+        result = tier.find("query", mode="general", context_fp="ctx1")
+        self.assertIsNone(result)
+
+    def test_embedding_tier_disabled_by_default_in_base_tests(self):
+        """ShortQueryCache with enable_embedding=False must have _embed=None."""
+        cache = ShortQueryCache(ttl_s=10.0, enable_embedding=False)
+        self.assertIsNone(cache._embed)
+
+    def test_embedding_tier_created_when_enabled(self):
+        """ShortQueryCache with enable_embedding=True must create EmbeddingTier."""
+        cache = ShortQueryCache(ttl_s=10.0, enable_embedding=True)
+        self.assertIsInstance(cache._embed, EmbeddingTier)
+
+    def test_ttl_expiry_skips_record(self):
+        """Records older than TTL must not be returned."""
+        tier = EmbeddingTier(threshold=0.50, ttl_s=0.01)  # 10ms TTL
+        v = np.random.rand(384).astype(np.float32)
+
+        def fake_embed(text):
+            norm = np.linalg.norm(v)
+            return v / norm
+        tier._embed = fake_embed
+
+        rec = _EmbedRecord(mode="general", context_fp="ctx1", cache_query="stored", history_fp="h1")
+        tier.add("stored", rec)
+        time.sleep(0.05)  # let TTL expire
+
+        result = tier.find("query", mode="general", context_fp="ctx1")
+        self.assertIsNone(result)
+
+
+# Resolve Path for tests
+from pathlib import Path
 
 if __name__ == "__main__":
     unittest.main()
