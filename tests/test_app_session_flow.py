@@ -281,7 +281,8 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             _generation_epoch=0,
             _screen_analysis_pending=False,
             _click_through=False,
-            loop=object(),
+            loop=SimpleNamespace(is_running=lambda: True),
+            _do_analyze_screen=lambda: __import__("asyncio").sleep(0),
             modes=ModeManagerStub(),
             ai=SimpleNamespace(
                 _providers={"groq": SimpleNamespace(enabled=True)},

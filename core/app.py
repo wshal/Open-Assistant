@@ -662,6 +662,10 @@ class OpenAssistApp(QObject):
 
     def analyze_current_screen(self):
         if not self.session_active:
+            self.start_new_session()
+            return
+
+        if not getattr(self, "ai", None) or not getattr(self, "screen", None):
             return
 
         self.overlay.update_transcript("Screen captured. Analyzing current screen...")
@@ -1177,72 +1181,7 @@ class OpenAssistApp(QObject):
         """Compatibility alias for UI code that expects app.type_response()."""
         return self.type_last_response()
 
-    def analyze_current_screen(self):
-        """Phase 3: Immediate Screen Analysis (Context-Aware Toggle)."""
-        if not self.session_active:
-            # Context-Aware: If session is off, hotkey acts as Start Session
-            self.start_session()
-            return
 
-        if not getattr(self, "ai", None) or not getattr(self, "screen", None):
-            return
-
-        # Triggered from UI. Run the capture and analysis via asyncio
-        if self.loop and self.loop.is_running():
-            import asyncio
-            asyncio.run_coroutine_threadsafe(self._do_analyze_screen(), self.loop)
-
-    async def _do_analyze_screen(self):
-        try:
-            # 1. Fast UI feedback
-            if hasattr(self.overlay, "set_analysis_provider_badge"):
-                self.overlay.set_analysis_provider_badge(pending=True)
-            
-            # 2. Capture optimized image bytes
-            image_bytes = await self.screen.capture_image_bytes(for_analysis=True)
-            if not image_bytes:
-                if hasattr(self.overlay, "set_analysis_provider_badge"):
-                    self.overlay.set_analysis_provider_badge(pending=False)
-                return
-            
-            # 3. Fire to Vision AI
-            snap = self.nexus.get_snapshot()
-            prompt = "Analyze the current screen and concisely explain what the user is looking at or doing."
-            
-            resp = await self.ai.analyze_image_response(
-                query=prompt,
-                image_bytes=image_bytes,
-                nexus_snapshot=snap,
-                audio_context=snap.get("recent_audio", "")
-            )
-            
-            if resp:
-                # 4. Save to history
-                self.history.add(
-                    query="[Screen Analysis]",
-                    response=resp,
-                    provider="vision",
-                    mode=self.state.mode,
-                    metadata={"had_screen": True}
-                )
-                if hasattr(self.overlay, "set_analysis_provider_badge"):
-                    self.overlay.set_analysis_provider_badge(provider="gemini")
-                
-                # Force the UI to reflect the new history item immediately
-                self.overlay.update_transcript("Screen analysis complete", "auto")
-                # Trigger history feed refresh in overlay if visible
-                if hasattr(self.overlay, "history_feed"):
-                    self.overlay.history_feed.refresh()
-                self.overlay._current_query = "[Screen Analysis]"
-                self.overlay._raw_buffer = resp
-                self.overlay._is_streaming = False
-                self.overlay._render_markdown_now()
-                self.overlay.show_chat_view()
-
-        except Exception as e:
-            logger.error(f"Analyze screen failed: {e}")
-            if hasattr(self.overlay, "set_analysis_provider_badge"):
-                self.overlay.set_analysis_provider_badge(pending=False)
 
     def _on_transcription(self, t):
         if not self.session_active or not t:
