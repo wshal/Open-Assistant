@@ -88,10 +88,11 @@ class AIEngine(QObject):
         # --- Short-query response cache (P1) ---
         cache_cfg = (config.get("ai.cache", {}) or {}) if hasattr(config, "get") else {}
         self._short_cache = ShortQueryCache(
-            ttl_s=float(cache_cfg.get("ttl_s", 25) or 25),
+            ttl_s=float(cache_cfg.get("ttl_s", 120) or 120),
             max_items=int(cache_cfg.get("max_items", 128) or 128),
             enable_fuzzy=bool(cache_cfg.get("enable_fuzzy", False)),
-            fuzzy_threshold=float(cache_cfg.get("fuzzy_threshold", 0.92) or 0.92),
+            fuzzy_threshold=float(cache_cfg.get("fuzzy_threshold", 0.85) or 0.85),
+            enable_semantic=bool(cache_cfg.get("enable_semantic", True)),
         )
 
         # --- Health polling adaptivity (P1) ---
@@ -299,10 +300,10 @@ class AIEngine(QObject):
         # P1: Short-query cache (exact + optional conservative fuzzy)
         cache_cfg = self.config.get("ai.cache", {}) or {}
         cache_enabled = bool(cache_cfg.get("enabled", True))
-        max_q_chars = int(cache_cfg.get("max_query_chars", 120) or 120)
+        max_q_chars = int(cache_cfg.get("max_query_chars", 320) or 320)
         allow_cache = (
             cache_enabled
-            and origin in {"manual", "speech"}
+            and origin in {"manual", "speech", "auto"}
             and isinstance(query, str)
             and len(query.strip()) > 0
             and len(query.strip()) <= max_q_chars

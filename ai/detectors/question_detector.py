@@ -26,6 +26,8 @@ class DetectionResult:
     trigger_type: str  # "question", "coding", "casual", "followup"
     source: str  # "screen", "audio", "rag"
     detected_text: str
+    language: Optional[str] = None  # optional code/stack hint (e.g., "react", "typescript", "api")
+    is_code: bool = False
     auto_response_threshold: float = 0.7
 
     def should_auto_respond(self) -> bool:
@@ -39,6 +41,8 @@ class DetectionResult:
             "trigger_type": self.trigger_type,
             "source": self.source,
             "detected_text": self.detected_text,
+            "language": self.language,
+            "is_code": self.is_code,
             "auto_respond": self.should_auto_respond(),
         }
 
@@ -87,8 +91,72 @@ class QuestionDetector:
             "write a",
             "function",
             "class",
+            "debug",
+            "fix",
+            "error",
+            "exception",
+            "stack trace",
+            "traceback",
             "hook",
             "component",
+            "react",
+            "next.js",
+            "nextjs",
+            "react router",
+            "redux",
+            "zustand",
+            "context api",
+            "useeffect",
+            "usestate",
+            "usememo",
+            "usecallback",
+            "useref",
+            "usecontext",
+            "jsx",
+            "tsx",
+            "vite",
+            "webpack",
+            "babel",
+            "eslint",
+            "prettier",
+            "npm",
+            "yarn",
+            "pnpm",
+            "typescript",
+            "tsconfig",
+            "tsc",
+            "generic",
+            "generics",
+            "union type",
+            "intersection type",
+            "type narrowing",
+            "rest api",
+            "endpoint",
+            "route",
+            "router",
+            "http",
+            "https",
+            "status code",
+            "cors",
+            "jwt",
+            "oauth",
+            "props",
+            "state",
+            "css",
+            "html",
+            "tailwind",
+            "css grid",
+            "flexbox",
+            "responsive",
+            "media query",
+            "browser",
+            "frontend",
+            "backend",
+            "database",
+            "query",
+            "api",
+            "json",
+            "dom",
         ]
 
         # Casual/Engagement patterns
@@ -198,6 +266,228 @@ class QuestionDetector:
             "exam": {"q": 1.5, "code": 0.5, "casual": 0.3},
         }
 
+        # Interim (live) detection guardrails (Option 2)
+        self._interim_enabled = bool(config.get("detection.interim.enabled", True))
+        self._interim_min_words = int(config.get("detection.interim.min_words", 4) or 4)
+        self._interim_stability_ms = int(config.get("detection.interim.stability_ms", 900) or 900)
+        self._interim_min_confidence = float(config.get("detection.interim.min_confidence", 0.75) or 0.75)
+        self._interim_cooldown_s = float(config.get("detection.interim.cooldown_s", 6.0) or 6.0)
+        self._interim_require_question_signal = bool(
+            config.get("detection.interim.require_question_signal", True)
+        )
+        self._interim_last_key = ""
+        self._interim_first_seen_at = 0.0
+        self._interim_last_trigger_at = 0.0
+
+    @staticmethod
+    def _split_clauses(text: str) -> List[str]:
+        parts = re.split(r"[.?!,;:\n]+", text or "")
+        return [p.strip() for p in parts if p and p.strip()]
+
+    @staticmethod
+    def _code_keywords() -> dict:
+        # Centralized markers so detect_with_confidence() can attach hints without
+        # re-running stateful detection logic.
+        return {
+            "react": [
+                "react",
+                "next.js",
+                "nextjs",
+                "jsx",
+                "tsx",
+                "component",
+                "props",
+                "hook",
+                "useState",
+                "useEffect",
+                "useMemo",
+                "useCallback",
+                "useRef",
+                "useContext",
+                "context api",
+                "react router",
+                "redux",
+                "zustand",
+            ],
+            "web": [
+                "html",
+                "css",
+                "dom",
+                "tailwind",
+                "css grid",
+                "flexbox",
+                "responsive",
+                "media query",
+                "frontend",
+                "browser",
+                "vite",
+                "webpack",
+            ],
+            "api": [
+                "rest api",
+                "endpoint",
+                "route",
+                "router",
+                "fetch",
+                "axios",
+                "graphql",
+                "json",
+                "http",
+                "https",
+                "status 200",
+                "status code",
+                "cors",
+                "jwt",
+                "oauth",
+                "openapi",
+                "swagger",
+                "websocket",
+                "sse",
+            ],
+            "python": ["def ", "import ", "class ", ".py", "python", "flask", "django", "fastapi"],
+            "javascript": [
+                "function ",
+                "const ",
+                "let ",
+                "var ",
+                "=>",
+                ".js",
+                "javascript",
+                "console.log",
+            ],
+            "typescript": [
+                "interface ",
+                "type ",
+                ": string",
+                ": number",
+                ".ts",
+                "typescript",
+                "tsconfig",
+                "tsc",
+                "generic",
+                "generics",
+                "any",
+            ],
+            "java": ["public class", "void main", "System.out", ".java", "java", "spring"],
+            "cpp": ["#include", "std::", "int main", "cout", "c++"],
+            "sql": ["SELECT ", "FROM ", "WHERE ", "INSERT ", "CREATE TABLE", "database", "query"],
+            "go": ["func ", "package ", "fmt.", "golang", "goroutine"],
+            "rust": ["fn ", "let mut", "impl ", "pub fn", "rust", "cargo"],
+        }
+
+    def detect_language_hint(self, text: str) -> Optional[str]:
+        """Best-effort stack/language hint for routing/logging (pure function)."""
+        if not text:
+            return None
+        lower = text.lower()
+        for lang, markers in self._code_keywords().items():
+            if any(str(m).lower() in lower for m in markers):
+                return lang
+        return None
+
+    @staticmethod
+    def _norm_key(text: str) -> str:
+        t = (text or "").lower().strip()
+        t = re.sub(r"\s+", " ", t)
+        if t.endswith("?"):
+            t = t[:-1].strip()
+        return t
+
+    def detect_interim_with_guardrails(self, text: str) -> Optional[str]:
+        """Return a stable question clause from partial ASR, or None.
+
+        Guardrails:
+        - Must look question-like (prefix/pattern/?), unless disabled
+        - Must meet a higher confidence threshold
+        - Must be stable for a time window
+        - Hard cooldown after firing to prevent duplicate/misfires
+        """
+        if not self._interim_enabled or not self.enabled:
+            return None
+        raw = (text or "").strip()
+        if not raw:
+            return None
+
+        candidate = (self._extract_question_clause(raw) or "").strip()
+        if not candidate:
+            return None
+
+        lower = candidate.lower().strip()
+        words = lower.replace("?", "").split()
+        if len(words) < max(self._interim_min_words, 2):
+            return None
+
+        has_signal = (
+            candidate.strip().endswith("?")
+            or any(lower.startswith(prefix) for prefix in self.question_prefixes)
+            or any(pattern in lower for pattern in self.question_patterns)
+        )
+        if self._interim_require_question_signal and not has_signal:
+            return None
+
+        confidence = self._calculate_confidence(candidate)
+        if confidence < self._interim_min_confidence:
+            return None
+
+        now = time.time()
+        if self._interim_last_trigger_at and (now - self._interim_last_trigger_at) < self._interim_cooldown_s:
+            return None
+
+        key = self._norm_key(candidate)
+        if not key:
+            return None
+
+        if key != self._interim_last_key:
+            self._interim_last_key = key
+            self._interim_first_seen_at = now
+            return None
+
+        stable_ms = (now - self._interim_first_seen_at) * 1000.0
+        if stable_ms < float(self._interim_stability_ms):
+            return None
+
+        self._interim_last_trigger_at = now
+        return candidate
+
+    def _extract_question_clause(self, text: str) -> str:
+        """Extract the most question-like clause from a longer transcript.
+
+        Keeps the query short and cache-friendly while the full transcript can
+        still be passed as audio_context/screen_context.
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return raw
+
+        # Always start by splitting into clauses once (centralized splitting)
+        clauses = self._split_clauses(raw)
+        if not clauses:
+            return raw
+
+        def _looks_question_like(clause_text: str) -> bool:
+            lower = clause_text.lower().strip()
+            return any(lower.startswith(p) for p in self.question_prefixes) or any(
+                pat in lower for pat in self.question_patterns
+            )
+
+        # Priority 1: If we have an explicit question mark anywhere, anchor to the last one.
+        if "?" in raw:
+            # Find which clause contains the last question mark
+            for clause in reversed(clauses):
+                if "?" in clause:
+                    # Return this clause (already has ?)
+                    return clause.strip()
+            # Fallback: return last clause with ?
+            return clauses[-1].strip() + "?"
+
+        # Priority 2: No question mark - find best question-like clause
+        for clause in reversed(clauses):
+            if _looks_question_like(clause):
+                return clause.strip()
+
+        # Priority 3: Fallback - return first clause (usually contains the core)
+        return clauses[0].strip()
+
     def set_mode(self, mode_id: str):
         """Update detection bias based on current Task mode."""
         self.current_mode = mode_id
@@ -214,8 +504,15 @@ class QuestionDetector:
 
         if result:
             # Calculate confidence based on pattern match
-            confidence = self._calculate_confidence(text)
+            confidence = self._calculate_confidence(result)
             trigger_type = self._classify_trigger(result)
+
+            # Attach best-effort language hints without re-running stateful detection.
+            language = self.detect_language_hint(result) or self.detect_language_hint(text)
+            lower_result = result.lower()
+            is_code = bool(language) or any(p in lower_result for p in self.coding_patterns)
+            if is_code and trigger_type == "question":
+                trigger_type = "coding"
 
             detection = DetectionResult(
                 triggered=True,
@@ -223,6 +520,8 @@ class QuestionDetector:
                 trigger_type=trigger_type,
                 source=source,
                 detected_text=result,
+                language=language,
+                is_code=is_code,
                 auto_response_threshold=self.auto_response_threshold,
             )
 
@@ -254,9 +553,18 @@ class QuestionDetector:
         elif "?" in text:
             score += 0.4
 
-        # Strong signals
-        if any(lower.startswith(prefix) for prefix in self.question_prefixes):
+        # Strong signals - Check if ANY sentence in the text starts with a prefix
+        # This handles multi-sentence queries like "I am working on this. How do I fix it?"
+        clauses = self._split_clauses(lower)
+        has_prefix = False
+        for clause in clauses:
+            if any(clause.startswith(prefix) for prefix in self.question_prefixes):
+                has_prefix = True
+                break
+                
+        if has_prefix:
             score += 0.4
+            
         if any(pattern in lower for pattern in self.question_patterns):
             score += 0.3
 
@@ -274,21 +582,30 @@ class QuestionDetector:
 
     def learn_from_query(self, query: str):
         """Learn a successful query prefix to dynamically improve detection."""
-        text = query.strip().lower()
-        if not text or not text.endswith("?"):
+        extracted = self._extract_question_clause(query)
+        text = (extracted or "").strip().lower()
+        if not text:
             return
-            
-        words = text.replace("?", "").split()
+
+        looks_question_like = (
+            "?" in (query or "")
+            or any(text.startswith(prefix) for prefix in self.question_prefixes)
+            or any(pattern in text for pattern in self.question_patterns)
+        )
+        if not looks_question_like:
+            return
+
+        words = text.replace("?", "").strip().split()
         if len(words) >= 2:
             prefix = " ".join(words[:2]) + " "
             if prefix not in self.question_prefixes:
-                logger.info(f"QuestionDetector: Learned new dynamic prefix: '{prefix}'")
+                logger.info(f"QuestionDetector: Learned dynamic prefix: '{prefix}'")
                 self.question_prefixes.append(prefix)
             
             if len(words) >= 3:
                 prefix_3 = " ".join(words[:3]) + " "
                 if prefix_3 not in self.question_prefixes:
-                    logger.info(f"QuestionDetector: Learned new dynamic prefix: '{prefix_3}'")
+                    logger.info(f"QuestionDetector: Learned dynamic prefix: '{prefix_3}'")
                     self.question_prefixes.append(prefix_3)
 
     def _classify_trigger(self, text: str) -> str:
@@ -323,6 +640,7 @@ class QuestionDetector:
         candidate = self._detect_from_buffer()
         if candidate:
             self.fragment_buffer.clear()
+            candidate = self._extract_question_clause(candidate)
             if self._is_debounced(candidate):
                 return None
             logger.debug(f"QuestionDetector: Triggered from buffer: {candidate!r}")
@@ -337,11 +655,12 @@ class QuestionDetector:
         # Final pass on the current segment only.
         if self._is_question_candidate(text, lower, words):
             self.fragment_buffer.clear()
-            if self._is_debounced(text):
+            extracted = self._extract_question_clause(text)
+            if self._is_debounced(extracted):
                 return None
-            logger.debug(f"QuestionDetector: Triggered direct segment: {text!r}")
-            self._update_trigger(text)
-            return text
+            logger.debug(f"QuestionDetector: Triggered direct segment: {extracted!r}")
+            self._update_trigger(extracted)
+            return extracted
 
         # Keep the fragment if it looks like a continuation phrase.
         if self._looks_like_continuation(text, lower):
@@ -379,7 +698,18 @@ class QuestionDetector:
         elif "?" in text:
             score += 0.8 * weights["q"]
             
-        if any(lower.startswith(prefix) for prefix in self.question_prefixes):
+        starts_with_prefix = any(lower.startswith(prefix) for prefix in self.question_prefixes)
+        clause_starts_with_prefix = False
+        if not starts_with_prefix:
+            for clause in self._split_clauses(lower):
+                if any(clause.startswith(prefix) for prefix in self.question_prefixes):
+                    clause_starts_with_prefix = True
+                    break
+
+        if starts_with_prefix:
+            score += 0.6 * weights["q"]
+        elif clause_starts_with_prefix:
+            # Treat mid-sentence clause-start questions as equally strong.
             score += 0.6 * weights["q"]
         if any(pattern in lower for pattern in self.question_patterns):
             score += 0.5 * weights["q"]
@@ -447,38 +777,7 @@ class QuestionDetector:
         if not text:
             return None
 
-        code_keywords = {
-            "python": ["def ", "import ", "class ", ".py", "python"],
-            "javascript": [
-                "function ",
-                "const ",
-                "let ",
-                "var ",
-                "=>",
-                ".js",
-                "javascript",
-            ],
-            "typescript": [
-                "interface ",
-                "type ",
-                ": string",
-                ": number",
-                ".ts",
-                "typescript",
-            ],
-            "java": ["public class", "void main", "System.out", ".java", "java"],
-            "cpp": ["#include", "std::", "int main", "cout", "c++"],
-            "sql": ["SELECT ", "FROM ", "WHERE ", "INSERT ", "CREATE TABLE"],
-            "go": ["func ", "package ", "fmt.", "golang"],
-            "rust": ["fn ", "let mut", "impl ", "pub fn", "rust"],
-        }
-
-        detected_lang = None
-        lower = text.lower()
-        for lang, markers in code_keywords.items():
-            if any(m.lower() in lower for m in markers):
-                detected_lang = lang
-                break
+        detected_lang = self.detect_language_hint(text)
 
         # Find the question
         question = self.detect(text)

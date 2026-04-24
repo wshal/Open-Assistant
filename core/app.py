@@ -140,6 +140,8 @@ class OpenAssistApp(QObject):
         )
         self.ai.error_occurred.connect(lambda e: self.mini_overlay.show_error(e))
         self.audio.transcription_ready.connect(self._on_transcription)
+        if hasattr(self.audio, "interim_transcription_ready"):
+            self.audio.interim_transcription_ready.connect(self._on_interim_transcription)
         self.screen.text_captured.connect(self._on_screen_text)
         self.warmup_status_update.connect(self.overlay.update_warmup_status)
         self.ai.provider_status.connect(self.overlay.standby_view.set_provider_statuses)
@@ -549,6 +551,15 @@ class OpenAssistApp(QObject):
         request_metadata = dict(self._pending_request_metadata or {})
         request_metadata.setdefault("request_started_at", self._current_request_start)
         request_metadata.setdefault("origin", s)
+        # P2: Attach detector hints for routing/logging even in General mode.
+        try:
+            det = getattr(getattr(self, "ai", None), "detector", None)
+            if det and hasattr(det, "detect_language_hint"):
+                lang = det.detect_language_hint(q)
+                request_metadata.setdefault("detected_language", lang)
+                request_metadata.setdefault("is_code", bool(lang))
+        except Exception:
+            pass
         self._pending_request_metadata = None
         request_epoch = self._generation_epoch
 
@@ -1212,6 +1223,29 @@ class OpenAssistApp(QObject):
                     f"🤔 Possible question detected (tap ⎨ to answer)",
                     state="processing",
                 )
+
+    def _on_interim_transcription(self, t: str):
+        """Best-effort live (partial) ASR updates while the user is still speaking.
+
+        Conservative by design:
+        - Never pushes interim text into the Nexus history (avoids unstable context)
+        - Only early-triggers when the detector reports a stable question clause
+        """
+        if not self.session_active:
+            return
+        if not t or not hasattr(self.ai, "detector"):
+            return
+
+        try:
+            det = self.ai.detector
+            if not hasattr(det, "detect_interim_with_guardrails"):
+                return
+            candidate = det.detect_interim_with_guardrails(t)
+            if candidate:
+                logger.info("⚡ Live question detected (interim ASR)")
+                self.generate_response(candidate, "speech", {"audio": t})
+        except Exception as e:
+            logger.debug(f"Interim transcription handler error (non-fatal): {e}")
 
     def _on_screen_text(self, t):
         if not self.session_active:

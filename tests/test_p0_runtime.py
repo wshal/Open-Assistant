@@ -155,6 +155,30 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
 
         self.assertEqual(resampled.shape, (160, 2))
 
+    def test_webrtc_vad_helper_is_safe_and_frames_correctly(self):
+        audio = AudioCapture(
+            ConfigStub(
+                {
+                    "capture.audio.sample_rate": 16000,
+                    "capture.audio.vad.frame_ms": 20,
+                }
+            )
+        )
+
+        calls = []
+
+        class _FakeVAD:
+            def is_speech(self, frame_bytes, sample_rate):
+                calls.append((len(frame_bytes), sample_rate))
+                return True
+
+        audio._vad = _FakeVAD()
+        block = np.zeros((audio.block_size,), dtype=np.float32)
+        self.assertTrue(audio._webrtc_vad_has_speech(block))
+        self.assertTrue(calls, "expected at least one VAD frame call")
+        self.assertEqual(calls[0][1], 16000)
+        self.assertEqual(calls[0][0], int(16000 * 0.02) * 2)
+
 
 class AIEngineParallelOrderingTests(unittest.TestCase):
     def test_parallel_generation_emits_completion_without_duplicate_chunks(self):

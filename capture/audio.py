@@ -9,6 +9,7 @@ import os
 import queue
 import threading
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 # Suppress HuggingFace symlinks warning on Windows.
@@ -26,6 +27,7 @@ logger = setup_logger(__name__)
 
 class AudioCapture(QObject):
     transcription_ready = pyqtSignal(str)
+    interim_transcription_ready = pyqtSignal(str)
     level = pyqtSignal(float)
 
     def __init__(self, config, state=None):
@@ -57,11 +59,57 @@ class AudioCapture(QObject):
         self._current_rms = 0.0
         self._last_transcription_metrics = {}
 
+        # Interim transcription (Option 2): best-effort partial ASR while speaking.
+        # Guardrails are enforced at the detector/app layer so this never auto-fires by itself.
+        self._interim_enabled = bool(config.get("capture.audio.interim.enabled", True))
+        self._interim_interval_s = float(
+            (config.get("capture.audio.interim.interval_ms", 900) or 900) / 1000.0
+        )
+        self._interim_min_speech_s = float(
+            (config.get("capture.audio.interim.min_speech_ms", 1200) or 1200) / 1000.0
+        )
+        self._interim_tail_s = float(
+            (config.get("capture.audio.interim.tail_ms", 3500) or 3500) / 1000.0
+        )
+        self._last_interim_at = 0.0
+        self._interim_epoch = 0
+        self._interim_inflight = False
+
+        # WebRTC VAD (optional but recommended): improves real-time speech detection
+        # without changing Whisper model accuracy.
+        self._vad = None
+        self._vad_frame_ms = int(config.get("capture.audio.vad.frame_ms", 20) or 20)
+        if self._vad_frame_ms not in (10, 20, 30):
+            self._vad_frame_ms = 20
+        self._vad_mode = int(config.get("capture.audio.vad.mode", 2) or 2)
+        self._vad_mode = max(0, min(3, self._vad_mode))
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"pkg_resources is deprecated as an API\.",
+                    category=UserWarning,
+                )
+                import webrtcvad  # type: ignore
+
+            self._vad = webrtcvad.Vad(self._vad_mode)
+            logger.info(f"🎙️ WebRTC VAD enabled (mode={self._vad_mode}, frame_ms={self._vad_frame_ms})")
+        except Exception as e:
+            self._vad = None
+            logger.debug(f"Audio: WebRTC VAD unavailable, falling back to RMS gate ({e})")
+
+        # Serialize Whisper inference calls (final + interim).
+        self._infer_lock = threading.Lock()
+
         # Single-worker pool: Whisper transcription runs off the VAD thread.
         # This means the VAD loop can immediately resume listening while the
         # previous speech segment is being transcribed in the background.
         self._transcribe_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="whisper"
+        )
+        # Separate pool for interim ASR so final transcription isn't queued behind interim jobs.
+        self._interim_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="whisper-live"
         )
 
         self._active_streams = []
@@ -366,18 +414,24 @@ class AudioCapture(QObject):
                 continue
 
             rms = np.sqrt(np.mean(data**2))
-            # P0.5: Highly sensitive pre-gate (0.001). Let Silero VAD handle the actual noise filtering.
-            has_speech = rms > 0.001
+            # Speech detection:
+            # - Prefer WebRTC VAD (trained speech detector) for robust segmentation.
+            # - Fall back to RMS gate if VAD is unavailable.
+            has_speech = self._webrtc_vad_has_speech(data) if self._vad else (rms > 0.001)
             if has_speech or is_speaking:
                 speech_buffer.append(data)
             if has_speech:
                 silence_count = 0
                 if not is_speaking:
                     speech_started_at = time.time()
+                    self._last_interim_at = 0.0
+                    self._interim_epoch += 1
                 is_speaking = True
             elif is_speaking:
                 silence_count += 1
                 if silence_count >= self.silence_blocks:
+                    # Speech ended: bump epoch to invalidate any in-flight interim work.
+                    self._interim_epoch += 1
                     # ── Dispatch transcription to pool so VAD loop is not blocked ──
                     # Previously: self._transcribe() ran synchronously here (~300ms).
                     # Now: submitted to a single-worker ThreadPoolExecutor so the VAD
@@ -389,6 +443,71 @@ class AudioCapture(QObject):
                     is_speaking = False
                     speech_started_at = None
 
+            # Best-effort interim transcription while speaking (never blocks VAD loop).
+            if (
+                self._interim_enabled
+                and is_speaking
+                and speech_started_at
+                and (time.time() - speech_started_at) >= self._interim_min_speech_s
+            ):
+                now = time.time()
+                if (now - self._last_interim_at) >= max(self._interim_interval_s, 0.2):
+                    self._last_interim_at = now
+                    self._submit_interim(list(speech_buffer), speech_started_at, self._interim_epoch)
+
+    def _webrtc_vad_has_speech(self, block: np.ndarray) -> bool:
+        """Return True if WebRTC VAD detects speech in this audio block.
+
+        Expects `block` as float32 mono samples at self.sr with length ~= block_size.
+        WebRTC VAD requires 16-bit PCM in 10/20/30ms frames.
+        """
+        vad = self._vad
+        if not vad:
+            return False
+        try:
+            if block is None or len(block) == 0:
+                return False
+            # Ensure mono float array.
+            samples = np.asarray(block, dtype=np.float32).reshape(-1)
+            # Convert to 16-bit PCM bytes.
+            pcm16 = np.clip(samples, -1.0, 1.0)
+            pcm16 = (pcm16 * 32767.0).astype(np.int16, copy=False).tobytes()
+
+            frame_len = int(self.sr * (self._vad_frame_ms / 1000.0))
+            if frame_len <= 0:
+                return False
+            frame_bytes = frame_len * 2  # int16
+            if len(pcm16) < frame_bytes:
+                return False
+
+            # Mark as speech if ANY frame contains speech.
+            # This is intentionally permissive; downstream buffering + question
+            # detection prevents most false triggers.
+            for i in range(0, len(pcm16) - frame_bytes + 1, frame_bytes):
+                if vad.is_speech(pcm16[i : i + frame_bytes], self.sr):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _submit_interim(self, buffer, speech_started_at: float, epoch: int) -> None:
+        if self._interim_inflight:
+            return
+        if not buffer or len(buffer) < 3:
+            return
+        self._interim_inflight = True
+
+        def _run():
+            try:
+                self._transcribe_interim(buffer, speech_started_at, epoch)
+            finally:
+                self._interim_inflight = False
+
+        try:
+            self._interim_pool.submit(_run)
+        except Exception:
+            self._interim_inflight = False
+
     def _transcribe(self, buffer, speech_started_at=None):
         self._ensure_whisper_loaded()
         if not self.model or len(buffer) < 5:
@@ -398,12 +517,13 @@ class AudioCapture(QObject):
             audio = np.concatenate(buffer, axis=0).flatten()
             # P2.3: Use configured language hint; None = Whisper auto-detects
             # P0.5: Enable highly-accurate Silero VAD to cleanly separate speech from noise/breathing.
-            segments, _ = self.model.transcribe(
-                audio, 
-                language=self._language,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500)
-            )
+            with self._infer_lock:
+                segments, _ = self.model.transcribe(
+                    audio,
+                    language=self._language,
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                )
             text = " ".join(
                 [s.text.strip() for s in segments if not self._is_hall(s.text)]
             )
@@ -431,6 +551,39 @@ class AudioCapture(QObject):
 
     def _is_hall(self, t):
         return any(x in t.lower() for x in ["thank you", "watching", "♪", "[music]"])
+
+    def _transcribe_interim(self, buffer, speech_started_at: float, epoch: int) -> None:
+        """Best-effort interim transcription while the user is still speaking."""
+        if epoch != self._interim_epoch:
+            return
+        self._ensure_whisper_loaded()
+        if not self.model or not buffer:
+            return
+        try:
+            audio = np.concatenate(buffer, axis=0).flatten()
+            # Only transcribe the most recent tail to keep latency down.
+            tail_samples = int(self.sr * max(self._interim_tail_s, 0.5))
+            if tail_samples > 0 and len(audio) > tail_samples:
+                audio = audio[-tail_samples:]
+            if epoch != self._interim_epoch:
+                return
+            with self._infer_lock:
+                segments, _ = self.model.transcribe(
+                    audio,
+                    language=self._language,
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                )
+            if epoch != self._interim_epoch:
+                return
+            text = " ".join(
+                [s.text.strip() for s in segments if not self._is_hall(s.text)]
+            )
+            cleaned = (text or "").strip()
+            if cleaned and epoch == self._interim_epoch:
+                self.interim_transcription_ready.emit(cleaned)
+        except Exception as e:
+            logger.debug(f"Whisper interim transcription error (non-fatal): {e}")
 
     def get_transcript(self):
         return " ".join(self.transcripts)
