@@ -125,6 +125,38 @@ class TestShortQueryCacheSemantic(unittest.TestCase):
         # Should NOT classify as TROUBLESHOOT
         self.assertNotIn("TROUBLESHOOT", sig)
 
+    def test_multi_context_isolation(self):
+        """Semantic cache must not bleed between different context fingerprints."""
+        ctx1 = "ctx_window1"
+        ctx2 = "ctx_window2"
+        
+        self.cache.set(
+            mode="general",
+            query="What is React?",
+            context_fp=ctx1, history_fp=self.hist,
+            response="Response for window 1.", provider="test"
+        )
+        self.cache.set(
+            mode="general",
+            query="What is React?",
+            context_fp=ctx2, history_fp=self.hist,
+            response="Response for window 2.", provider="test"
+        )
+
+        entry1 = self.cache.get(
+            mode="general", query="Can you explain React?",
+            context_fp=ctx1, history_fp=self.hist
+        )
+        entry2 = self.cache.get(
+            mode="general", query="Can you explain React?",
+            context_fp=ctx2, history_fp=self.hist
+        )
+
+        self.assertIsNotNone(entry1)
+        self.assertIsNotNone(entry2)
+        self.assertNotEqual(entry1.response, entry2.response)
+        self.assertEqual(entry1.response, "Response for window 1.")
+        self.assertEqual(entry2.response, "Response for window 2.")
 
 
 class TestEmbeddingTier(unittest.TestCase):

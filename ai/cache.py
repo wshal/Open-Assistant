@@ -64,7 +64,7 @@ _CANONICAL_ENTITIES: Dict[str, List[str]] = {
     "props":        ["props", "properties", "react props"],
     "state":        ["state", "react state"],
     "context api":  ["context api", "react context"],
-    "redux":        ["redux", "store", "reducer", "action"],
+    "redux":        ["redux", "redux store", "reducer", "action"],
     "zustand":      ["zustand"],
     "react router": ["react router", "router", "routing"],
 
@@ -209,71 +209,12 @@ class EmbeddingTier:
 
     def warmup(self) -> None:
         """Pre-load the model at app startup so first query has zero extra latency."""
-        self._load_model()
-
-    def _load_model(self) -> None:
-        if self._model is not None:
-            return
-        with self._model_lock:
-            if self._model is not None:
-                return
-
-            # Fallback chain:
-            #   1. fastembed      — ONNX-native, ~24MB, fastest (fails on Python 3.14 due to py-rust-stemmers)
-            #   2. sentence-transformers ONNX backend — requires `optimum` package
-            #   3. sentence-transformers PyTorch      — always works, ~30ms CPU, still background-threaded
-
-            # Path 1: fastembed (best)
-            try:
-                from fastembed import TextEmbedding  # type: ignore
-                self._model = TextEmbedding(model_name=_EMBED_MODEL_NAME)
-                logger.info(f"✅ Embedding model loaded via fastembed ONNX ({_EMBED_MODEL_NAME})")
-                return
-            except ImportError:
-                pass
-            except Exception as e:
-                logger.debug(f"fastembed unavailable: {e}")
-
-            # Path 2: sentence-transformers with ONNX backend
-            try:
-                from sentence_transformers import SentenceTransformer  # type: ignore
-                self._model = SentenceTransformer(
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    backend="onnx",
-                )
-                logger.info("✅ Embedding model loaded via sentence-transformers (ONNX backend)")
-                return
-            except Exception:
-                pass
-
-            # Path 3: sentence-transformers PyTorch (universal fallback)
-            try:
-                from sentence_transformers import SentenceTransformer  # type: ignore
-                self._model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-                logger.info("✅ Embedding model loaded via sentence-transformers (PyTorch)")
-                return
-            except Exception as e:
-                self._model = False  # sentinel: stop retrying
-                logger.warning(f"Embedding model unavailable — Tier 3 disabled: {e}")
+        from ai.embedding_manager import EmbeddingManager
+        EmbeddingManager().warmup()
 
     def _embed(self, text: str) -> Optional[np.ndarray]:
-        self._load_model()
-        if not self._model:
-            return None
-        try:
-            if hasattr(self._model, "embed"):
-                # fastembed API
-                vecs = list(self._model.embed([text]))
-            else:
-                # sentence-transformers API
-                vecs = self._model.encode([text], normalize_embeddings=True)
-            v = np.array(vecs[0], dtype=np.float32)
-            # L2-normalize for cosine similarity via dot product
-            norm = np.linalg.norm(v)
-            return v / norm if norm > 1e-8 else v
-        except Exception as e:
-            logger.debug(f"Embedding error: {e}")
-            return None
+        from ai.embedding_manager import EmbeddingManager
+        return EmbeddingManager().embed(text)
 
     # ------------------------------------------------------------------
     # Index operations
@@ -439,6 +380,26 @@ class ShortQueryCache:
                 threshold=float(embedding_threshold or 0.88),
                 ttl_s=self.ttl_s,
             )
+            
+            import queue
+            self._embed_queue: queue.Queue = queue.Queue(maxsize=100)
+            self._embed_worker = threading.Thread(
+                target=self._embed_worker_loop,
+                daemon=True,
+                name="embed-worker",
+            )
+            self._embed_worker.start()
+
+    def _embed_worker_loop(self) -> None:
+        while True:
+            try:
+                query, rec = self._embed_queue.get()
+                if self._embed:
+                    self._embed.add(query, rec)
+            except Exception as e:
+                logger.debug(f"Embed indexing error: {e}")
+            finally:
+                self._embed_queue.task_done()
 
     def warmup(self) -> None:
         """Pre-load the embedding model during app warmup — zero cold-start latency."""
@@ -611,12 +572,11 @@ class ShortQueryCache:
                 cache_query=nq,
                 history_fp=key.history_fp,
             )
-            threading.Thread(
-                target=self._embed.add,
-                args=(query, rec),
-                daemon=True,
-                name="embed-index",
-            ).start()
+            import queue
+            try:
+                self._embed_queue.put((query, rec), timeout=0.1)
+            except queue.Full:
+                pass
 
         self._touch_lru(key)
         self._prune()

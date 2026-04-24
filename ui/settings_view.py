@@ -493,8 +493,8 @@ class SettingsView(QWidget):
             tbtn.setCursor(Qt.CursorShape.PointingHandCursor)
             tbtn.setToolTip(f"Test {name} connection")
             tbtn.setStyleSheet(
-                "QPushButton { background: rgba(80,85,255,0.18); color: #f8fafc; border-radius: 4px; font-size: 10px; font-weight: 800; border: 1px solid rgba(129,140,248,0.55); padding: 0 8px; text-align: center; }"
-                "QPushButton:hover { background: rgba(80,85,255,0.35); color: white; border: 1px solid rgba(165,180,252,0.85); }"
+                "QPushButton { background: rgba(80,85,255,0.18); color: #f8fafc; border-radius: 4px; font-size: 10px; font-weight: bold; border: 1px solid rgba(129,140,248,0.55); padding: 0 8px; text-align: center; } "
+                "QPushButton:hover { background: rgba(80,85,255,0.35); color: white; border: 1px solid rgba(165,180,252,0.85); } "
                 "QPushButton:pressed { background: rgba(67,56,202,0.55); }"
             )
             tbtn.clicked.connect(lambda _, p=pid: self._test_pid(p))

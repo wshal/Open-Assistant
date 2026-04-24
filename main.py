@@ -59,14 +59,20 @@ def main():
 
     logger.info("🚀 OpenAssist AI starting...")
 
-    # Suppress a noisy PyTorch warning from upstream libs when running on CPU:
-    # "pin_memory argument is set as true but no accelerator is found..."
-    # It is harmless (pinning just won't be used) and can confuse users.
+    # Suppress upstream noise
     warnings.filterwarnings(
         "ignore",
         message=r".*pin_memory.*no accelerator is found.*",
         category=UserWarning,
-        module=r"torch\\.utils\\.data\\.dataloader",
+        module=r"torch\.utils\.data\.dataloader",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*SOCKS support in urllib3 requires.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*unauthenticated requests to the HF Hub.*",
     )
 
     try:

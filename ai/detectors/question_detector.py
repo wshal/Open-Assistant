@@ -9,6 +9,7 @@ Full-Auto Meeting Interaction:
 
 import re
 import time
+import numpy as np
 from collections import deque
 from typing import Optional, List
 from dataclasses import dataclass
@@ -252,6 +253,13 @@ class QuestionDetector:
 
         # Sensitivity: 1.0 = Max triggers, 0.1 = Strict
         self.sensitivity = config.get("detection.sensitivity", 0.5)
+
+        # Zero-Shot Semantic Intent Anchors
+        self._semantic_enabled = config.get("detection.semantic_enabled", True)
+        self._semantic_threshold = float(config.get("detection.semantic_threshold", 0.35))
+        self._anchors_initialized = False
+        self._anchor_q = None
+        self._anchor_s = None
 
         self.auto_response_threshold = config.get(
             "detection.auto_response_threshold", 0.7
@@ -577,7 +585,34 @@ class QuestionDetector:
         if any(pattern in lower for pattern in self.followup_patterns):
             score += 0.2
 
-        # P0: Do not artificially dampen the score. Let the absolute score speak for itself.
+        score = min(score, 1.0)
+
+        # Tier 2: Zero-Shot Semantic Verification for ambiguous cases
+        if self._semantic_enabled and 0.2 <= score < self.auto_response_threshold:
+            try:
+                from ai.embedding_manager import EmbeddingManager
+                manager = EmbeddingManager()
+                
+                if not self._anchors_initialized:
+                    # Lazy load anchors
+                    self._anchor_q = manager.embed("Can you explain how this works or help me with this problem?")
+                    self._anchor_s = manager.embed("I am just talking to my coworker about this issue.")
+                    self._anchors_initialized = True
+                    
+                if self._anchor_q is not None and self._anchor_s is not None:
+                    vec = manager.embed(text)
+                    if vec is not None:
+                        sim_q = float(np.dot(vec, self._anchor_q))
+                        sim_s = float(np.dot(vec, self._anchor_s))
+                        
+                        # If it's mathematically closer to a question AND exceeds the minimum similarity threshold
+                        if sim_q > sim_s and sim_q > self._semantic_threshold:
+                            logger.debug(f"Semantic Intent Match: sim_q={sim_q:.2f} > sim_s={sim_s:.2f}")
+                            # Boost confidence above the auto-response threshold
+                            score = max(score, self.auto_response_threshold + 0.05)
+            except Exception as e:
+                logger.debug(f"Semantic verification failed: {e}")
+
         return min(score, 1.0)
 
     def learn_from_query(self, query: str):
