@@ -1165,11 +1165,12 @@ class SettingsView(QWidget):
         l.addWidget(lbl_gaze)
 
         self.chk_gaze = PremiumCheckBox("Enable gaze-based window fading")
-        self.chk_gaze.setChecked(self.config.get("app.gaze_fade.enabled", True))  # P1.2: default ON
+        self.chk_gaze.setChecked(self.config.get("app.gaze_fade.enabled", False))
         l.addWidget(self.chk_gaze)
         desc_gaze = QLabel(
-            "When enabled, the window will fade to low opacity when your mouse is near it. "
-            "Only active during active sessions - not on standby or settings screens."
+            "When enabled, the window fades to low opacity when your mouse is near it. "
+            "Only active during active sessions — not on standby or settings screens. "
+            "Works alongside Stealth Mode; stealth anti-capture remains active."
         )
         desc_gaze.setWordWrap(True)
         desc_gaze.setStyleSheet(

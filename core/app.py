@@ -408,7 +408,15 @@ class OpenAssistApp(QObject):
         stealth_opacity = self.config.get("stealth.low_opacity", 0.75)
         is_stealth = bool(getattr(self.state, "is_stealth", False))
 
-        window.setWindowOpacity(stealth_opacity if is_stealth else base_opacity)
+        # Don't fight the gaze timer: if gaze fade is enabled and a session
+        # is active, the gaze timer owns the opacity — skip overriding it.
+        gaze_active = (
+            self.config.get("app.gaze_fade.enabled", False)
+            and getattr(self, "session_active", False)
+        )
+        if not gaze_active:
+            window.setWindowOpacity(stealth_opacity if is_stealth else base_opacity)
+
         WindowUtils.hide_from_taskbar(window)
         WindowUtils.ensure_topmost(window)
         self.stealth.apply_to_window(window, is_stealth)

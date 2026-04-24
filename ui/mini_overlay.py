@@ -408,39 +408,50 @@ class MiniOverlay(QMainWindow):
         self._drag = False
 
     def _check_gaze(self):
-        """Neural UX: Fades the mini-overlay if mouse is nearby to allow viewing background content.
+        """Neural UX: Fades the mini-overlay if mouse is near/over it.
 
-        Only active during an active session - not on standby/settings screens.
-        Can be disabled via config 'app.gaze_fade.enabled'.
+        Uses the same stylesheet technique as the main overlay to work with WA_TranslucentBackground.
         """
-        # Check if gaze fade is enabled in config
-        if not self.config.get("app.gaze_fade.enabled", True):  # P1.2: default ON
-            return
-
-        if getattr(self.app.state, "is_stealth", False):
-            return
-
-        # Only fade during active session - not on standby/settings screens
         if not self.isVisible() or not self.app.state.is_mini:
             return
 
-        # Check if session is active - only fade when user is in a running session
-        if not getattr(self.app, "session_active", False):
+        gaze_enabled = self.config.get("app.gaze_fade.enabled", False)
+        session_active = getattr(self.app, "session_active", False)
+
+        # Determine if cursor is near/over the window
+        near = False
+        if gaze_enabled and session_active:
+            cursor_pos = self.mapFromGlobal(self.cursor().pos())
+            x = cursor_pos.x()
+            y = cursor_pos.y()
+            # Margin is smaller for the mini overlay
+            margin = self.config.get("app.gaze_fade.margin", 30)
+            if -margin <= x <= self.width() + margin and -margin <= y <= self.height() + margin:
+                near = True
+
+        # Track previous state to avoid redundant stylesheet writes
+        was_near = getattr(self, "_gaze_near", None)
+        if near == was_near:
             return
+        self._gaze_near = near
 
-        cursor_pos = self.mapFromGlobal(self.cursor().pos())
-        inside = self.rect().contains(cursor_pos)
-
-        # Use config values with sensible defaults for mini mode
-        margin = self.config.get("app.gaze_fade.margin", 30)
-        dist_x = min(abs(cursor_pos.x()), abs(cursor_pos.x() - self.width()))
-        dist_y = min(abs(cursor_pos.y()), abs(cursor_pos.y() - self.height()))
-
-        target_opa = 0.95
-        if inside or (dist_x < margin and dist_y < margin):
-            target_opa = self.config.get("app.gaze_fade.target_opacity", 0.15)
-
-        current_opa = self.windowOpacity()
-        if abs(current_opa - target_opa) > 0.01:
-            # Smooth interpolation
-            self.setWindowOpacity(current_opa + (target_opa - current_opa) * 0.3)
+        if near:
+            # Calculate alpha from config (target_opacity 0.0-1.0)
+            t_opa = self.config.get("app.gaze_fade.target_opacity", 0.15)
+            alpha = int(t_opa * 255)
+            
+            self.bar.setStyleSheet(
+                f"background: rgba(20,20,35,{alpha}); border: 1px solid rgba(80,80,150,40); border-radius: 24px;"
+            )
+            self.response_area.setStyleSheet(
+                f"background: rgba(15,15,30,{max(20, alpha-10)}); border: none; border-radius: 12px; "
+                f"color: rgba(208, 208, 232, {max(40, alpha+40)}); font-size: 11px; padding: 8px;"
+            )
+        else:
+            # Restore to fully opaque
+            self.bar.setStyleSheet(
+                "background: rgba(20,20,35,250); border: 1px solid rgba(80,80,150,80); border-radius: 24px;"
+            )
+            self.response_area.setStyleSheet(
+                "background: rgba(15,15,30,240); border: none; border-radius: 12px; color: #d0d0e8; font-size: 11px; padding: 8px;"
+            )

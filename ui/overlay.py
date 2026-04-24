@@ -863,39 +863,52 @@ class OverlayWindow(QMainWindow):
             self.app.hotkeys.reset_state()
 
     def _check_gaze(self):
-        """Dynamic Gaze: Fades the window if the mouse is close to allow viewing content underneath.
+        """Dynamic Gaze: Fades the window if the mouse is near/over it.
 
-        Only active during an active session - not on standby/settings screens.
-        Can be disabled via config 'app.gaze_fade.enabled'.
+        Only active during an active session. Uses the same stylesheet technique
+        as set_click_through() which is proven to work with WA_TranslucentBackground.
+        Works alongside Stealth Mode — stealth anti-capture remains active.
         """
-        # Check if gaze fade is enabled in config
-        if not self.config.get("app.gaze_fade.enabled", False):
-            return
-
-        if getattr(self.app.state, "is_stealth", False):
-            return
-
-        # Only fade during active session - not on standby/settings screens
         if not self.isVisible() or self.app.mini_mode:
             return
 
-        # Check if session is active - only fade when user is in a running session
-        if not getattr(self.app, "session_active", False):
+        gaze_enabled = self.config.get("app.gaze_fade.enabled", False)
+        session_active = getattr(self.app, "session_active", False)
+
+        # Determine if cursor is near/over the window
+        near = False
+        if gaze_enabled and session_active:
+            cursor_pos = self.mapFromGlobal(self.cursor().pos())
+            x = cursor_pos.x()
+            y = cursor_pos.y()
+            margin = self.config.get("app.gaze_fade.margin", 80)
+            if -margin <= x <= self.width() + margin and -margin <= y <= self.height() + margin:
+                near = True
+
+        # Track previous state to avoid redundant stylesheet writes
+        was_near = getattr(self, "_gaze_near", None)
+        if near == was_near:
             return
+        self._gaze_near = near
 
-        cursor_pos = self.mapFromGlobal(self.cursor().pos())
-        dist_x = min(abs(cursor_pos.x()), abs(cursor_pos.x() - self.width()))
-        dist_y = min(abs(cursor_pos.y()), abs(cursor_pos.y() - self.height()))
+        if near:
+            # Same style as set_click_through(True) — proven to work visually
+            # Hook up config target_opacity (0.0-1.0) to alpha (0-255)
+            t_opa = self.config.get("app.gaze_fade.target_opacity", 0.12)
+            alpha = int(t_opa * 255)
+            
+            self.box.setStyleSheet(
+                f"#box {{ background: rgba(12, 12, 25, {alpha}); border: 1px solid rgba(80, 85, 255, 10); border-radius: 14px; }}"
+            )
+            self.response_area.setStyleSheet(
+                f"background: transparent; color: rgba(208, 208, 232, {max(40, alpha+40)}); border: none; font-size: 13px;"
+            )
+        else:
+            # Restore to fully opaque
+            self.box.setStyleSheet(
+                "#box { background: rgba(12, 12, 25, 250); border: 1px solid rgba(80, 85, 255, 30); border-radius: 14px; }"
+            )
+            self.response_area.setStyleSheet(
+                "background: transparent; color: #d0d0e8; border: none; font-size: 13px;"
+            )
 
-        inside = self.rect().contains(cursor_pos)
-        margin = self.config.get("app.gaze_fade.margin", 60)
-        target_opa = self.config.get("app.opacity", 0.94)
-
-        if inside or (dist_x < margin and dist_y < margin):
-            target_opa = self.config.get("app.gaze_fade.target_opacity", 0.12)
-
-        current_opa = self.windowOpacity()
-        if abs(current_opa - target_opa) > 0.01:
-            # Smooth transition
-            new_opa = current_opa + (target_opa - current_opa) * 0.3
-            self.setWindowOpacity(new_opa)
