@@ -562,8 +562,9 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
         self.ollama_model_combo.blockSignals(False)
 
     def showEvent(self, event):
-        """Reset UI state when settings are opened."""
+        """Reset UI state and sync from current config when settings are opened."""
         super().showEvent(event)
+        self._sync_ui_from_config()
         self.btn_save.setText("APPLY SETTINGS")
         self.btn_save.setEnabled(True)
         self.btn_save.setStyleSheet("""
@@ -573,6 +574,31 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             }
             QPushButton:hover { background: #6366f1; border: 1px solid rgba(255,255,255,30); }
         """)
+
+    def _sync_ui_from_config(self):
+        """Pull latest config/state values into UI widgets."""
+        logger.debug("[Settings] Syncing UI from current config/state...")
+        
+        # 1. Sync AI Mode
+        if hasattr(self, "ai_mode"):
+            current_mode = self.config.get("ai.mode", "general")
+            mode_map = {"general": 0, "interview": 1, "coding": 2, "meeting": 3, "exam": 4, "writing": 5}
+            self.ai_mode.blockSignals(True)
+            self.ai_mode.setCurrentIndex(mode_map.get(current_mode, 0))
+            self.ai_mode.blockSignals(False)
+
+        # 2. Sync Audio Source
+        if hasattr(self, "audio_mode"):
+            curr = self.config.get("capture.audio.mode", "system")
+            self.audio_mode.blockSignals(True)
+            self.audio_mode.setCurrentIndex(0 if curr == "system" else 1 if curr == "mic" else 2)
+            self.audio_mode.blockSignals(False)
+            
+        # 3. Sync API Keys (refresh from secrets in case they changed)
+        for pid, inp in self.api_inputs.items():
+            key = self.config.get_api_key(pid) or ""
+            if key and not inp.text(): # Only if currently empty or we want a full refresh
+                 inp.setText(key)
 
     def _save_all(self):
         try:
@@ -777,8 +803,12 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
                 self.app.state.mode = selected_mode
                 self.app.state.audio_source = selected_audio
                 self.app._apply_settings()
+                # Also emit our own signals for any other listeners
                 self.mode_changed.emit(selected_mode)
                 self.audio_source_changed.emit(selected_audio)
+                # Explicitly sync StandbyView UI immediately to avoid signal timing issues
+                if hasattr(self.app, 'overlay') and hasattr(self.app.overlay, 'standby_view'):
+                    self.app.overlay.standby_view.refresh_highlights(mode=selected_mode, audio=selected_audio)
 
             # Transition back to Standby
             QTimer.singleShot(800, self.closed.emit)

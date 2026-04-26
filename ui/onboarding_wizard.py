@@ -654,6 +654,12 @@ class OnboardingWizard(QWidget):
                 self.app.state.mode = self.wizard_state["ai_mode"]
                 self.app.state.audio_source = self.wizard_state["audio_mode"]
                 self.app._apply_settings()
+                # Explicitly sync StandbyView UI to reflect new selections
+                if hasattr(self.app, 'overlay') and hasattr(self.app.overlay, 'standby_view'):
+                    self.app.overlay.standby_view.refresh_highlights(
+                        mode=self.wizard_state["ai_mode"],
+                        audio=self.wizard_state["audio_mode"]
+                    )
                 
             self.finished.emit()
 

@@ -132,8 +132,6 @@ class OverlayWindow(QMainWindow):
 
     def _connect_state(self):
         self.app.state.muted_changed.connect(self.update_audio_state)
-        self.app.state.mode_changed.connect(self.update_mode)
-        self.app.state.audio_source_changed.connect(self.update_audio_source)
         self.app.state.hud_mode_changed.connect(self._on_hud_mode_changed)
         self.app.state.capturing_changed.connect(self.update_capture_state)
 
@@ -305,6 +303,8 @@ class OverlayWindow(QMainWindow):
         box_layout.addWidget(self.stack)
 
         self.standby_view = StandbyView(self)
+        self.standby_view.mode_selected.connect(self._on_standby_mode_selected)
+        self.standby_view.audio_source_changed.connect(self._on_standby_audio_source_changed)
         self.stack.addWidget(self.standby_view)
 
         # History Feed (Index 3)
@@ -687,11 +687,25 @@ class OverlayWindow(QMainWindow):
 
         self.refresh_standby_state()
 
+    def _on_standby_mode_selected(self, mode):
+        """Update app state when user clicks a mode button on standby screen."""
+        if hasattr(self.app, "state"):
+            self.app.state.mode = mode
+            self.app._apply_settings()
+
+    def _on_standby_audio_source_changed(self, source):
+        """Update app state when user clicks an audio button on standby screen."""
+        if hasattr(self.app, "state"):
+            self.app.state.audio_source = source
+            self.app._apply_settings()
+
     def update_mode(self, mode):
-        self.standby_view.refresh_highlights(mode=mode)
+        # Kept for compatibility if called externally, but StandbyView is now self-connected
+        self.standby_view.set_current_mode(mode)
 
     def update_audio_source(self, source):
-        self.standby_view.refresh_highlights(audio=source)
+        # Kept for compatibility if called externally, but StandbyView is now self-connected
+        self.standby_view.set_current_audio_source(source)
 
     def update_capture_state(self, capturing):
         """Update UI to reflect if active capture is running."""

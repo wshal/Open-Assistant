@@ -685,21 +685,36 @@ class StandbyView(QWidget):
     def refresh_highlights(self, mode=None, audio=None):
         """Force refresh selection states from explicit values or resolved state."""
         resolved_mode, resolved_audio = self._resolve_initial_selection()
+        
+        # Inject highlight styles with priority:
+        # 1. Explicit argument
+        # 2. State-resolved value
         self.set_current_mode(mode or resolved_mode)
         self.set_current_audio_source(audio or resolved_audio)
 
     def _resolve_initial_selection(self):
+        """State-first resolution of active selections. Robustly traverses parent tree to find app."""
+        # Search up the parent tree for the 'app' reference
+        p = self.parent()
+        app = None
+        while p:
+            if hasattr(p, "app"):
+                app = p.app
+                break
+            p = p.parent()
+        
+        # Default fallbacks
         mode = "general"
         audio = "system"
 
-        parent = self.parent()
-        app = getattr(parent, "app", None)
-
+        # 1. Try AppState (True Runtime State)
         if app and hasattr(app, "state"):
             state = app.state
             mode = (getattr(state, "mode", None) or mode).strip().lower()
             audio = (getattr(state, "audio_source", None) or audio).strip().lower()
+            return mode, audio
 
+        # 2. Try Config (Persistence State - only if AppState unavailable)
         if app and hasattr(app, "config"):
             mode = (app.config.get("ai.mode", mode) or mode).strip().lower()
             audio = (app.config.get("capture.audio.mode", audio) or audio).strip().lower()
