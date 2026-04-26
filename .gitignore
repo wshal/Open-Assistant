@@ -1,4 +1,4 @@
-# --- OpenAssist — GitHub Production Ignore ---
+# --- OpenAssist — Industry Standard Python Ignore ---
 
 # ── Application Secrets & Encrypted State ────────────────────────────────────
 config.yaml
@@ -11,36 +11,77 @@ data/vectordb/
 data/__pycache__/
 data/context_presets.json
 logs/
+.openassist/
 
 # ── Internal Docs & Private Assets ───────────────────────────────────────────
 data/cache/
 cheating/
+scratch/
+docs/
 
 # ── Python Environment ────────────────────────────────────────────────────────
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
 venv/
 env/
+ENV/
+env.bak/
+venv.bak/
+.env
 .Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.pyw
+
+# ── Testing & Code Coverage ───────────────────────────────────────────────────
 .pytest_cache/
 .coverage
 htmlcov/
-*.egg-info/
-dist-info/
+.tox/
+.nox/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
 
-# ── Local Dev Artifacts ───────────────────────────────────────────────────────
-.env
+# ── IDEs & Local Dev Artifacts ────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
 *.log
 *.bak
 *.tmp
-*.swp
 
-# ── Build & Distribution ──────────────────────────────────────────────────────
-build/
-dist/
+# ── PyInstaller Build ─────────────────────────────────────────────────────────
+*.manifest
 *.spec

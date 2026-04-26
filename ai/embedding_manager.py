@@ -43,7 +43,13 @@ class EmbeddingManager:
                 self._model = TextEmbedding(model_name=self._model_name)
                 # fastembed returns generator
                 self._embed_fn = lambda x: list(self._model.embed([x]))[0]
-                logger.info(f"✅ Shared EmbeddingManager loaded via fastembed ONNX ({self._model_name})")
+                
+                # Check underlying cache directory to confirm quantization
+                cache_dir = os.environ.get("FASTEMBED_CACHE_PATH", "./data/cache/fastembed")
+                is_quantized = os.path.exists(os.path.join(cache_dir, "models--qdrant--bge-small-en-v1.5-onnx-q"))
+                q_status = "INT8 Quantized" if is_quantized else "FP32"
+                
+                logger.info(f"✅ Shared EmbeddingManager loaded via fastembed ONNX ({self._model_name} | {q_status})")
                 return
             except Exception as e:
                 logger.debug(f"fastembed unavailable: {e}")

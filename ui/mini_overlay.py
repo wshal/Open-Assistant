@@ -76,7 +76,7 @@ class MiniOverlay(QMainWindow):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self.setWindowOpacity(0.95)
+        self.setWindowOpacity(self.config.get("app.opacity", 0.94))
         self.setFixedWidth(280)
         self.setFixedHeight(self.COLLAPSED_HEIGHT)
 
@@ -444,8 +444,8 @@ class MiniOverlay(QMainWindow):
                 f"background: rgba(20,20,35,{alpha}); border: 1px solid rgba(80,80,150,40); border-radius: 24px;"
             )
             self.response_area.setStyleSheet(
-                f"background: rgba(15,15,30,{max(20, alpha-10)}); border: none; border-radius: 12px; "
-                f"color: rgba(208, 208, 232, {max(40, alpha+40)}); font-size: 11px; padding: 8px;"
+                f"background: rgba(15,15,30,{min(255, max(20, alpha-10))}); border: none; border-radius: 12px; "
+                f"color: rgba(208, 208, 232, {min(255, max(40, alpha+40))}); font-size: 11px; padding: 8px;"
             )
         else:
             # Restore to fully opaque

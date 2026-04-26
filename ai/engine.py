@@ -283,6 +283,9 @@ class AIEngine(QObject):
         audio_context: Optional[str] = None,
         origin: Optional[str] = None,
         request_metadata: Optional[Dict[str, Any]] = None,
+        screen_hash: Optional[str] = None,
+        window_id: Optional[str] = None,
+        boost_context: Optional[str] = None,  # Q16: prior-turn entity keywords
     ):
         """
         RESTORED: Main async generation task.
@@ -318,9 +321,11 @@ class AIEngine(QObject):
         if allow_cache:
             snap = nexus_snapshot or {}
             context_fp = self._short_cache.context_fingerprint(
+                window_id=str(window_id or ""),
                 active_window=str(snap.get("active_window", "")),
                 screen=str(screen_context or snap.get("latest_ocr", "")),
                 audio=str(audio_context or snap.get("recent_audio", "")),
+                screen_hash=screen_hash or "",
             )
             try:
                 last = self.history.entries[-1] if getattr(self.history, "entries", None) else None
@@ -331,14 +336,25 @@ class AIEngine(QObject):
             except Exception:
                 history_fp = self._short_cache.history_fingerprint()
 
-            cached = self._short_cache.get(
+            cached, cache_tier = self._short_cache.get_with_tier(
                 mode=mode_id,
                 query=query,
                 context_fp=context_fp,
                 history_fp=history_fp,
+                boost_context=boost_context,  # Q16
             )
             if cached and (cached.response or "").strip():
                 latency_ms = (time.time() - start_time) * 1000
+                # Q13: record cache-hit latency
+                try:
+                    from utils.telemetry import telemetry as _tel
+                    _tel.record_total_latency(latency_ms)
+                except Exception:
+                    pass
+                logger.info(
+                    "[Q14 Cache] Hit tier=%d, provider=%s, latency=%.0fms",
+                    cache_tier, cached.provider or 'cache', latency_ms
+                )
                 self.history.add(
                     query,
                     cached.response,
@@ -347,6 +363,7 @@ class AIEngine(QObject):
                     latency=latency_ms,
                     metadata={
                         "cache_hit": True,
+                        "cache_tier": cache_tier,  # Q14: tier for overlay badge
                         "stage_timings": {
                             **stage_timings,
                             "request_to_complete_ms": (time.time() - request_started_at) * 1000,
@@ -368,6 +385,10 @@ class AIEngine(QObject):
 
         # Smart routing: analyse query complexity and select provider
         complexity = self._analyze_query_complexity(query)
+        logger.debug(
+            f"[P2.3 Routing] Query complexity='{complexity}', "
+            f"origin='{origin}', query_tokens≈{len(query.split())}"
+        )
         preferred_providers = None
         if origin in {"manual", "speech"}:
             cfg_text = self.config.get("ai.text.preferred_providers", None)
@@ -571,6 +592,8 @@ class AIEngine(QObject):
                 origin=origin,
                 nexus=nexus_snapshot,
                 history=history_block,
+                long_term_memory=(request_metadata or {}).get("long_term_memory", ""),
+                action_output=(request_metadata or {}).get("action_output", ""),
             )
 
             # Optional low-latency "race" for text: run top providers concurrently and use the first success.

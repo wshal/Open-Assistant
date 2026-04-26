@@ -32,5 +32,7 @@ def fix_file(path):
     else:
         print(f"No changes needed for {path}")
 
-if __name__ == "__main__":
-    fix_file(r'C:\Users\Vishal\Desktop\New\openassist\ui\markdown_renderer.py')
+    import os
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    target_file = os.path.join(project_root, 'ui', 'markdown_renderer.py')
+    fix_file(target_file)

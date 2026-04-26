@@ -49,9 +49,16 @@ class NativeHotkeyThread(threading.Thread):
                 if user32.RegisterHotKey(None, current_id, mods, vk):
                     self.manager._id_to_action[current_id] = action
                     self._registered_ids.append(current_id)
-                    logger.info(f"🔑 Registered (Native): {action} -> {key_str}")
+                    logger.info(f"\U0001f511 Registered (Native): {action} -> {key_str}")
                 else:
-                    logger.warning(f"⚠️ Native Hotkey Failed: {action}")
+                    # Q15: Hotkey conflict detection — RegisterHotKey returns 0 on failure
+                    # This usually means another app (or Windows itself) has claimed the combo.
+                    logger.warning(
+                        "[Q15 Conflict] Native hotkey '%s' (%s) FAILED to register — "
+                        "likely claimed by another app or Windows. "
+                        "Change it in Settings > Shortcuts.",
+                        action, key_str
+                    )
                 current_id += 1
 
         msg = wintypes.MSG()
@@ -132,8 +139,10 @@ class HotkeyManager:
     def _handle_trigger(self, action):
         bridges = {
             "toggle": self.app.toggle_overlay,
+            "cancel": self.app.cancel_generation,
             "quick_answer": self.app.quick_answer,
             "analyze_screen": self.app.analyze_current_screen,
+            "clipboard_context": self.app.paste_as_context,  # Q12
             "history_prev": self.app.history_prev,
             "history_next": self.app.history_next,
             "scroll_up": self.app.scroll_up,

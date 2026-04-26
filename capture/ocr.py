@@ -36,18 +36,21 @@ class OCREngine:
                     self.engine = ocr.OcrEngine.try_create_from_user_profile_languages()
                     self.name = "winrt"
                     self._loaded = True
-                    logger.info("  ✅ Windows Native OCR ready (Primary)")
+                    logger.info("  ✅ Windows Native OCR ready (Primary) — sub-100ms path active")
                     return
             except Exception as e:
                 logger.debug(f"WinRT load failed: {e}")
 
             # 2. Fallback: EasyOCR (High Accuracy, slower)
+            # P2.2 Lite: passes raw numpy arrays directly — skips any OpenCV encoding step
             try:
                 import easyocr
                 self.engine = easyocr.Reader(["en"], gpu=False, verbose=False)
                 self.name = "easyocr"
                 self._loaded = True
-                logger.info("  ✅ EasyOCR ready (Fallback)")
+                logger.info(
+                    "  ✅ EasyOCR ready (Fallback) — P2.2 Lite: PIL→numpy direct path active"
+                )
                 return
             except ImportError:
                 pass
@@ -57,17 +60,31 @@ class OCREngine:
     async def extract(self, img: Image.Image) -> Tuple[Optional[str], List[Tuple[int, int, int, int]]]:
         """EXTRACT: Extracts text and bounding boxes (Vision Focus)."""
         self._ensure_loaded()
-        if not self._loaded: return None, []
+        if not self._loaded:
+            logger.warning("[OCR] extract() called but no OCR engine loaded")
+            return None, []
+
+        import time as _time
+        t0 = _time.perf_counter()
 
         try:
             if self.name == "winrt" and self.engine:
-                return await self._extract_winrt(img)
+                result = await self._extract_winrt(img)
+                elapsed = (_time.perf_counter() - t0) * 1000
+                logger.debug(f"[OCR] WinRT extraction: {elapsed:.1f}ms, text_len={len(result[0] or '')}")
+                return result
             
             elif self.name == "easyocr" and self.engine:
                 import numpy as np
+                # P2.2 Lite: PIL → numpy array directly — no OpenCV or JPEG encode/decode roundtrip
                 arr = np.array(img)
-                # Note: EasyOCR is sync, but we wrap it in a thread to keep extract() consistent
-                return await asyncio.to_thread(self._extract_sync_easyocr, arr)
+                logger.debug(
+                    f"[OCR] P2.2 Lite: PIL→numpy direct path, shape={arr.shape}, dtype={arr.dtype}"
+                )
+                result = await asyncio.to_thread(self._extract_sync_easyocr, arr)
+                elapsed = (_time.perf_counter() - t0) * 1000
+                logger.debug(f"[OCR] EasyOCR extraction: {elapsed:.1f}ms, text_len={len(result[0] or '')}")
+                return result
                 
         except Exception as e:
             logger.debug(f"OCR Runtime Error ({self.name}): {e}")
@@ -94,6 +111,10 @@ class OCREngine:
             img.save(byte_io, format='PNG')
             byte_io.seek(0)
             data = byte_io.getvalue()
+            logger.debug(
+                f"[OCR] WinRT: encoding PIL image → PNG bytes ({len(data)} bytes) "
+                "for WinRT IInputStream"
+            )
             stream = streams.InMemoryRandomAccessStream()
             writer = streams.DataWriter(stream)
             writer.write_bytes(data)
@@ -104,7 +125,9 @@ class OCREngine:
             bitmap = await decoder.get_software_bitmap_async()
             
             result = await self.engine.recognize_async(bitmap)
-            if not result or not result.lines: return None, []
+            if not result or not result.lines:
+                logger.debug("[OCR] WinRT: no text lines detected")
+                return None, []
             
             text = "\n".join(line.text for line in result.lines)
             boxes = []

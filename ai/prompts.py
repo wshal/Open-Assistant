@@ -259,6 +259,8 @@ For MCQ: state correct answer first.""",
         origin: str = None,
         nexus: Dict[str, Any] = None,
         history: str = "",
+        long_term_memory: str = "",
+        action_output: str = "",
     ) -> str:
         """Build user prompt with mode-profile-aware context ranking and limits."""
         parts = []
@@ -328,6 +330,18 @@ For MCQ: state correct answer first.""",
                 "[TASK]\nGive the fastest useful context answer using the most recent live context. "
                 "Prioritise context in the order it appears above (highest weight first). "
                 f"Keep it extremely concise and actionable.{fmt}"
+            )
+
+        # P3.3: Inject command output so AI can interpret and explain it
+        if action_output:
+            parts.append(
+                f"[COMMAND OUTPUT — executed on user's machine]\n{action_output[:3000]}"
+            )
+
+        # P2.4: Inject long-term memory before the query if available
+        if long_term_memory:
+            parts.append(
+                f"[LONG-TERM MEMORY — relevant past sessions]\n{long_term_memory[:2000]}"
             )
 
         parts.append(f"Q: {query}")

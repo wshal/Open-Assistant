@@ -35,6 +35,10 @@ from utils.logger import setup_logger
 from utils.context_store import get_store as get_context_store
 from utils.context_store import get_suggested_preset_for_mode
 from core.constants import DB_DIR, CACHE_DIR, LOG_DIR
+from ai.memory import LongTermMemory
+from ai.context import ContextBuilder, ContextPruner
+from ai.prefetch import PredictivePrefetcher
+from ai.actions import ActionExecutor
 
 logger = setup_logger(__name__)
 
@@ -63,6 +67,20 @@ class OpenAssistApp(QObject):
         self.nexus = ContextNexus(config)
         self.stealth = StealthManager(config)
         self.simulator = InputSimulator(config)
+
+        # P2.4: Long-term semantic memory (ChromaDB, local, offline)
+        self.memory = LongTermMemory(config)
+        # P2.1: Incremental context assembly (diff-based screen context)
+        self.context_builder = ContextBuilder(config)
+        # P3.4: Attention-based context pruner
+        self.context_pruner = ContextPruner(config)
+        # P3.1: Predictive prefetch engine (instantiate; wired to loop in _run_master_loop)
+        self.prefetcher = PredictivePrefetcher(
+            config,
+            prefetch_fn=self.ai.prefetch_rag,
+        )
+        # P3.3: Actionable queries executor
+        self.actions = ActionExecutor(config)
 
         self.session_active = False
         self._last_query = ""
@@ -122,6 +140,10 @@ class OpenAssistApp(QObject):
         asyncio.set_event_loop(self.loop)
         self._ai_lock = asyncio.Lock()
         self._ai_lock_ready.set()
+        # P3.1: Wire the prefetcher to the running loop now that it exists
+        if hasattr(self, "prefetcher"):
+            self.prefetcher.wire(self.loop)
+            logger.info("[P3.1 Prefetcher] Wired to async loop")
         self.loop.run_forever()
 
     def _wire_signals(self):
@@ -167,6 +189,10 @@ class OpenAssistApp(QObject):
         had_screen = False
         had_audio = False
         had_rag = False
+        had_memory = False
+        had_action = False
+        had_prefetch = False
+        cache_tier = 0  # Q14: which cache tier served this response (0=miss/LLM)
         if entries:
             entry = entries[-1]
             latency_ms = getattr(entry, "latency", 0)
@@ -179,6 +205,19 @@ class OpenAssistApp(QObject):
             had_screen = bool(metadata.get("had_screen", False))
             had_audio = bool(metadata.get("had_audio", False))
             had_rag = bool(metadata.get("had_rag", False))
+            # Q1/Q2/Q3 — P2/P3 feature chip flags from request_metadata
+            had_memory = bool(req_meta.get("long_term_memory", ""))
+            had_action = bool(req_meta.get("action_output", ""))
+            had_prefetch = bool(req_meta.get("prefetch_hit", False))
+            cache_tier = int(metadata.get("cache_tier", 0))  # Q14
+            if cache_tier:
+                logger.info("[Q14 Chip] Response served from cache tier=%d", cache_tier)
+            if had_memory:
+                logger.info("[Q1 Chip] Long-term memory was injected into this response")
+            if had_action:
+                logger.info("[Q2 Chip] P3.3 action output was injected into this response")
+            if had_prefetch:
+                logger.info("[Q3 Chip] P3.1 prefetch hit used for this response")
             if stage_timings:
                 summary_parts = []
                 speech_to_transcript = req_meta.get("speech_to_transcript_ms")
@@ -225,6 +264,10 @@ class OpenAssistApp(QObject):
             had_screen=had_screen,
             had_audio=had_audio,
             had_rag=had_rag,
+            had_memory=had_memory,
+            had_action=had_action,
+            had_prefetch=had_prefetch,
+            cache_tier=cache_tier,
         )
 
         # ── Reset transcript label to Listening/Ready ─────────────────────────────
@@ -523,6 +566,13 @@ class OpenAssistApp(QObject):
 
         self._last_query = q
         self._last_query_time = now
+
+        # P1.4: New query should cancel any in-flight generation (new wins).
+        if s in {"manual", "speech", "quick"} and hasattr(self.ai, "cancel"):
+            try:
+                self.ai.cancel()
+            except Exception:
+                pass
         # SNAP-LOCK: Capture target window HWND at moment of query
         if s in ["manual", "speech", "quick"]:
             hwnd = self.simulator.get_foreground_window()
@@ -582,14 +632,99 @@ class OpenAssistApp(QObject):
             if request_epoch != self._generation_epoch:
                 return
             self._last_query = q
-            sc = c.get("screen") if c else await self.screen.capture_context()
+            # Q10: Parallel screen capture + audio transcript when both need live fetch
+            if c:
+                sc = c.get("screen")
+                au = c.get("audio")
+                sc_hash = (c.get("screen_hash") or self.screen.last_img_hash or "")
+            else:
+                # Fire both concurrently — capture_context is a coroutine,
+                # get_transcript is sync so wrap in an executor to avoid blocking.
+                _t0_parallel = __import__("time").time()
+                async def _get_audio_async():
+                    return self.audio.get_transcript()
+                sc, au = await asyncio.gather(
+                    self.screen.capture_context(),
+                    _get_audio_async(),
+                    return_exceptions=True,
+                )
+                # Unwrap exceptions gracefully
+                if isinstance(sc, Exception):
+                    logger.warning("[Q10 Parallel] screen capture failed: %s", sc)
+                    sc = ""
+                if isinstance(au, Exception):
+                    logger.warning("[Q10 Parallel] audio fetch failed: %s", au)
+                    au = ""
+                sc_hash = self.screen.last_img_hash or ""
+                logger.debug(
+                    "[Q10 Parallel] Screen + audio fetched concurrently in %.0fms",
+                    (__import__("time").time() - _t0_parallel) * 1000,
+                )
+
+            # P1.3: Log the screen_hash being used for cache fingerprinting
+            if sc_hash:
+                logger.debug(
+                    f"[P1.3 Fingerprint] Using screen_hash={sc_hash[:8]}... "
+                    f"for cache fingerprint (stable across minor visual noise)"
+                )
+            else:
+                logger.debug(
+                    "[P1.3 Fingerprint] No screen_hash available — "
+                    "falling back to OCR text for fingerprint"
+                )
+
+            # P2.1: Build incremental context (diff from last screen state)
+            boost_context: str = ""  # Q16: entity keywords from prior turn
+            if sc and hasattr(self, "context_builder"):
+                ctx_result = self.context_builder.build(q, sc)
+                sc = ctx_result["screen"]
+                boost_context = ctx_result.get("entities", "")
+                logger.debug(
+                    f"[P2.1 ContextBuilder] mode={ctx_result['mode']}, "
+                    f"screen_ctx_len={len(sc)}, "
+                    f"entities='{boost_context[:60]}'"
+                )
+                if boost_context:
+                    logger.debug("[Q16 Boost] entity context for cache boosting: '%s'", boost_context[:60])
+
             if request_epoch != self._generation_epoch:
                 return
             if sc:
                 self.nexus.push("screen", sc)
 
-            au = c.get("audio") if c else self.audio.get_transcript()
-            # Push last transcript fragment specifically if available
+            window_id = str(getattr(self.state, "target_window_id", "") or "")
+            # au is already set above (Q10 parallel block or c.get("audio"))
+
+            # P3.3: Actionable Queries — detect and execute before hitting the AI
+            if hasattr(self, "actions"):
+                action_output = await self.actions.detect_and_run(q)
+                if action_output:
+                    logger.info(
+                        f"[P3.3 Actions] Action executed — injecting output "
+                        f"({len(action_output)} chars) as context"
+                    )
+                    request_metadata = dict(request_metadata or {})
+                    request_metadata["action_output"] = action_output
+
+            # P3.4: Context Pruning — drop irrelevant screen blocks before the prompt
+            if sc and q and hasattr(self, "context_pruner"):
+                sc = self.context_pruner.prune(sc, q)
+
+            # P2.4: Retrieve relevant long-term memories and attach to request metadata
+            memory_ctx: str = ""
+            if hasattr(self, "memory") and self.memory.is_ready():
+                memories = self.memory.query(q, mode=str(self.config.get("ai.mode", "general")))
+                if memories:
+                    memory_ctx = "\n\n".join(memories)
+                    logger.info(
+                        f"[P2.4 Memory] Injecting {len(memories)} relevant memories "
+                        f"({len(memory_ctx)} chars) into prompt"
+                    )
+                else:
+                    logger.debug("[P2.4 Memory] No relevant past memories found for this query")
+            if memory_ctx:
+                request_metadata = dict(request_metadata or {})
+                request_metadata["long_term_memory"] = memory_ctx
 
             snapshot = self.nexus.get_snapshot()
             if request_epoch != self._generation_epoch:
@@ -601,6 +736,9 @@ class OpenAssistApp(QObject):
                 audio_context=au,
                 origin=s,
                 request_metadata=request_metadata,
+                screen_hash=sc_hash,
+                window_id=window_id,
+                boost_context=boost_context or None,  # Q16
             )
 
     def toggle_overlay(self):
@@ -667,6 +805,71 @@ class OpenAssistApp(QObject):
             )
 
         asyncio.run_coroutine_threadsafe(_quick_answer_flow(), self.loop)
+
+    def cancel_generation(self):
+        """Abort the current AI stream (best-effort)."""
+        if hasattr(self.ai, "cancel"):
+            try:
+                self.ai.cancel()
+            except Exception:
+                pass
+        if getattr(self, "session_active", False):
+            self.overlay.update_transcript("Cancelled â€” Listening...", state="listening")
+        else:
+            self.overlay.update_transcript("Cancelled.", state="idle")
+        if hasattr(self.mini_overlay, "set_ready"):
+            self.mini_overlay.set_ready()
+
+    def paste_as_context(self):
+        """Q12: Clipboard-as-context shortcut.
+
+        Reads the current clipboard text and injects it directly as screen context
+        for the next AI query.  Zero OCR latency — ideal for interview demos where
+        the candidate highlights a LeetCode / coding problem and hits Ctrl+Shift+X.
+        """
+        try:
+            from PyQt6.QtWidgets import QApplication as _QApp
+            clipboard = _QApp.clipboard()
+            text = (clipboard.text() or "").strip()
+        except Exception as exc:
+            logger.warning("[Q12 Clipboard] Failed to read clipboard: %s", exc)
+            text = ""
+
+        if not text:
+            logger.info("[Q12 Clipboard] Clipboard is empty — nothing to inject")
+            if hasattr(self.overlay, "show_error_toast"):
+                self.overlay.show_error_toast("Clipboard is empty. Copy some text first.")
+            return
+
+        # Truncate to a sensible context size
+        max_chars = int(self.config.get("context.max_screen_chars", 8000))
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n[... truncated to context limit ...]"
+
+        # Inject into Nexus as screen context
+        self.nexus.push("screen", text)
+        logger.info(
+            "[Q12 Clipboard] Injected %d chars of clipboard text as screen context",
+            len(text),
+        )
+
+        # Q13: Record clipboard use
+        try:
+            from utils.telemetry import telemetry as _tel
+            _tel.record_clipboard_use()
+        except Exception:
+            pass
+
+        # UI feedback
+        preview = text[:60].replace("\n", " ")
+        if hasattr(self.overlay, "update_transcript"):
+            self.overlay.update_transcript(
+                f"Clipboard context ready: \"{preview}...\"",
+                state="listening",
+            )
+        if hasattr(self.overlay, "show_error_toast"):
+            # Use a green-ish info toast (reuse the toast widget with a positive message)
+            pass  # update_transcript is sufficient
 
     def analyze_current_screen(self):
         if not self.session_active:
@@ -1055,6 +1258,20 @@ class OpenAssistApp(QObject):
         self.session_active = True
         self.state.is_capturing = True
 
+        # P2.1: Reset ContextBuilder so entity tracking starts fresh
+        if hasattr(self, "context_builder"):
+            self.context_builder.reset()
+            logger.info("[P2.1] ContextBuilder reset for new session")
+
+        # P2.4: Log memory store size at session start
+        if hasattr(self, "memory") and self.memory.is_ready():
+            logger.info(f"[P2.4] LongTermMemory: {self.memory.count()} memories available")
+
+        # P3.1: Reset prefetcher so stale symbol cache from last session is cleared
+        if hasattr(self, "prefetcher"):
+            self.prefetcher.reset()
+            logger.info("[P3.1] Prefetcher reset for new session")
+
         # Hard-clear the response area so no previous Q&A is visible
         self.overlay._current_query = ""
         self.overlay._raw_buffer = ""
@@ -1103,6 +1320,22 @@ class OpenAssistApp(QObject):
         # This also clears in-memory entries so the history block injected into prompts
         # doesn't carry over previous session context.
         self.history.start_new_session()
+
+        # P2.4: Persist the last AI exchange to long-term memory
+        if hasattr(self, "memory"):
+            last_entries = self.history.get_last(1)
+            if last_entries:
+                e = last_entries[0]
+                q = getattr(e, "query", "") or ""
+                r = getattr(e, "response", "") or ""
+                mode = str(self.config.get("ai.mode", "general"))
+                if q and r:
+                    session_id = str(int(time.time()))
+                    logger.info(
+                        f"[P2.4] Archiving session memory — mode={mode}, "
+                        f"query_preview='{q[:60]}'"
+                    )
+                    self.memory.store(session_id, q, r, mode=mode)
 
         # Clear AI caches so the next session has no stale context
         if hasattr(self.ai, "clear_rag_prefetch"):
@@ -1288,6 +1521,14 @@ class OpenAssistApp(QObject):
                 ),
                 self.loop,
             )
+
+        # P3.1: Predictive Prefetch — fire when we detect IDE symbols on screen
+        if hasattr(self, "prefetcher"):
+            window_title = str(
+                getattr(self.state, "active_window_title", "")
+                or (self.nexus.get_snapshot() or {}).get("active_window", "")
+            )
+            self.prefetcher.analyze(t, window_title=window_title)
 
         q = self.ai.detector.detect_with_confidence(t, source="screen")
         if q.triggered:

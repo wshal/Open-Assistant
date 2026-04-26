@@ -1,6 +1,7 @@
-import sys
+import os
 
-path = r'C:\Users\Vishal\Desktop\New\openassist\ui\markdown_renderer.py'
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+path = os.path.join(project_root, 'ui', 'markdown_renderer.py')
 with open(path, 'r', encoding='utf-8', errors='ignore') as f:
     lines = f.readlines()
 

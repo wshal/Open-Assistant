@@ -27,6 +27,12 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+# Q13: Telemetry (import lazily to avoid circular deps at module load)
+try:
+    from utils.telemetry import telemetry as _telemetry
+except Exception:
+    _telemetry = None
+
 # Suppress the noisy HuggingFace Hub unauthenticated-request warning.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -195,6 +201,9 @@ class EmbeddingTier:
         self._model = None          # None = not loaded yet, False = failed, model otherwise
         self._model_lock = threading.Lock()
         self._data_lock = threading.RLock()
+        # Q18: separate write-lock to prevent concurrent np.save races
+        self._persist_lock = threading.Lock()
+        self._persist_timer: threading.Timer = None
 
         # In-memory index: parallel lists for fast numpy batch cosine similarity
         self._vectors: List[np.ndarray] = []   # each shape (384,) float32
@@ -202,6 +211,8 @@ class EmbeddingTier:
         self._timestamps: List[float] = []     # created_at for TTL pruning
 
         self._dirty = False   # True when vectors need to be flushed to disk
+        # Q18: Start periodic 30s auto-persist background timer
+        self._schedule_persist_timer()
         with self._data_lock:
             self._load_persisted()
 
@@ -231,7 +242,8 @@ class EmbeddingTier:
             self._records.append(record)
             self._timestamps.append(time.time())
             self._dirty = True
-            self._persist()
+        # Q18: Do NOT call _persist() here — it would deadlock because _do_persist
+        # also needs _data_lock from a different thread. The 30s auto-timer handles persistence.
 
     def find(
         self,
@@ -289,7 +301,7 @@ class EmbeddingTier:
             self._records = [self._records[i] for i in keep]
             self._timestamps = [self._timestamps[i] for i in keep]
             self._dirty = True
-            self._persist()
+        # Q18: _persist() removed from here — called by 30s auto-timer instead
 
     # ------------------------------------------------------------------
     # Disk persistence
@@ -298,23 +310,44 @@ class EmbeddingTier:
     def _persist(self) -> None:
         if not self._dirty or not self._vectors:
             return
-        try:
-            self._vectors_path.parent.mkdir(parents=True, exist_ok=True)
-            np.save(str(self._vectors_path), np.stack(self._vectors))
-            meta = [
-                {
-                    "mode": r.mode,
-                    "context_fp": r.context_fp,
-                    "cache_query": r.cache_query,
-                    "history_fp": r.history_fp,
-                    "ts": ts,
-                }
-                for r, ts in zip(self._records, self._timestamps)
-            ]
-            self._meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            self._dirty = False
-        except Exception as e:
-            logger.debug(f"EmbeddingTier: persist failed: {e}")
+        # Q18: Run in background thread to avoid blocking response path
+        def _do_persist():
+            with self._persist_lock:
+                try:
+                    with self._data_lock:
+                        if not self._vectors:
+                            return
+                        vecs = np.stack(self._vectors)
+                        meta = [
+                            {
+                                "mode": r.mode,
+                                "context_fp": r.context_fp,
+                                "cache_query": r.cache_query,
+                                "history_fp": r.history_fp,
+                                "ts": ts,
+                            }
+                            for r, ts in zip(self._records, self._timestamps)
+                        ]
+                    self._vectors_path.parent.mkdir(parents=True, exist_ok=True)
+                    np.save(str(self._vectors_path), vecs)
+                    self._meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                    with self._data_lock:
+                        self._dirty = False
+                    logger.debug("[Q18 Persist] Embedding index saved in background (%d vectors)", len(vecs))
+                except Exception as e:
+                    logger.debug("EmbeddingTier: background persist failed: %s", e)
+        threading.Thread(target=_do_persist, daemon=True, name="embed-persist").start()
+
+    def _schedule_persist_timer(self, interval: float = 30.0) -> None:
+        """Q18: Periodic background persist every 30s — restarts itself."""
+        def _tick():
+            try:
+                self._persist()
+            finally:
+                self._schedule_persist_timer(interval)  # reschedule
+        self._persist_timer = threading.Timer(interval, _tick)
+        self._persist_timer.daemon = True
+        self._persist_timer.start()
 
     def _load_persisted(self) -> None:
         try:
@@ -381,6 +414,9 @@ class ShortQueryCache:
         # Composite key: (signature, mode, context_fp) → CacheKey
         self._semantic_items: dict[Tuple[str, str, str], CacheKey] = {}
         self._lru: list[CacheKey] = []
+        # Q17: LRU list for semantic_items (prevents unbounded growth)
+        self._semantic_lru: list[Tuple[str, str, str]] = []
+        self._max_semantic_items: int = 512
 
         # Tier 3: embedding index
         self._embed: Optional[EmbeddingTier] = None
@@ -422,15 +458,22 @@ class ShortQueryCache:
     @staticmethod
     def context_fingerprint(
         *,
+        window_id: str = "",
         active_window: str = "",
         screen: str = "",
         audio: str = "",
+        screen_hash: str = "",
     ) -> str:
+        wid = (str(window_id or "")).strip()[:24]
         aw = (active_window or "").strip()[:80]
-        sc = (screen or "").strip()[:400]
+        # P1.3: Use the perceptual screen_hash if available, otherwise fallback to text
+        if screen_hash:
+            sc = f"hash:{(screen_hash or '')[:8]}"
+        else:
+            sc = (screen or "").strip()[:400]
         # Audio deliberately excluded — highly volatile in live meetings.
         # Cache is stable as long as the visual/window context remains the same.
-        return _sha1(f"aw={aw}||sc={sc}")
+        return _sha1(f"wid={wid}||aw={aw}||sc={sc}")
 
     @staticmethod
     def history_fingerprint(last_query: str = "", last_response: str = "") -> str:
@@ -452,40 +495,54 @@ class ShortQueryCache:
             self._items.clear()
             self._lru.clear()
             self._semantic_items.clear()
+            self._semantic_lru.clear()  # Q17: sync LRU list
             return
 
         while len(self._items) > self.max_items and self._lru:
             k = self._lru.pop(0)
             self._items.pop(k, None)
 
-        # Garbage-collect orphaned semantic entries
+        # Garbage-collect orphaned semantic entries and sync LRU list (Q17)
         active_keys = set(self._items.keys())
         self._semantic_items = {sk: ck for sk, ck in self._semantic_items.items() if ck in active_keys}
+        # Rebuild LRU to match surviving keys (removes dangling references)
+        surviving_sem = set(self._semantic_items.keys())
+        self._semantic_lru = [sk for sk in self._semantic_lru if sk in surviving_sem]
 
         # Prune embedding tier (runs cheaply — just checks timestamps)
         if self._embed:
             self._embed.prune_expired()
 
-    def get(
+    def get_with_tier(
         self,
         *,
         mode: str,
         query: str,
         context_fp: str,
         history_fp: str,
-    ) -> Optional[CacheEntry]:
+        boost_context: Optional[str] = None,  # Q16: prior-turn entity keywords for score boosting
+    ) -> "tuple[Optional[CacheEntry], int]":
+        """Like get() but also returns which tier was hit (1-4, or 0 for miss).
+
+        Q16: boost_context is a space-separated string of entity keywords from the
+        prior turn (e.g. 'React useState hooks').  When provided, Tier 4 fuzzy
+        scoring applies a 1.2x multiplier to candidates whose query overlaps with
+        those tokens, increasing cache hit rate for topic-related follow-ups.
+        """
         if self.ttl_s <= 0 or self.max_items <= 0:
-            return None
+            return None, 0
         self._prune()
 
-        # ── Tier 1: Exact match ─────────────────────────────────────────
+        # ── Tier 1: Exact match ──────────────────────────────────────────────
         key = CacheKey(str(mode or "general"), _norm_query(query), context_fp, history_fp)
         entry = self._items.get(key)
         if entry and entry.expires_at > time.time():
             self._touch_lru(key)
-            return entry
+            if _telemetry:
+                _telemetry.record_cache_hit(tier=1)
+            return entry, 1
 
-        # ── Tier 2: Semantic Signature ──────────────────────────────────
+        # ── Tier 2: Semantic Signature ────────────────────────────────────────
         if self.enable_semantic:
             signature = self._get_semantic_signature(query)
             sem_lookup_key = (signature, key.mode, key.context_fp)
@@ -494,9 +551,11 @@ class ShortQueryCache:
                 entry = self._items.get(semantic_key)
                 if entry and entry.expires_at > time.time():
                     self._touch_lru(semantic_key)
-                    return entry
+                    if _telemetry:
+                        _telemetry.record_cache_hit(tier=2)
+                    return entry, 2
 
-        # ── Tier 3: Embedding Similarity ────────────────────────────────
+        # ── Tier 3: Embedding Similarity ──────────────────────────────────────
         if self._embed:
             rec = self._embed.find(query, mode=key.mode, context_fp=key.context_fp)
             if rec:
@@ -504,19 +563,32 @@ class ShortQueryCache:
                 entry = self._items.get(embed_key)
                 if entry and entry.expires_at > time.time():
                     self._touch_lru(embed_key)
-                    return entry
+                    if _telemetry:
+                        _telemetry.record_cache_hit(tier=3)
+                    return entry, 3
 
-        # ── Tier 4: Conservative Fuzzy ──────────────────────────────────
+        # ── Tier 4: Conservative Fuzzy ─────────────────────────────────────────
         if not self.enable_fuzzy:
-            return None
+            if _telemetry:
+                _telemetry.record_cache_miss()
+            return None, 0
 
         nq = _norm_query(query)
         if len(nq) < 4 or len(nq) > 240 or not _is_simple_ascii(nq):
-            return None
+            if _telemetry:
+                _telemetry.record_cache_miss()
+            return None, 0
 
         q_tokens = set(nq.split())
         if not q_tokens:
-            return None
+            if _telemetry:
+                _telemetry.record_cache_miss()
+            return None, 0
+        # Q16: Build boost token set from prior-turn entity context
+        boost_tokens: set = set()
+        if boost_context:
+            boost_tokens = set(_norm_query(boost_context).split())
+            boost_tokens.discard("")  # remove empty strings
         best_key = None
         best_score = 0.0
         for k in list(self._items.keys()):
@@ -528,14 +600,42 @@ class ShortQueryCache:
             inter = len(q_tokens & kt)
             union = len(q_tokens | kt)
             score = inter / union if union else 0.0
+            # Q16: Boost score if candidate shares entity tokens with prior turn
+            if boost_tokens and kt & boost_tokens:
+                score *= 1.2
+                logger.debug(
+                    "[Q16 Boost] score %.3f boosted to %.3f for '%s'",
+                    score / 1.2, score, k.query[:60],
+                )
             if score > best_score:
                 best_score = score
                 best_key = k
         if best_key and best_score >= self.fuzzy_threshold:
             e = self._items.get(best_key)
             if e and e.expires_at > time.time():
-                return e
-        return None
+                if _telemetry:
+                    _telemetry.record_cache_hit(tier=4)
+                return e, 4
+
+        if _telemetry:
+            _telemetry.record_cache_miss()
+        return None, 0
+
+    def get(
+        self,
+        *,
+        mode: str,
+        query: str,
+        context_fp: str,
+        history_fp: str,
+        boost_context: Optional[str] = None,
+    ) -> Optional[CacheEntry]:
+        """Backward-compatible wrapper — delegates to get_with_tier()."""
+        entry, _ = self.get_with_tier(
+            mode=mode, query=query, context_fp=context_fp, history_fp=history_fp,
+            boost_context=boost_context,
+        )
+        return entry
 
     def set(
         self,
@@ -564,12 +664,24 @@ class ShortQueryCache:
         # Tier 1: Exact
         self._items[key] = entry
 
-        # Tier 2: Semantic signature
+        # Q17: Evict oldest semantic entry when cap is exceeded
         if self.enable_semantic:
             try:
                 signature = self._get_semantic_signature(query)
                 sem_key = (signature, key.mode, key.context_fp)
+                if sem_key not in self._semantic_items:
+                    # New entry — check cap
+                    while len(self._semantic_items) >= self._max_semantic_items and self._semantic_lru:
+                        oldest = self._semantic_lru.pop(0)
+                        self._semantic_items.pop(oldest, None)
+                        logger.debug("[Q17 LRU] Evicted semantic_item key: %s", oldest)
                 self._semantic_items[sem_key] = key
+                # Track LRU order for this sem_key
+                try:
+                    self._semantic_lru.remove(sem_key)
+                except ValueError:
+                    pass
+                self._semantic_lru.append(sem_key)
             except Exception:
                 pass
 

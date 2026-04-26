@@ -22,8 +22,10 @@ OpenAssist is a premium AI-powered overlay assistant for Windows. It analyzes yo
 ### 🧠 Intelligent Brain
 - **Smart Router** — dynamically switches between high-speed cloud providers (Groq, Gemini, Cerebras, Together) and local inference (Ollama) based on query complexity.
 - **Four-Tier Semantic Cache** — high-performance engine using local ONNX embeddings (`BAAI/bge-small-en-v1.5`) and Jaccard token overlap to autonomously resolve paraphrased questions with sub-20ms latency.
+- **Actionable Queries** — native intent routing execution that can launch dev servers, run tests, and execute git commands automatically.
+- **Predictive Prefetch** — anticipates documentation needs by scanning cursor and IDE context to warm up the RAG cache in the background.
 - **RAG Engine** — built-in local vector database (ChromaDB) for instant indexing and retrieval from project directories or knowledge bases.
-- **Conversation History** — maintains multi-turn context across a session and resolves follow-up queries automatically.
+- **Conversation History** — maintains multi-turn context across a session and resolves follow-up queries automatically, with automatic contextual boosting.
 - **Parallel Inference** — optional mode that fires multiple providers simultaneously and uses the fastest valid response.
 
 ### 📝 Session Context (Custom Instructions)
@@ -127,9 +129,11 @@ openassist/
 ├── capture/        # Screen OCR, audio capture pipeline
 ├── modes/          # Capture mode profiles (Interview, Coding, etc.)
 ├── ui/             # HUD overlay, standby view, settings, mini-HUD
-├── utils/          # Logger, context store, platform utilities
+├── utils/          # Logger, context store, platform utilities, telemetry
 ├── stealth/        # Anti-screen-capture and input simulator
-├── tests/          # Unit test suite (127 tests)
+├── docs/           # Architecture deep-dives and technical reports
+├── scripts/        # Utility and build scripts
+├── tests/          # Unit test suite (238 tests)
 └── data/           # Runtime data (encrypted, gitignored)
 ```
 
@@ -141,7 +145,7 @@ openassist/
 python -m unittest discover -s tests
 ```
 
-All **127 tests** should pass. Tests cover session lifecycle, context store, mode switching, prompt injection, audio pipeline behavior, semantic caching, and question detection.
+All **238 tests** should pass. Tests cover session lifecycle, context store, mode switching, prompt injection, audio pipeline behavior, semantic caching, background async workers, and question detection.
 
 ---
 

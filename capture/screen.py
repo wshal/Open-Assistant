@@ -6,6 +6,7 @@ FIXED: Active region tracking for Smart Crop (Vision Focus).
 
 import io
 import time
+from dataclasses import dataclass
 from typing import Optional, Tuple
 from PIL import Image
 import mss
@@ -13,8 +14,17 @@ import ctypes
 from PyQt6.QtCore import QObject, pyqtSignal
 from capture.ocr import OCREngine
 from utils.logger import setup_logger
+from utils.platform_utils import ProcessUtils
 
 logger = setup_logger(__name__)
+
+
+@dataclass
+class _WindowState:
+    img_hash: str = ""
+    text: str = ""
+    last_ocr_time: float = 0.0
+    last_seen: float = 0.0
 
 
 class ScreenCapture(QObject):
@@ -25,6 +35,8 @@ class ScreenCapture(QObject):
         self.config = config
         self.ocr = ocr
         self._last_text = ""
+        self._last_img_hash = ""
+        self._last_ocr_time = 0.0
         self._last_time = 0.0
         # Prefer the explicit screen capture interval setting (P1.7). Fall back
         # to the legacy debounce key for backwards compatibility.
@@ -49,6 +61,17 @@ class ScreenCapture(QObject):
         self._smart_crop_enabled = config.get("capture.screen.smart_crop", True)
         self._enabled = config.get("capture.screen.enabled", True)
 
+        # P1.1: Cache OCR/hash per active window (title-based by default).
+        self._window_states: dict[str, _WindowState] = {}
+        self._active_window_key: str = ""
+        self._window_cache_size = int(config.get("capture.screen.window_cache_size", 8) or 8)
+        self._key_by_window = bool(config.get("capture.screen.key_by_window", True))
+
+        # P1.1: Stability gate for perceptual hash skipping.
+        self._hash_threshold_bits = int(config.get("capture.screen.hash_threshold_bits", 2) or 2)
+        stable_ttl_ms = config.get("capture.screen.stable_ttl_ms", 2000)
+        self._stable_ttl_s = float(stable_ttl_ms) / 1000.0
+
         # RESTORATION: Active Text Region Tracking
         self._last_crop_box = None  # (left, top, right, bottom)
         self._crop_hits = 0
@@ -64,11 +87,124 @@ class ScreenCapture(QObject):
         self.ocr._ensure_loaded()
         logger.info("  ✅ Screen capture pipeline ready")
 
+    @property
+    def last_img_hash(self) -> str:
+        return self._last_img_hash
+
+    def _get_window_key(self) -> str:
+        if not getattr(self, "_key_by_window", True):
+            return "global"
+        try:
+            title = ProcessUtils.get_active_window_title() or ""
+        except Exception:
+            title = ""
+        title = (title or "").strip()
+        return title[:200] if title else "global"
+
+    def _evict_window_states_if_needed(self) -> None:
+        states = getattr(self, "_window_states", None)
+        if not isinstance(states, dict):
+            return
+        try:
+            max_items = int(getattr(self, "_window_cache_size", 0) or 0)
+        except Exception:
+            max_items = 0
+        if max_items <= 0 or len(states) <= max_items:
+            return
+        active = getattr(self, "_active_window_key", "")
+        victims = sorted(
+            (k for k in states.keys() if k != active),
+            key=lambda k: states.get(k, _WindowState()).last_seen,
+        )
+        while len(states) > max_items and victims:
+            states.pop(victims.pop(0), None)
+
+    def _sync_active_state(self) -> None:
+        states = getattr(self, "_window_states", None)
+        key = getattr(self, "_active_window_key", "")
+        if not isinstance(states, dict) or not key:
+            return
+        states[key] = _WindowState(
+            img_hash=getattr(self, "_last_img_hash", "") or "",
+            text=getattr(self, "_last_text", "") or "",
+            last_ocr_time=float(getattr(self, "_last_ocr_time", 0.0) or 0.0),
+            last_seen=time.time(),
+        )
+        self._evict_window_states_if_needed()
+
+    def _activate_window_state(self, window_key: str) -> None:
+        # PyQt QObject instances constructed via __new__ (in tests) can raise if
+        # we touch Qt-backed attributes before QObject.__init__.
+        try:
+            states = self.__dict__.get("_window_states", None)
+        except Exception:
+            states = None
+        if not isinstance(states, dict):
+            return
+        window_key = window_key or "global"
+        if window_key == getattr(self, "_active_window_key", ""):
+            self._sync_active_state()
+            return
+
+        if getattr(self, "_active_window_key", ""):
+            self._sync_active_state()
+
+        state = states.get(window_key) or _WindowState()
+        self._active_window_key = window_key
+        self._last_img_hash = state.img_hash or ""
+        self._last_text = state.text or ""
+        self._last_ocr_time = float(state.last_ocr_time or 0.0)
+        self._last_crop_box = None  # Reset crop box for new window
+        self._sync_active_state()
+
+    @staticmethod
+    def _dhash(image: Image.Image, hash_size: int = 8) -> str:
+        """Calculate a Difference Hash (dHash) for an image."""
+        try:
+            # Resize to (hash_size + 1) x hash_size, convert to grayscale
+            img = image.convert("L").resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
+            pixels = list(img.getdata())
+            
+            # Compare adjacent pixels
+            diff = []
+            for row in range(hash_size):
+                for col in range(hash_size):
+                    left_pixel = pixels[row * (hash_size + 1) + col]
+                    right_pixel = pixels[row * (hash_size + 1) + col + 1]
+                    diff.append(left_pixel > right_pixel)
+                    
+            # Convert boolean array to hex string
+            decimal_value = 0
+            hex_string = []
+            for index, value in enumerate(diff):
+                if value:
+                    decimal_value += 2**(index % 8)
+                if (index % 8) == 7:
+                    hex_string.append(hex(decimal_value)[2:].rjust(2, '0'))
+                    decimal_value = 0
+                    
+            return ''.join(hex_string)
+        except Exception as e:
+            logger.error(f"Error computing dhash: {e}")
+            return ""
+
+    @staticmethod
+    def _hash_distance(h1: str, h2: str) -> int:
+        """Calculate the Hamming distance between two hex hashes."""
+        if not h1 or not h2 or len(h1) != len(h2):
+            return 999
+        return sum(bin(int(c1, 16) ^ int(c2, 16)).count('1') for c1, c2 in zip(h1, h2))
+
 
     async def capture(self) -> Optional[str]:
         """Periodic capture — respects debounce interval and Smart Crop."""
         if not self._enabled:
             return None
+        try:
+            if isinstance(self.__dict__.get("_window_states", None), dict):
+                self._activate_window_state(self._get_window_key())
+        except Exception:
+            pass
         now = time.time()
         if now - self._last_time < self._debounce:
             return None
@@ -88,8 +224,47 @@ class ScreenCapture(QObject):
                 offset_x, offset_y = self._last_crop_box[0], self._last_crop_box[1]
                 logger.debug("Vision: Focused capture using Smart Crop")
 
+            # phase 1.5: Screen Diff (P1.1)
+            # Compute perceptual hash to see if we can skip OCR entirely
+            curr_hash = self._dhash(target_img)
+            if curr_hash and self._last_img_hash:
+                dist = self._hash_distance(curr_hash, self._last_img_hash)
+                stable_recent = (now - float(getattr(self, "_last_ocr_time", 0.0) or 0.0)) < float(
+                    getattr(self, "_stable_ttl_s", 0.0) or 0.0
+                )
+                if stable_recent and dist <= int(getattr(self, "_hash_threshold_bits", 2) or 2):
+                    logger.debug(
+                        f"[ScreenCapture P1.1] OCR SKIPPED — dhash distance={dist} ≤ "
+                        f"{self._hash_threshold_bits} bits, screen visually unchanged "
+                        f"(within {self._stable_ttl_s:.1f}s TTL)"
+                    )
+                    # Q11: Telemetry — track per-window TTL cache hits
+                    try:
+                        from utils.telemetry import telemetry as _tel
+                        _tel.record_screen_ocr(0.0)  # 0ms = cache hit, no OCR ran
+                    except Exception:
+                        pass
+                    self._last_img_hash = curr_hash
+                    self._sync_active_state()
+                    return None  # No change, caller will use _last_text
+                elif not stable_recent:
+                    logger.debug(
+                        f"[ScreenCapture P1.1] TTL expired — forcing OCR re-run "
+                        f"(last_ocr={now - float(getattr(self, '_last_ocr_time', 0.0) or 0.0):.1f}s ago)"
+                    )
+                else:
+                    logger.debug(
+                        f"[ScreenCapture P1.1] OCR RUNNING — dhash distance={dist} > "
+                        f"{self._hash_threshold_bits} bits (visual change detected)"
+                    )
+
+            self._last_img_hash = curr_hash or self._last_img_hash
+            self._sync_active_state()
+
             # phase 2: Extraction
             text, boxes = await self.ocr.extract(target_img)
+            self._last_ocr_time = now
+            self._sync_active_state()
 
             # phase 3: Hysteresis Logic (Update the focus zone)
             if text and len(text.strip()) > 10:
@@ -105,6 +280,7 @@ class ScreenCapture(QObject):
             # phase 4: Change Detection
             if text and self._has_changed(text):
                 self._last_text = text
+                self._sync_active_state()
                 self.text_captured.emit(text)
                 return text
         except Exception as e:
@@ -115,17 +291,29 @@ class ScreenCapture(QObject):
         """Force immediate capture regardless of debounce."""
         if not self._enabled:
             return ""
+        try:
+            if isinstance(self.__dict__.get("_window_states", None), dict):
+                self._activate_window_state(self._get_window_key())
+        except Exception:
+            pass
         img = self._screenshot()
         if img:
             text, _ = await self.ocr.extract(img)
             if text:
                 self._last_text = text
+                self._last_ocr_time = time.time()
+                self._sync_active_state()
                 if emit_signal:
                     self.text_captured.emit(text)
                 return text
         return ""
 
     async def capture_context(self) -> str:
+        try:
+            if isinstance(self.__dict__.get("_window_states", None), dict):
+                self._activate_window_state(self._get_window_key())
+        except Exception:
+            pass
         text = await self.capture()
         if text is not None:
             return text
@@ -135,6 +323,11 @@ class ScreenCapture(QObject):
         """Capture one screenshot and derive OCR text from the same image."""
         if not self._enabled:
             return b"", ""
+        try:
+            if isinstance(self.__dict__.get("_window_states", None), dict):
+                self._activate_window_state(self._get_window_key())
+        except Exception:
+            pass
 
         img = self._screenshot()
         if img is None:
@@ -143,6 +336,8 @@ class ScreenCapture(QObject):
         text, _ = await self.ocr.extract(img)
         if text:
             self._last_text = text
+            self._last_ocr_time = time.time()
+            self._sync_active_state()
 
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -183,12 +378,19 @@ class ScreenCapture(QObject):
         """Run OCR over an existing screenshot blob."""
         if not image_bytes:
             return ""
+        try:
+            if isinstance(self.__dict__.get("_window_states", None), dict):
+                self._activate_window_state(self._get_window_key())
+        except Exception:
+            pass
 
         try:
             img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             text, _ = await self.ocr.extract(img)
             if text:
                 self._last_text = text
+                self._last_ocr_time = time.time()
+                self._sync_active_state()
             return text or ""
         except Exception as e:
             logger.debug(f"Snapshot OCR error: {e}")
@@ -238,14 +440,40 @@ class ScreenCapture(QObject):
         """
         try:
             sct = mss.mss()
+            
+            # Phase B1: True ROI - Attempt to capture ONLY the active window.
+            # This massively reduces memory allocation and image conversion overhead.
+            active_rect = ProcessUtils.get_active_window_rect()
+            if active_rect:
+                x, y, w, h = active_rect
+                
+                # We still need to find the right monitor to ensure we don't grab 
+                # weird out-of-bounds phantom pixels if a window is dragged off-screen.
+                monitors = getattr(sct, "monitors", []) or []
+                screen_width, screen_height = ProcessUtils.get_primary_screen_size()
+                
+                # Sanitize the window rect to clamp it within the primary display bounding box
+                # (Assuming primary display for now, a multi-monitor robust implementation 
+                # would intersect with all monitor bounds).
+                x = max(0, x)
+                y = max(0, y)
+                w = min(w, screen_width - x)
+                h = min(h, screen_height - y)
+                
+                # Only use the ROI if it's a valid size (e.g. greater than 50x50)
+                if w > 50 and h > 50:
+                    bbox = {"top": y, "left": x, "width": w, "height": h}
+                    sct_img = sct.grab(bbox)
+                    img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                    return img
+
+            # Fallback: Capture the entire screen containing the cursor
             monitors = getattr(sct, "monitors", []) or []
             if len(monitors) < 2:
-                # mss uses index 0 as the virtual "all monitors" region.
                 target_monitor = monitors[0] if monitors else None
             else:
                 target_monitor = monitors[1]  # fallback: primary
 
-            # Prefer the monitor under the cursor (thread-safe via Win32).
             try:
                 class _POINT(ctypes.Structure):
                     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]

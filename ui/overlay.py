@@ -160,8 +160,17 @@ class OverlayWindow(QMainWindow):
             # Width: 400px, Height: from top to taskbar
             # Use setFixedSize to prevent layout-driven expansion beyond screen bounds
             self.setFixedSize(400, geom.height())
-            # Position at right edge of screen, respecting taskbar/top offset
-            self.move(geom.right() - 400, geom.top())
+            # Restore saved position (Q9); fall back to right edge of screen
+            saved_x = self.config.get("app.overlay_x", None)
+            saved_y = self.config.get("app.overlay_y", None)
+            if saved_x is not None and saved_y is not None:
+                # Clamp to ensure it stays on screen after monitor changes
+                safe_x = max(geom.left(), min(int(saved_x), geom.right() - 400))
+                safe_y = max(geom.top(), min(int(saved_y), geom.bottom() - 100))
+                self.move(safe_x, safe_y)
+                logger.debug("[Q9 Position] Restored overlay to (%d, %d)", safe_x, safe_y)
+            else:
+                self.move(geom.right() - 400, geom.top())
 
         self.container = QWidget()
         self.setCentralWidget(self.container)
@@ -497,6 +506,12 @@ class OverlayWindow(QMainWindow):
         had_screen: bool = False,
         had_audio: bool = False,
         had_rag: bool = False,
+        # Q1/Q2/Q3 — P2/P3 feature chips
+        had_memory: bool = False,
+        had_action: bool = False,
+        had_prefetch: bool = False,
+        # Q14: cache tier badge (0 = LLM response, 1-4 = cache tier)
+        cache_tier: int = 0,
     ):
         """Update the status bar with current state."""
         parts = []
@@ -504,29 +519,50 @@ class OverlayWindow(QMainWindow):
         # Show current mode
         current_mode = self.app.state.mode if hasattr(self.app, "state") else "general"
         mode_icons = {
-            "general": "🧠",
-            "interview": "🎯",
-            "coding": "💻",
-            "meeting": "🤝",
-            "exam": "🎓",
-            "writing": "✍️",
+            "general": "\U0001f9e0",
+            "interview": "\U0001f3af",
+            "coding": "\U0001f4bb",
+            "meeting": "\U0001f91d",
+            "exam": "\U0001f393",
+            "writing": "\u270d\ufe0f",
         }
-        parts.append(f"{mode_icons.get(current_mode, '🧠')} {current_mode.upper()}")
+        parts.append(f"{mode_icons.get(current_mode, chr(0x1F9E0))} {current_mode.upper()}")
 
         # Show available providers (from app.router or config)
         if available_providers and len(available_providers) > 0:
-            parts.append(f"📡 [{', '.join(available_providers)}]")
+            parts.append(f"\U0001f4e1 [{', '.join(available_providers)}]")
 
         if provider:
-            parts.append(f"🧠 {provider}")
+            parts.append(f"\U0001f9e0 {provider}")
         if capture_audio:
-            parts.append("🎙️")
+            parts.append("\U0001f399\ufe0f")
         if capture_screen:
-            parts.append("👁️")
+            parts.append("\U0001f441\ufe0f")
         if latency_ms > 0:
             parts.append(f"{latency_ms / 1000:.1f}s")
         else:
-            parts.append("⚡ Ready")
+            parts.append("\u26a1 Ready")
+
+        # Q1: Long-term memory chip
+        if had_memory:
+            parts.append("\U0001f4be Memory")
+            logger.debug("[UI Chip] Memory chip shown — long-term memory was injected")
+
+        # Q2: Actionable query chip
+        if had_action:
+            parts.append("\u26a1 Action")
+            logger.debug("[UI Chip] Action chip shown — P3.3 command was executed")
+
+        # Q3: Predictive prefetch chip
+        if had_prefetch:
+            parts.append("\U0001f52e Prefetched")
+            logger.debug("[UI Chip] Prefetch chip shown — RAG was pre-warmed")
+
+        # Q14: Cache tier badge
+        if cache_tier > 0:
+            tier_labels = {1: "T1", 2: "T2", 3: "T3", 4: "T4"}
+            parts.append(f"\u2248 {tier_labels.get(cache_tier, 'T?')} cached")
+            logger.debug("[UI Chip] Cache tier=%d badge shown", cache_tier)
 
         self._status_snapshot = " | ".join(parts)
 
@@ -849,6 +885,14 @@ class OverlayWindow(QMainWindow):
 
     def mouseReleaseEvent(self, e):
         self._drag = False
+        # Q9: Persist overlay position so it survives restarts
+        pos = self.pos()
+        try:
+            self.config.set("app.overlay_x", pos.x())
+            self.config.set("app.overlay_y", pos.y())
+            logger.debug("[Q9 Position] Saved overlay position: (%d, %d)", pos.x(), pos.y())
+        except Exception as _e:
+            logger.debug("[Q9 Position] Could not save position: %s", _e)
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -856,8 +900,12 @@ class OverlayWindow(QMainWindow):
             self.app._apply_window_effects(self)
         if hasattr(self.app, "hotkeys"):
             self.app.hotkeys.reset_state()
+        if hasattr(self, "_gaze_timer") and not self._gaze_timer.isActive():
+            self._gaze_timer.start(100)
 
     def hideEvent(self, e):
+        if hasattr(self, "_gaze_timer") and self._gaze_timer.isActive():
+            self._gaze_timer.stop()
         super().hideEvent(e)
         if hasattr(self.app, "hotkeys"):
             self.app.hotkeys.reset_state()
@@ -901,7 +949,7 @@ class OverlayWindow(QMainWindow):
                 f"#box {{ background: rgba(12, 12, 25, {alpha}); border: 1px solid rgba(80, 85, 255, 10); border-radius: 14px; }}"
             )
             self.response_area.setStyleSheet(
-                f"background: transparent; color: rgba(208, 208, 232, {max(40, alpha+40)}); border: none; font-size: 13px;"
+                f"background: transparent; color: rgba(208, 208, 232, {min(255, max(40, alpha+40))}); border: none; font-size: 13px;"
             )
         else:
             # Restore to fully opaque
