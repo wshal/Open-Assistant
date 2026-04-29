@@ -71,9 +71,9 @@ class NexusTimelineView(QWidget):
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.setFixedSize(52, 22)
         self.clear_btn.setStyleSheet(
-            "background: rgba(239,68,68,0.12); color: #ef4444;"
-            " border: 1px solid rgba(239,68,68,0.3); border-radius: 6px; font-size: 9px;"
-            " QPushButton:hover { background: rgba(239,68,68,0.25); }"
+            "background: rgba(239,68,68,30); color: #ef4444;"
+            " border: 1px solid rgba(239,68,68,76); border-radius: 6px; font-size: 9px;"
+            " QPushButton:hover { background: rgba(239,68,68,63); }"
         )
         self.clear_btn.clicked.connect(self._clear_log)
         hdr.addWidget(self.clear_btn)

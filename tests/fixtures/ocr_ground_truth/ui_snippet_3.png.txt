@@ -1,0 +1,4 @@
+Provider Health
+Groq       Connected
+OpenAI     Missing Key
+Last Check 19:35

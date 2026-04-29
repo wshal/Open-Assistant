@@ -1,0 +1,4 @@
+capture:
+  screen:
+    interval_ms: 250
+    smart_crop: true

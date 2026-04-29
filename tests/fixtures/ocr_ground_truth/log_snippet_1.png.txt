@@ -1,0 +1,3 @@
+2026-04-27 19:35:33 INFO Screen capture pipeline ready
+2026-04-27 19:35:33 INFO Windows Native OCR ready
+2026-04-27 19:35:34 INFO Saved report to benchmarks/baseline_ocr.json

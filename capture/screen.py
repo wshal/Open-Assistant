@@ -4,6 +4,7 @@ RESTORED: Dynamic Monitor Selection.
 FIXED: Active region tracking for Smart Crop (Vision Focus).
 """
 
+import asyncio
 import io
 import time
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from capture.ocr import OCREngine
 from utils.logger import setup_logger
 from utils.platform_utils import ProcessUtils
+from utils.telemetry import telemetry
 
 logger = setup_logger(__name__)
 
@@ -118,6 +120,7 @@ class ScreenCapture(QObject):
         )
         while len(states) > max_items and victims:
             states.pop(victims.pop(0), None)
+            telemetry.record_cache_eviction("screen_window_state")
 
     def _sync_active_state(self) -> None:
         states = getattr(self, "_window_states", None)
@@ -211,7 +214,7 @@ class ScreenCapture(QObject):
         self._last_time = now
 
         try:
-            full_img = self._screenshot()
+            full_img = await self._screenshot_async()
             if full_img is None:
                 return None
 
@@ -240,8 +243,7 @@ class ScreenCapture(QObject):
                     )
                     # Q11: Telemetry — track per-window TTL cache hits
                     try:
-                        from utils.telemetry import telemetry as _tel
-                        _tel.record_screen_ocr(0.0)  # 0ms = cache hit, no OCR ran
+                        telemetry.record_screen_ocr(0.0, engine="cache")
                     except Exception:
                         pass
                     self._last_img_hash = curr_hash
@@ -296,8 +298,13 @@ class ScreenCapture(QObject):
                 self._activate_window_state(self._get_window_key())
         except Exception:
             pass
-        img = self._screenshot()
+        img = await self._screenshot_async()
         if img:
+            # Bug 7 fix: update _last_img_hash so the next periodic capture()
+            # can correctly diff against this fresh frame instead of stale state.
+            new_hash = self._dhash(img)
+            if new_hash:
+                self._last_img_hash = new_hash
             text, _ = await self.ocr.extract(img)
             if text:
                 self._last_text = text
@@ -430,79 +437,96 @@ class ScreenCapture(QObject):
         # We want to focus on editors/interviews, not just a single word.
         if (final_box[2] - final_box[0]) > 50 and (final_box[3] - final_box[1]) > 50:
             self._last_crop_box = final_box
+            telemetry.record_roi(
+                final_box[2] - final_box[0],
+                final_box[3] - final_box[1],
+                source="smart_crop_box",
+            )
+
+    async def _screenshot_async(self) -> Optional[Image.Image]:
+        """Run _screenshot() in a thread executor so the async event loop
+        is never blocked during the mss OS-level screen grab (~5-15 ms).
+
+        Phase 2 async tuning: keeping the event loop free during I/O means
+        other coroutines (OCR, AI streaming, audio) remain responsive.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            return await loop.run_in_executor(None, self._screenshot)
+        except Exception as e:
+            logger.debug("Async screenshot error: %s", e)
+            return None
 
     def _screenshot(self) -> Optional[Image.Image]:
-        """Capture a screenshot as a PIL image.
+        """Capture a screenshot as a PIL image (synchronous, runs in thread executor).
 
-        Important: Avoid calling Qt GUI APIs here. This method can be executed from
-        the background asyncio thread (e.g., Analyze Screen), and Qt widgets are
-        not thread-safe. We instead select the monitor by cursor position.
+        Uses get_active_client_rect() (Phase 2) which strips the DWM shadow
+        border and title bar, giving OCR only the true content pixels.
+        Avoid calling Qt GUI APIs here — this runs off the main thread.
         """
         try:
-            sct = mss.mss()
-            
-            # Phase B1: True ROI - Attempt to capture ONLY the active window.
-            # This massively reduces memory allocation and image conversion overhead.
-            active_rect = ProcessUtils.get_active_window_rect()
-            if active_rect:
-                x, y, w, h = active_rect
-                
-                # We still need to find the right monitor to ensure we don't grab 
-                # weird out-of-bounds phantom pixels if a window is dragged off-screen.
+            # Bug 3 fix: use context manager so OS handles are always released
+            with mss.mss() as sct:
+                # Phase 2 ROI: use client rect to exclude window chrome
+                # (title bar ~30px, DWM shadow ~8px per side).
+                # Falls back to outer window rect if DWM API is unavailable.
+                active_rect = ProcessUtils.get_active_client_rect()
+                if active_rect:
+                    x, y, w, h = active_rect
+
+                    screen_width, screen_height = ProcessUtils.get_primary_screen_size()
+
+                    # Sanitize the window rect to clamp it within the primary display bounding box
+                    x = max(0, x)
+                    y = max(0, y)
+                    w = min(w, screen_width - x)
+                    h = min(h, screen_height - y)
+
+                    # Only use the ROI if it's a valid size (e.g. greater than 50x50)
+                    if w > 50 and h > 50:
+                        bbox = {"top": y, "left": x, "width": w, "height": h}
+                        telemetry.record_roi(w, h, source="active_window")
+                        sct_img = sct.grab(bbox)
+                        img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                        return img
+
+                # Fallback: Capture the entire screen containing the cursor
                 monitors = getattr(sct, "monitors", []) or []
-                screen_width, screen_height = ProcessUtils.get_primary_screen_size()
-                
-                # Sanitize the window rect to clamp it within the primary display bounding box
-                # (Assuming primary display for now, a multi-monitor robust implementation 
-                # would intersect with all monitor bounds).
-                x = max(0, x)
-                y = max(0, y)
-                w = min(w, screen_width - x)
-                h = min(h, screen_height - y)
-                
-                # Only use the ROI if it's a valid size (e.g. greater than 50x50)
-                if w > 50 and h > 50:
-                    bbox = {"top": y, "left": x, "width": w, "height": h}
-                    sct_img = sct.grab(bbox)
-                    img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-                    return img
+                if len(monitors) < 2:
+                    target_monitor = monitors[0] if monitors else None
+                else:
+                    target_monitor = monitors[1]  # fallback: primary
 
-            # Fallback: Capture the entire screen containing the cursor
-            monitors = getattr(sct, "monitors", []) or []
-            if len(monitors) < 2:
-                target_monitor = monitors[0] if monitors else None
-            else:
-                target_monitor = monitors[1]  # fallback: primary
+                try:
+                    class _POINT(ctypes.Structure):
+                        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
-            try:
-                class _POINT(ctypes.Structure):
-                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+                    pt = _POINT()
+                    if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+                        cx, cy = int(pt.x), int(pt.y)
+                        for m in monitors[1:]:
+                            left, top = int(m.get("left", 0)), int(m.get("top", 0))
+                            width, height = int(m.get("width", 0)), int(m.get("height", 0))
+                            if left <= cx < (left + width) and top <= cy < (top + height):
+                                target_monitor = m
+                                break
+                except Exception:
+                    pass
 
-                pt = _POINT()
-                if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
-                    cx, cy = int(pt.x), int(pt.y)
-                    for m in monitors[1:]:
-                        left, top = int(m.get("left", 0)), int(m.get("top", 0))
-                        width, height = int(m.get("width", 0)), int(m.get("height", 0))
-                        if left <= cx < (left + width) and top <= cy < (top + height):
-                            target_monitor = m
-                            break
-            except Exception:
-                # Cursor-based selection is best-effort; primary fallback remains.
-                pass
+                if not target_monitor:
+                    return None
 
-            if not target_monitor:
-                return None
+                raw = sct.grab(target_monitor)
+                img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+                telemetry.record_roi(img.width, img.height, source="monitor_capture")
 
-            raw = sct.grab(target_monitor)
-            img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+                if img.width > self._max_w:
+                    ratio = self._max_w / img.width
+                    new_h = int(img.height * ratio)
+                    img = img.resize((self._max_w, new_h), Image.LANCZOS)
+                    telemetry.record_roi(img.width, img.height, source="downscaled_capture")
 
-            if img.width > self._max_w:
-                ratio = self._max_w / img.width
-                new_h = int(img.height * ratio)
-                img = img.resize((self._max_w, new_h), Image.LANCZOS)
-
-            return img
+                return img
         except Exception as e:
             logger.debug(f"Screenshot error: {e}")
             return None

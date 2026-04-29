@@ -1,0 +1,4 @@
+Capture Panel
+Screen Interval    250 ms
+Smart Crop         Enabled
+Analyze Now

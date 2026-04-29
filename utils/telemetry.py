@@ -1,22 +1,13 @@
 """
-utils/telemetry.py  --  Q13: Lightweight in-process telemetry counters.
-
-Design goals:
-  - Zero dependencies beyond stdlib (thread-safe via threading.Lock)
-  - No disk I/O in the hot path
-  - Accessible from anywhere via module-level singleton
-
-Usage:
-    from utils.telemetry import telemetry
-    telemetry.record_cache_hit(tier=1)
-    telemetry.record_llm_first_token(ms=340.5)
-    summary = telemetry.summary()          # dict of stats
+Lightweight in-process telemetry counters and histograms.
 """
+
+from __future__ import annotations
 
 import threading
 import time
 from collections import deque
-from typing import Dict, Any
+from typing import Any, Dict
 
 from utils.logger import setup_logger
 
@@ -24,36 +15,32 @@ logger = setup_logger(__name__)
 
 
 class _Histogram:
-    """Rolling-window histogram (last N samples)."""
-
     def __init__(self, maxlen: int = 200):
         self._lock = threading.Lock()
-        self._samples: deque = deque(maxlen=maxlen)
+        self._samples: deque[float] = deque(maxlen=maxlen)
 
     def record(self, value: float) -> None:
         with self._lock:
-            self._samples.append(value)
+            self._samples.append(float(value))
 
     def stats(self) -> Dict[str, float]:
         with self._lock:
             data = list(self._samples)
         if not data:
             return {"count": 0, "mean": 0.0, "p50": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
-        s = sorted(data)
-        n = len(s)
+        data.sort()
+        n = len(data)
         return {
             "count": n,
-            "mean": round(sum(s) / n, 1),
-            "p50": round(s[int(n * 0.50)], 1),
-            "p90": round(s[int(n * 0.90)], 1),
-            "min": round(s[0], 1),
-            "max": round(s[-1], 1),
+            "mean": round(sum(data) / n, 1),
+            "p50": round(data[min(n - 1, int(n * 0.50))], 1),
+            "p90": round(data[min(n - 1, int(n * 0.90))], 1),
+            "min": round(data[0], 1),
+            "max": round(data[-1], 1),
         }
 
 
 class _Counter:
-    """Thread-safe integer counter."""
-
     def __init__(self):
         self._lock = threading.Lock()
         self._value = 0
@@ -68,75 +55,110 @@ class _Counter:
             return self._value
 
 
-class Telemetry:
-    """
-    Central telemetry store for OpenAssist.
-
-    Tracks:
-      - cache_hits[tier]  (int counters, tier = 1..4)
-      - cache_misses      (int counter)
-      - llm_first_token   (histogram, ms)
-      - total_latency     (histogram, ms)
-      - screen_ocr        (histogram, ms)
-      - asr               (histogram, ms)
-    """
-
+class _NamedCounters:
     def __init__(self):
         self._lock = threading.Lock()
-        self._start_time = time.time()
+        self._values: Dict[str, int] = {}
 
-        # Cache counters
+    def increment(self, key: str, by: int = 1) -> None:
+        with self._lock:
+            self._values[key] = self._values.get(key, 0) + by
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._values)
+
+
+class Telemetry:
+    def __init__(self):
+        self._start_time = time.time()
+        # Persistent lock for cer_by_engine dict mutations (Bug 1 fix)
+        self._cer_lock = threading.Lock()
+
         self.cache_hits: Dict[int, _Counter] = {1: _Counter(), 2: _Counter(), 3: _Counter(), 4: _Counter()}
         self.cache_misses = _Counter()
         self.clipboard_context_uses = _Counter()
 
-        # Latency histograms (all values in ms)
         self.llm_first_token = _Histogram()
         self.total_latency = _Histogram()
         self.screen_ocr = _Histogram()
+        self.ocr_cer = _Histogram()
+        self.ocr_cer_by_engine: Dict[str, _Histogram] = {}
         self.asr = _Histogram()
+        self.roi_width = _Histogram()
+        self.roi_height = _Histogram()
+        self.roi_area = _Histogram()
 
-        logger.info("[Q13 Telemetry] Telemetry module initialised")
+        self.ocr_backend_success = _NamedCounters()
+        self.ocr_backend_fallback_success = _NamedCounters()
+        self.ocr_backend_failures = _NamedCounters()
+        self.roi_sources = _NamedCounters()
+        self.cache_evictions = _NamedCounters()
 
-    # ── Recording helpers ─────────────────────────────────────────────────────
+        logger.info("[Telemetry] module initialised")
 
     def record_cache_hit(self, tier: int) -> None:
-        """Call when a cache lookup succeeds at a specific tier (1–4)."""
         if tier in self.cache_hits:
             self.cache_hits[tier].increment()
-            logger.debug("[Q13 Telemetry] cache_hit tier=%d (total=%d)", tier, self.cache_hits[tier].value)
 
     def record_cache_miss(self) -> None:
         self.cache_misses.increment()
-        logger.debug("[Q13 Telemetry] cache_miss (total=%d)", self.cache_misses.value)
 
     def record_llm_first_token(self, ms: float) -> None:
         self.llm_first_token.record(ms)
-        logger.debug("[Q13 Telemetry] llm_first_token=%.0fms", ms)
 
     def record_total_latency(self, ms: float) -> None:
         self.total_latency.record(ms)
-        logger.debug("[Q13 Telemetry] total_latency=%.0fms", ms)
 
-    def record_screen_ocr(self, ms: float) -> None:
+    def record_screen_ocr(self, ms: float, engine: str = "") -> None:
         self.screen_ocr.record(ms)
-        logger.debug("[Q13 Telemetry] screen_ocr=%.0fms", ms)
+        if engine:
+            logger.debug("[Telemetry] screen_ocr %.1fms engine=%s", ms, engine)
+
+    def record_ocr_cer(self, cer: float, engine: str = "") -> None:
+        """Record OCR character error rate for a run."""
+        self.ocr_cer.record(cer)
+        if engine:
+            engine_key = str(engine).lower()
+            with self._cer_lock:  # Bug 1 fix: use persistent instance lock
+                if engine_key not in self.ocr_cer_by_engine:
+                    self.ocr_cer_by_engine[engine_key] = _Histogram()
+                self.ocr_cer_by_engine[engine_key].record(cer)
 
     def record_asr(self, ms: float) -> None:
         self.asr.record(ms)
-        logger.debug("[Q13 Telemetry] asr=%.0fms", ms)
 
     def record_clipboard_use(self) -> None:
         self.clipboard_context_uses.increment()
-        logger.info("[Q13 Telemetry] clipboard_context_use #%d", self.clipboard_context_uses.value)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    def record_ocr_backend(self, engine: str, outcome: str = "success") -> None:
+        engine = str(engine or "unknown")
+        if outcome == "success":
+            self.ocr_backend_success.increment(engine)
+        elif outcome == "fallback_success":
+            self.ocr_backend_fallback_success.increment(engine)
+        else:
+            self.ocr_backend_failures.increment(engine)
+
+    def record_roi(self, width: int, height: int, source: str = "unknown") -> None:
+        width = max(0, int(width))
+        height = max(0, int(height))
+        self.roi_width.record(width)
+        self.roi_height.record(height)
+        self.roi_area.record(width * height)
+        self.roi_sources.increment(str(source or "unknown"))
+
+    def record_cache_eviction(self, namespace: str) -> None:
+        self.cache_evictions.increment(str(namespace or "unknown"))
 
     def summary(self) -> Dict[str, Any]:
-        """Return a dict snapshot of all metrics."""
-        total_hits = sum(c.value for c in self.cache_hits.values())
+        total_hits = sum(counter.value for counter in self.cache_hits.values())
         total_requests = total_hits + self.cache_misses.value
         hit_rate = round(total_hits / total_requests * 100, 1) if total_requests else 0.0
+
+        ocr_cer_by_engine_stats = {}
+        for engine, hist in self.ocr_cer_by_engine.items():
+            ocr_cer_by_engine_stats[engine] = hist.stats()
 
         return {
             "uptime_s": round(time.time() - self._start_time, 0),
@@ -147,6 +169,7 @@ class Telemetry:
                 "hits_t4": self.cache_hits[4].value,
                 "misses": self.cache_misses.value,
                 "hit_rate_pct": hit_rate,
+                "evictions": self.cache_evictions.snapshot(),
             },
             "latency_ms": {
                 "llm_first_token": self.llm_first_token.stats(),
@@ -154,27 +177,31 @@ class Telemetry:
                 "screen_ocr": self.screen_ocr.stats(),
                 "asr": self.asr.stats(),
             },
+            "ocr": {
+                "cer": self.ocr_cer.stats(),
+                "cer_by_engine": ocr_cer_by_engine_stats,
+                "backend_success": self.ocr_backend_success.snapshot(),
+                "backend_fallback_success": self.ocr_backend_fallback_success.snapshot(),
+                "backend_failures": self.ocr_backend_failures.snapshot(),
+            },
+            "roi": {
+                "width": self.roi_width.stats(),
+                "height": self.roi_height.stats(),
+                "area": self.roi_area.stats(),
+                "sources": self.roi_sources.snapshot(),
+            },
             "clipboard_context_uses": self.clipboard_context_uses.value,
         }
 
     def log_summary(self) -> None:
-        """Log a human-readable summary at INFO level."""
-        s = self.summary()
-        c = s["cache"]
+        summary = self.summary()
         logger.info(
-            "[Q13 Telemetry] Session summary | uptime=%.0fs | "
-            "cache_hits T1=%d T2=%d T3=%d T4=%d misses=%d hit_rate=%.1f%% | "
-            "llm_first_token p50=%.0fms p90=%.0fms | "
-            "total p50=%.0fms p90=%.0fms | clipboard_uses=%d",
-            s["uptime_s"],
-            c["hits_t1"], c["hits_t2"], c["hits_t3"], c["hits_t4"], c["misses"], c["hit_rate_pct"],
-            s["latency_ms"]["llm_first_token"]["p50"],
-            s["latency_ms"]["llm_first_token"]["p90"],
-            s["latency_ms"]["total"]["p50"],
-            s["latency_ms"]["total"]["p90"],
-            s["clipboard_context_uses"],
+            "[Telemetry] uptime=%ss hit_rate=%.1f%% screen_ocr_p50=%.0fms roi_samples=%d",
+            summary["uptime_s"],
+            summary["cache"]["hit_rate_pct"],
+            summary["latency_ms"]["screen_ocr"]["p50"],
+            summary["roi"]["width"]["count"],
         )
 
 
-# ── Module-level singleton ────────────────────────────────────────────────────
 telemetry = Telemetry()

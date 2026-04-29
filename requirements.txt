@@ -13,9 +13,15 @@ Pillow>=10.0.0
 mss>=9.0.0
 
 # -- OCR ----------------------------------------------------------------
-# EasyOCR - cross-platform OCR (recommended for Python 3.14)
+# Windows Native OCR (Primary Engine)
+winrt-Windows.Media.Ocr>=3.2.0
+winrt-Windows.Graphics.Imaging>=3.2.0
+winrt-Windows.Globalization>=3.2.0
+
+# EasyOCR - cross-platform OCR (fallback for Python 3.14/Linux)
 easyocr>=1.7.0
-# rapidocr_onnxruntime may not work with Python 3.14
+# RapidOCR - ONNX fallback for code-heavy captures without full Paddle install
+rapidocr_onnxruntime>=1.4.4
 
 # -- Audio & Speech-to-Text --------------------------------------------
 sounddevice>=0.4.0

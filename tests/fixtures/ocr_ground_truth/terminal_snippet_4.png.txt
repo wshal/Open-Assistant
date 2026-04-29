@@ -1,0 +1,3 @@
+[INFO] OCR engine ready: winrt
+[DEBUG] capture latency p50=8.2ms p95=38.2ms
+[WARN] ui_snippet_1 CER=0.632

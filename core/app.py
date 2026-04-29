@@ -1621,6 +1621,12 @@ class OpenAssistApp(QObject):
     async def _continuous_capture_loop(self):
         """Asynchronous vision loop: periodically updates screen context for the Nexus."""
         logger.info("👁️ Continuous Vision Loop Started.")
+        
+        # Phase 2 async tuning: use a wall-clock ticker so that OCR extraction time
+        # doesn't drift the capture interval.
+        interval = self.config.get("capture.screen.interval_ms", 3000) / 1000.0
+        next_tick = asyncio.get_event_loop().time()
+
         while self.is_running:
             try:
                 # Screen context remains active during a session even if audio is muted.
@@ -1631,12 +1637,22 @@ class OpenAssistApp(QObject):
                         # self._on_screen_text(text)  # Optional: logic for auto-trigger
                         self.nexus.push("screen", text)
 
-                # Dynamic interval based on performance settings (Default: 3s)
+                # Update interval in case it changed in settings
                 interval = self.config.get("capture.screen.interval_ms", 3000) / 1000.0
-                await asyncio.sleep(interval)
+                next_tick += interval
+                
+                now = asyncio.get_event_loop().time()
+                sleep_time = next_tick - now
+                if sleep_time <= 0:
+                    # We fell behind (e.g. OCR took longer than interval). Skip ticks to catch up.
+                    next_tick = now
+                    sleep_time = 0
+                    
+                await asyncio.sleep(sleep_time)
             except Exception as e:
                 logger.error(f"Vision Loop Error: {e}")
                 await asyncio.sleep(5)
+                next_tick = asyncio.get_event_loop().time()
 
     def _stop_background_tasks(self):
         """Stops all background AI monitoring and capture tasks."""

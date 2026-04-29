@@ -1,0 +1,3 @@
+# Phase 0 Verification
+- Benchmark OCR latency on fixture corpus
+- Record p50 p95 and average CER

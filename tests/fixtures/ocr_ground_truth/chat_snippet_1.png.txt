@@ -1,0 +1,3 @@
+User: complete whats remaining of P0
+Assistant: benchmark runner is now in place
+User: sure lets expand

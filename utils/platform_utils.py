@@ -100,14 +100,21 @@ class ScreenInfo:
 
     @staticmethod
     def get_primary_screen_size() -> Tuple[int, int]:
+        """Get the resolution of the primary screen in a thread-safe manner."""
         try:
-            from PyQt6.QtWidgets import QApplication
-            app = QApplication.instance()
-            if app:
-                screen = app.primaryScreen()
-                if screen:
-                    geo = screen.geometry()
-                    return geo.width(), geo.height()
+            if PlatformInfo.IS_WINDOWS:
+                import ctypes
+                user32 = ctypes.windll.user32
+                # SM_CXSCREEN = 0, SM_CYSCREEN = 1
+                return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+            else:
+                from PyQt6.QtWidgets import QApplication
+                app = QApplication.instance()
+                if app:
+                    screen = app.primaryScreen()
+                    if screen:
+                        geo = screen.geometry()
+                        return geo.width(), geo.height()
         except Exception:
             pass
         return 1920, 1080
@@ -277,15 +284,18 @@ class ProcessUtils:
 
     @staticmethod
     def get_active_window_rect() -> Optional[Tuple[int, int, int, int]]:
-        """Get (x, y, width, height) of the active window."""
+        """Get (x, y, width, height) of the active window *outer* frame.
+
+        Includes title bar, DWM shadow border, and window decorations.
+        Prefer get_active_client_rect() for OCR — it strips the chrome.
+        """
         try:
             if PlatformInfo.IS_WINDOWS:
                 import ctypes
-                from ctypes import wintypes
 
                 class RECT(ctypes.Structure):
                     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+                                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
                 hwnd = ctypes.windll.user32.GetForegroundWindow()
                 rect = RECT()
@@ -308,11 +318,90 @@ class ProcessUtils:
         return None
 
     @staticmethod
+    def get_active_client_rect() -> Optional[Tuple[int, int, int, int]]:
+        """Get (x, y, width, height) of the active window *content* region.
+
+        Phase 2 ROI improvement: strips two sources of chrome that waste OCR pixels
+        and can produce false noise text:
+          1. DWM invisible shadow border  (~8 px each side on Win10/11)
+          2. Title bar / caption height   (~30 px top on a standard window)
+
+        Strategy:
+          - DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS=9) gives the
+            DWM-rendered rect, excluding the invisible shadow padding.
+          - ClientToScreen(hwnd, POINT(0,0)) maps the top-left of the client
+            area to screen coordinates — that is exactly where content starts.
+          - GetClientRect gives the client area (w, h).
+
+        Falls back to get_active_window_rect() on any error so nothing breaks.
+        Non-Windows platforms return the outer window rect (no chrome info).
+        """
+        if not PlatformInfo.IS_WINDOWS:
+            return ProcessUtils.get_active_window_rect()
+
+        try:
+            import ctypes
+
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                             ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+            user32 = ctypes.windll.user32
+            dwmapi = ctypes.windll.dwmapi
+
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return ProcessUtils.get_active_window_rect()
+
+            # Step 1: DWM rendered bounds (strips invisible shadow padding)
+            dwm_rect = RECT()
+            hr = dwmapi.DwmGetWindowAttribute(
+                hwnd, 9, ctypes.byref(dwm_rect), ctypes.sizeof(dwm_rect)
+            )
+            if hr != 0:
+                # DWM unavailable or window opted out — fall back
+                return ProcessUtils.get_active_window_rect()
+
+            # Step 2: Client area dimensions (no title bar, no menu bar)
+            client_rect = RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(client_rect))
+            client_w = client_rect.right  - client_rect.left
+            client_h = client_rect.bottom - client_rect.top
+
+            # Step 3: Map client origin (0,0) → screen to find content start Y
+            origin = POINT(0, 0)
+            user32.ClientToScreen(hwnd, ctypes.byref(origin))
+
+            content_left = int(origin.x)
+            content_top  = int(origin.y)
+
+            # Clamp to DWM visible bounds (handles maximised / borderless windows)
+            content_left = max(content_left, int(dwm_rect.left))
+            content_top  = max(content_top,  int(dwm_rect.top))
+            right_bound  = min(content_left + client_w, int(dwm_rect.right))
+            bottom_bound = min(content_top  + client_h, int(dwm_rect.bottom))
+
+            w = right_bound  - content_left
+            h = bottom_bound - content_top
+
+            if w > 50 and h > 50:
+                return (content_left, content_top, w, h)
+
+            # Degenerate (minimised / unusual window) — fall back
+            return ProcessUtils.get_active_window_rect()
+
+        except Exception as exc:
+            logger.debug("get_active_client_rect fallback: %s", exc)
+            return ProcessUtils.get_active_window_rect()
+
+    @staticmethod
     def is_screen_sharing_active() -> bool:
         """Detect if screen sharing is likely active."""
         try:
             if PlatformInfo.IS_WINDOWS:
-                # Check for common screen sharing processes
                 import psutil
                 sharing_apps = {
                     "zoom.exe", "teams.exe", "slack.exe", "discord.exe",

@@ -73,16 +73,16 @@ QPushButton:hover {{
 
 STYLE_BTN_SECONDARY = """
 QPushButton {{
-    background: rgba(255,255,255,0.05);
+    background: rgba(255,255,255,12);
     color: #94a3b8;
     border-radius: 12px;
     font-weight: 600;
     font-size: 11px;
     padding: 12px 24px;
-    border: 1px solid rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,25);
 }}
 QPushButton:hover {{
-    background: rgba(255,255,255,0.08);
+    background: rgba(255,255,255,20);
     color: white;
 }}
 """
@@ -312,6 +312,7 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
         self.hotkey_inputs = {}
         self.status_labels = {}
         self.provider_detail_labels = {}
+        self.test_buttons = {}          # Q10: populated by _tab_api
         self._test_workers = {}
         self._build()
 
@@ -429,8 +430,8 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet("""
             QTabWidget::pane { border: 1px solid rgba(80, 85, 255, 10); background: transparent; border-radius: 8px; }
-            QTabBar::tab { background: rgba(0,0,0,0.3); color: #778; padding: 10px 20px; font-size: 10px; font-weight: bold; border-top-left-radius: 8px; border-top-right-radius: 8px; margin-right: 2px; }
-            QTabBar::tab:selected { background: rgba(80, 85, 255, 0.08); color: #c0c0ff; border-bottom: 2px solid #6366f1; }
+            QTabBar::tab { background: rgba(0,0,0,76); color: #778; padding: 10px 20px; font-size: 10px; font-weight: bold; border-top-left-radius: 8px; border-top-right-radius: 8px; margin-right: 2px; }
+            QTabBar::tab:selected { background: rgba(80,85,255,20); color: #c0c0ff; border-bottom: 2px solid #6366f1; }
         """)
 
         self.tabs.addTab(self._tab_api(),      "AI ENGINES")
@@ -578,7 +579,7 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
     def _sync_ui_from_config(self):
         """Pull latest config/state values into UI widgets."""
         logger.debug("[Settings] Syncing UI from current config/state...")
-        
+
         # 1. Sync AI Mode
         if hasattr(self, "ai_mode"):
             current_mode = self.config.get("ai.mode", "general")
@@ -593,12 +594,20 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             self.audio_mode.blockSignals(True)
             self.audio_mode.setCurrentIndex(0 if curr == "system" else 1 if curr == "mic" else 2)
             self.audio_mode.blockSignals(False)
-            
-        # 3. Sync API Keys (refresh from secrets in case they changed)
+
+        # 3. Always refresh API key fields from encrypted storage.
+        # Bug fix: previous code only repopulated when the field was empty, so
+        # imported keys or keys saved outside the UI were never shown on re-open.
         for pid, inp in self.api_inputs.items():
-            key = self.config.get_api_key(pid) or ""
-            if key and not inp.text(): # Only if currently empty or we want a full refresh
-                 inp.setText(key)
+            stored_key = self.config.get_api_key(pid) or ""
+            inp.blockSignals(True)
+            inp.setText(stored_key)
+            inp._original_value = stored_key
+            inp.blockSignals(False)
+            # Q10: sync button enabled state with refreshed key
+            btn = self.test_buttons.get(pid)
+            if btn is not None:
+                btn.setEnabled(bool(stored_key))
 
     def _save_all(self):
         try:

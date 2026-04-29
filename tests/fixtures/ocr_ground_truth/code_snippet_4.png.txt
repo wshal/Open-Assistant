@@ -1,0 +1,3 @@
+const status = tasks.every(t => t.done) ? 'ready' : 'pending';
+const visible = tasks.filter(t => !t.archived);
+renderBoard(visible);

@@ -121,9 +121,9 @@ class MiniOverlay(QMainWindow):
         self.type_btn.setToolTip("Type last response into active window")
         self.type_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.type_btn.setStyleSheet(
-            "background: rgba(80,200,120,0.12); color: #4ade80; border: none;"
+            "background: rgba(80,200,120,30); color: #4ade80; border: none;"
             " border-radius: 11px; font-size: 11px;"
-            " QPushButton:hover { background: rgba(80,200,120,0.25); }"
+            " QPushButton:hover { background: rgba(80,200,120,63); }"
         )
         self.type_btn.clicked.connect(self._type_response)
         self.type_btn.setVisible(False)  # only shown once a response exists
@@ -132,7 +132,7 @@ class MiniOverlay(QMainWindow):
         self.expand_btn = QPushButton("▲")
         self.expand_btn.setFixedSize(22, 22)
         self.expand_btn.setStyleSheet(
-            "background: rgba(80,80,255,0.1); color: #8888bb; border: none; border-radius: 11px; font-size: 9px;"
+            "background: rgba(80,80,255,25); color: #8888bb; border: none; border-radius: 11px; font-size: 9px;"
         )
         self.expand_btn.clicked.connect(self._toggle_expand)
         bl.addWidget(self.expand_btn)

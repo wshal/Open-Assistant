@@ -1,0 +1,4 @@
+Settings
+OCR Engine    windows
+Fallback      easyocr -> tesseract
+Save Changes

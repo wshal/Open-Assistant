@@ -61,7 +61,7 @@ class HotkeysTabMixin:
         for action in sorted(hk_labels.keys()):
             row_frame = QFrame()
             row_frame.setStyleSheet(
-                "QFrame { background: rgba(255,255,255,0.02); border-bottom: 1px solid rgba(255,255,255,0.03); }"
+                "QFrame { background: rgba(255,255,255,5); border-bottom: 1px solid rgba(255,255,255,7); }"
             )
             rl = QHBoxLayout(row_frame)
             rl.setContentsMargins(10, 8, 10, 8)
@@ -74,7 +74,7 @@ class HotkeysTabMixin:
             inp.setFixedWidth(140)
             inp.setStyleSheet(
                 SS_INPUT
-                + "QLineEdit { border: none; background: rgba(0,0,0,0.2); text-align: center; }"
+                + "QLineEdit { border: none; background: rgba(0,0,0,51); text-align: center; }"
             )
             inp.setText(keys_cfg.get(action, ""))
             self.hotkey_inputs[action] = inp

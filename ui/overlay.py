@@ -229,7 +229,7 @@ class OverlayWindow(QMainWindow):
                 color: #4ade80; font-size: 14px; background: transparent; border: none; border-radius: 12px;
             }
             QPushButton:hover { 
-                background: rgba(255, 255, 255, 0.05); 
+                background: rgba(255,255,255,12); 
             }
         """)
         self.audio_status.clicked.connect(self.app.toggle_audio)
@@ -245,7 +245,7 @@ class OverlayWindow(QMainWindow):
                 color: #f59e0b; font-size: 12px; background: transparent; border: none; border-radius: 12px;
             }
             QPushButton:hover { 
-                background: rgba(255, 255, 255, 0.05); 
+                background: rgba(255,255,255,12); 
             }
         """)
         self.btn_end_session.clicked.connect(self.app.end_session)
@@ -261,7 +261,7 @@ class OverlayWindow(QMainWindow):
                 color: #818cf8; font-size: 12px; background: transparent; border: none; border-radius: 12px;
             }
             QPushButton:hover { 
-                background: rgba(255, 255, 255, 0.05); 
+                background: rgba(255,255,255,12); 
             }
         """)
         self.btn_history.clicked.connect(self._show_history)
@@ -272,8 +272,8 @@ class OverlayWindow(QMainWindow):
         self.btn_timeline.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_timeline.setFixedSize(24, 24)
         self.btn_timeline.setStyleSheet("""
-            QPushButton { background: rgba(255,255,255,0.05); color: #aaa; border: none; border-radius: 12px; font-size: 13px; }
-            QPushButton:hover { background: rgba(255,255,255,0.10); color: #c0c0ff; }
+            QPushButton { background: rgba(255,255,255,12); color: #aaa; border: none; border-radius: 12px; font-size: 13px; }
+            QPushButton:hover { background: rgba(255,255,255,25); color: #c0c0ff; }
         """)
         self.btn_timeline.clicked.connect(self._show_timeline)
         hl.addWidget(self.btn_timeline)
@@ -341,7 +341,7 @@ class OverlayWindow(QMainWindow):
         self.analysis_badge = QLabel("")
         self.analysis_badge.setVisible(False)
         self.analysis_badge.setStyleSheet(
-            "background: rgba(56,189,248,0.12); color: #7dd3fc; border: 1px solid rgba(56,189,248,0.30); border-radius: 10px; padding: 5px 9px; margin: 0 5px 2px 5px; font-size: 10px; font-weight: 700;"
+            "background: rgba(56,189,248,30); color: #7dd3fc; border: 1px solid rgba(56,189,248,76); border-radius: 10px; padding: 5px 9px; margin: 0 5px 2px 5px; font-size: 10px; font-weight: 700;"
         )
         cv_layout.addWidget(self.analysis_badge)
 
@@ -354,7 +354,7 @@ class OverlayWindow(QMainWindow):
 
         self.input_bar = QFrame()
         self.input_bar.setStyleSheet(
-            "background: rgba(18,20,38,220); border: 1px solid rgba(99,102,241,0.18); border-radius: 14px; margin: 6px 5px 8px 5px;"
+            "background: rgba(18,20,38,220); border: 1px solid rgba(99,102,241,45); border-radius: 14px; margin: 6px 5px 8px 5px;"
         )
         input_layout = QHBoxLayout(self.input_bar)
         input_layout.setContentsMargins(12, 8, 8, 8)
@@ -366,22 +366,22 @@ class OverlayWindow(QMainWindow):
         self.btn_analyze_screen.setToolTip("Capture the current screen and analyze it with live session context")
         self.btn_analyze_screen.setStyleSheet("""
             QPushButton {
-                background: rgba(56, 189, 248, 0.12);
+                background: rgba(56,189,248,30);
                 color: #7dd3fc;
-                border: 1px solid rgba(56, 189, 248, 0.28);
+                border: 1px solid rgba(56,189,248,71);
                 border-radius: 10px;
                 padding: 8px 12px;
                 font-size: 10px;
                 font-weight: 800;
             }
             QPushButton:hover {
-                background: rgba(56, 189, 248, 0.18);
+                background: rgba(56,189,248,45);
                 color: white;
             }
             QPushButton:disabled {
-                background: rgba(56, 189, 248, 0.10);
-                color: rgba(125, 211, 252, 0.72);
-                border: 1px solid rgba(56, 189, 248, 0.18);
+                background: rgba(56,189,248,25);
+                color: rgba(125,211,252,183);
+                border: 1px solid rgba(56,189,248,45);
             }
         """)
         self.btn_analyze_screen.clicked.connect(self._analyze_screen)
@@ -644,8 +644,8 @@ class OverlayWindow(QMainWindow):
             self._error_toast = QLabel(self.container)
             self._error_toast.setWordWrap(True)
             self._error_toast.setStyleSheet(
-                "background: rgba(239,68,68,0.18); color: #ef4444;"
-                " border: 1px solid rgba(239,68,68,0.5); border-radius: 8px;"
+                "background: rgba(239,68,68,45); color: #ef4444;"
+                " border: 1px solid rgba(239,68,68,127); border-radius: 8px;"
                 " padding: 6px 10px; font-size: 10px;"
             )
             self._error_toast.setAlignment(Qt.AlignmentFlag.AlignCenter)

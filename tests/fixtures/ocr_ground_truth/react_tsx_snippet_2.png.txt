@@ -1,0 +1,3 @@
+const [query, setQuery] = useState('');
+const deferredQuery = useDeferredValue(query);
+const filtered = items.filter(item => item.label.includes(deferredQuery));

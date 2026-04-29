@@ -1,0 +1,3 @@
+$ git status --short
+M capture/ocr.py
+?? benchmarks/capture_benchmark.py

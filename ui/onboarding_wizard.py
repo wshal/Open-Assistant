@@ -26,9 +26,9 @@ from core.constants import PROVIDERS
 
 STYLE_CARD = """
     QFrame {
-        background: rgba(255,255,255,0.03);
+        background: rgba(255,255,255,7);
         border-radius: 12px;
-        border: 1px solid rgba(80,85,255,0.1);
+        border: 1px solid rgba(80,85,255,25);
         padding: 20px;
     }
 """
@@ -51,16 +51,16 @@ STYLE_BTN_PRIMARY = """
 
 STYLE_BTN_SECONDARY = """
     QPushButton {
-        background: rgba(255,255,255,0.05);
+        background: rgba(255,255,255,12);
         color: #94a3b8;
         border-radius: 12px;
         font-weight: 600;
         font-size: 11px;
         padding: 12px 24px;
-        border: 1px solid rgba(255,255,255,0.1);
+        border: 1px solid rgba(255,255,255,25);
     }
     QPushButton:hover {
-        background: rgba(255,255,255,0.08);
+        background: rgba(255,255,255,20);
         color: white;
     }
 """
@@ -80,9 +80,9 @@ STYLE_BTN_SKIP = """
 
 STYLE_INPUT = """
     QLineEdit, QComboBox {
-        background: rgba(0,0,0,0.3);
+        background: rgba(0,0,0,76);
         color: #e2e8f0;
-        border: 1px solid rgba(255,255,255,0.1);
+        border: 1px solid rgba(255,255,255,25);
         border-radius: 8px;
         padding: 12px;
         font-size: 12px;
@@ -170,7 +170,7 @@ class OnboardingWizard(QWidget):
         self.progress.setTextVisible(False)
         self.progress.setFixedHeight(4)
         self.progress.setStyleSheet("""
-            QProgressBar { background: rgba(255,255,255,0.05); border-radius: 2px; border: none; }
+            QProgressBar { background: rgba(255,255,255,12); border-radius: 2px; border: none; }
             QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #4f46e5, stop:1 #7c3aed); border-radius: 2px; }
         """)
         layout.addWidget(self.progress)
@@ -408,14 +408,14 @@ class OnboardingWizard(QWidget):
                 color: #bae6fd;
                 font-size: 10px;
                 font-weight: 700;
-                background: rgba(56, 189, 248, 0.12);
-                border: 1px solid rgba(56, 189, 248, 0.28);
+                background: rgba(56,189,248,30);
+                border: 1px solid rgba(56,189,248,71);
                 border-radius: 10px;
                 padding: 4px 10px;
             }
             QLabel:hover {
-                background: rgba(56, 189, 248, 0.18);
-                border: 1px solid rgba(125, 211, 252, 0.5);
+                background: rgba(56,189,248,45);
+                border: 1px solid rgba(125,211,252,127);
             }
             """
         )
@@ -583,7 +583,7 @@ class OnboardingWizard(QWidget):
 
         # Advanced Summary Dashboard
         dash = QFrame()
-        dash.setStyleSheet("background: rgba(255,255,255,0.03); border-radius: 12px; border: 1px solid rgba(255,255,255,0.05);")
+        dash.setStyleSheet("background: rgba(255,255,255,7); border-radius: 12px; border: 1px solid rgba(255,255,255,12);")
         dl = QVBoxLayout(dash)
         dl.setContentsMargins(20, 20, 20, 20)
         dl.setSpacing(12)
@@ -603,7 +603,7 @@ class OnboardingWizard(QWidget):
             row.addStretch()
             
             status = QLabel("ACTIVE")
-            status.setStyleSheet("color: #10b981; font-size: 9px; font-weight: 800; background: rgba(16,185,129,0.1); padding: 2px 6px; border-radius: 4px;")
+            status.setStyleSheet("color: #10b981; font-size: 9px; font-weight: 800; background: rgba(16,185,129,25); padding: 2px 6px; border-radius: 4px;")
             row.addWidget(status)
             return row
 

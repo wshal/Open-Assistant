@@ -1,0 +1,3 @@
+def compute_total(items):
+    subtotal = sum(price for price in items)
+    return round(subtotal * 1.18, 2)

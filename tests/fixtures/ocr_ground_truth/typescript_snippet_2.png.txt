@@ -1,0 +1,3 @@
+interface ProviderState { id: string; connected: boolean; lastCheckedAt?: string; }
+const ready = providers.every((provider: ProviderState) => provider.connected);
+setBanner(ready ? 'All providers healthy' : 'Action required');

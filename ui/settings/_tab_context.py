@@ -49,7 +49,7 @@ class ContextTabMixin:
 
         sep = QFrame()
         sep.setFixedHeight(1)
-        sep.setStyleSheet("background: rgba(255,255,255,0.05);")
+        sep.setStyleSheet("background: rgba(255,255,255,12);")
         l.addWidget(sep)
 
         # Presets row
@@ -70,9 +70,9 @@ class ContextTabMixin:
         load_btn.setFixedHeight(32)
         load_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         load_btn.setStyleSheet(
-            "QPushButton { background: rgba(80,85,255,0.18); color: #c0c0ff; border-radius: 6px; "
-            "font-size: 10px; font-weight: 800; border: 1px solid rgba(129,140,248,0.4); padding: 0 10px; }"
-            "QPushButton:hover { background: rgba(80,85,255,0.3); color: white; }"
+            "QPushButton { background: rgba(80,85,255,45); color: #c0c0ff; border-radius: 6px; "
+            "font-size: 10px; font-weight: 800; border: 1px solid rgba(129,140,248,102); padding: 0 10px; }"
+            "QPushButton:hover { background: rgba(80,85,255,76); color: white; }"
         )
         load_btn.clicked.connect(self._load_ctx_preset)
         preset_row.addWidget(load_btn)
@@ -130,9 +130,9 @@ class ContextTabMixin:
         save_preset_btn.setFixedHeight(34)
         save_preset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         save_preset_btn.setStyleSheet(
-            "QPushButton { background: rgba(16,185,129,0.15); color: #6ee7b7; border-radius: 6px; "
-            "font-size: 10px; font-weight: 800; border: 1px solid rgba(52,211,153,0.3); padding: 0 12px; }"
-            "QPushButton:hover { background: rgba(16,185,129,0.25); color: white; }"
+            "QPushButton { background: rgba(16,185,129,38); color: #6ee7b7; border-radius: 6px; "
+            "font-size: 10px; font-weight: 800; border: 1px solid rgba(52,211,153,76); padding: 0 12px; }"
+            "QPushButton:hover { background: rgba(16,185,129,63); color: white; }"
         )
         save_preset_btn.clicked.connect(self._save_ctx_as_preset)
         btn_row.addWidget(save_preset_btn)
@@ -141,9 +141,9 @@ class ContextTabMixin:
         del_preset_btn.setFixedHeight(34)
         del_preset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         del_preset_btn.setStyleSheet(
-            "QPushButton { background: rgba(220,38,38,0.12); color: #fca5a5; border-radius: 6px; "
-            "font-size: 10px; font-weight: 800; border: 1px solid rgba(248,113,113,0.28); padding: 0 12px; }"
-            "QPushButton:hover { background: rgba(220,38,38,0.22); color: white; }"
+            "QPushButton { background: rgba(220,38,38,30); color: #fca5a5; border-radius: 6px; "
+            "font-size: 10px; font-weight: 800; border: 1px solid rgba(248,113,113,71); padding: 0 12px; }"
+            "QPushButton:hover { background: rgba(220,38,38,56); color: white; }"
         )
         del_preset_btn.clicked.connect(self._delete_ctx_preset)
         btn_row.addWidget(del_preset_btn)
@@ -152,9 +152,9 @@ class ContextTabMixin:
         clear_btn.setFixedHeight(34)
         clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         clear_btn.setStyleSheet(
-            "QPushButton { background: rgba(255,255,255,0.04); color: #64748b; border-radius: 6px; "
-            "font-size: 10px; font-weight: 700; border: 1px solid rgba(255,255,255,0.08); padding: 0 12px; }"
-            "QPushButton:hover { color: #94a3b8; background: rgba(255,255,255,0.07); }"
+            "QPushButton { background: rgba(255,255,255,10); color: #64748b; border-radius: 6px; "
+            "font-size: 10px; font-weight: 700; border: 1px solid rgba(255,255,255,20); padding: 0 12px; }"
+            "QPushButton:hover { color: #94a3b8; background: rgba(255,255,255,17); }"
         )
         clear_btn.clicked.connect(lambda: self._ctx_edit.clear())
         btn_row.addWidget(clear_btn)

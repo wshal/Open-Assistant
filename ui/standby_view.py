@@ -102,9 +102,9 @@ class StandbyView(QWidget):
             border: 1px solid rgba(255, 255, 255, 40);
         }
         QPushButton:disabled {
-            background: rgba(255, 255, 255, 0.03);
-            color: rgba(255, 255, 255, 0.10);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            background: rgba(255, 255, 255, 8);
+            color: rgba(255, 255, 255, 25);
+            border: 1px solid rgba(255, 255, 255, 13);
         }
     """
 
@@ -130,9 +130,9 @@ class StandbyView(QWidget):
             border: 1px solid rgba(255, 255, 255, 40);
         }
         QPushButton:disabled {
-            background: rgba(255, 255, 255, 0.03);
-            color: rgba(255, 255, 255, 0.10);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            background: rgba(255, 255, 255, 8);
+            color: rgba(255, 255, 255, 25);
+            border: 1px solid rgba(255, 255, 255, 13);
         }
     """
 
@@ -321,8 +321,8 @@ class StandbyView(QWidget):
         self._update_badge = QLabel()
         self._update_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._update_badge.setStyleSheet(
-            "background: rgba(251,191,36,0.15); color: #fbbf24;"
-            " border: 1px solid rgba(251,191,36,0.4); border-radius: 10px;"
+            "background: rgba(251,191,36,38); color: #fbbf24;"
+            " border: 1px solid rgba(251,191,36,102); border-radius: 10px;"
             " font-size: 9px; font-weight: 800; padding: 3px 10px;"
         )
         self._update_badge.setText("⬆ UPDATE AVAILABLE — github.com/OpenAssist")
@@ -346,7 +346,7 @@ class StandbyView(QWidget):
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setStyleSheet("""
             QProgressBar {
-                background: rgba(255, 255, 255, 0.03);
+                background: rgba(255,255,255,7);
                 border-radius: 2px;
                 border: none;
             }
@@ -382,7 +382,7 @@ class StandbyView(QWidget):
     def _divider() -> QFrame:
         line = QFrame()
         line.setFixedHeight(1)
-        line.setStyleSheet("background: rgba(255, 255, 255, 0.04);")
+        line.setStyleSheet("background: rgba(255,255,255,10);")
         return line
 
     def _check_for_update(self):
@@ -513,7 +513,7 @@ class StandbyView(QWidget):
                 badge = QLabel("LOCAL ONLY")
                 badge.setStyleSheet(
                     "color: #fbbf24; font-size: 8px; font-weight: 900;"
-                    " background: rgba(251,191,36,0.10); border: 1px solid rgba(251,191,36,0.35);"
+                    " background: rgba(251,191,36,25); border: 1px solid rgba(251,191,36,89);"
                     " border-radius: 9px; padding: 2px 7px;"
                 )
                 badge.setToolTip(
@@ -571,7 +571,7 @@ class StandbyView(QWidget):
             if selected:
                 badge.setStyleSheet(
                     f"color: {color}; font-size: 8px; font-weight: 900; "
-                    "background: rgba(255,255,255,0.05); "
+                    "background: rgba(255,255,255,12); "
                     f"border: 1px solid {color}30; border-radius: 9px; padding: 2px 7px;"
                 )
             else:
@@ -630,8 +630,8 @@ class StandbyView(QWidget):
             self._ctx_chip.setText(f"✓ Context: {preset_name}")
             self._ctx_chip.setStyleSheet(
                 "color: #4ade80; font-size: 8px; font-weight: 800; "
-                "background: rgba(74,222,128,0.08); "
-                "border: 1px solid rgba(74,222,128,0.25); border-radius: 8px; "
+                "background: rgba(74,222,128,20); "
+                "border: 1px solid rgba(74,222,128,63); border-radius: 8px; "
                 "padding: 1px 10px;"
             )
         else:
@@ -639,8 +639,8 @@ class StandbyView(QWidget):
             self._ctx_chip.setText(f"⚡ Suggested: {preset_name} (Settings › CONTEXT)")
             self._ctx_chip.setStyleSheet(
                 "color: #f59e0b; font-size: 8px; font-weight: 700; "
-                "background: rgba(245,158,11,0.07); "
-                "border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; "
+                "background: rgba(245,158,11,17); "
+                "border: 1px solid rgba(245,158,11,51); border-radius: 8px; "
                 "padding: 1px 10px;"
             )
         self._ctx_chip.show()

@@ -1,0 +1,3 @@
+$ npm run build
+dist/assets/index-9a3c1f.js   182.14 kB | gzip: 58.22 kB
+dist/assets/index-3af81c.css   21.31 kB | gzip: 4.93 kB

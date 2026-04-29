@@ -1,0 +1,3 @@
+Traceback (most recent call last):
+  File "core/app.py", line 905, in _analyze_screen_async
+RuntimeError: vision budget exceeded

@@ -1,0 +1,3 @@
+const grouped = messages.reduce((acc, message) => {
+  acc[message.role] = [...(acc[message.role] || []), message];
+  return acc;

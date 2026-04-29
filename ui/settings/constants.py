@@ -36,16 +36,16 @@ QPushButton:hover {
 
 STYLE_BTN_SECONDARY = """
 QPushButton {
-    background: rgba(255,255,255,0.05);
+    background: rgba(255,255,255,12);
     color: #94a3b8;
     border-radius: 12px;
     font-weight: 600;
     font-size: 11px;
     padding: 12px 24px;
-    border: 1px solid rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,25);
 }
 QPushButton:hover {
-    background: rgba(255,255,255,0.08);
+    background: rgba(255,255,255,20);
     color: white;
 }
 """

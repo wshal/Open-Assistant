@@ -1,0 +1,3 @@
+Implementation Notes
+Windows OCR is fast but code accuracy varies.
+Fallback engines protect against regressions.

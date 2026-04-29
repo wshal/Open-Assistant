@@ -1,0 +1,5 @@
+PS C:\Users\User> npm run build
+> vite build
+
+building for production...
+✓ 34 modules transformed.

@@ -93,6 +93,92 @@ class SecureStorage:
             if k.startswith("api_key_") and v
         }
 
+    def export_keys(self) -> bytes:
+        """Export all API keys as an encrypted blob (machine-locked, for local backup)."""
+        keys = self.get_all_keys()
+        plaintext = json.dumps(keys).encode("utf-8")
+        return self._fernet.encrypt(plaintext)
+
+    def import_keys(self, data: bytes) -> int:
+        """Import API keys from a machine-locked encrypted blob. Returns count imported."""
+        try:
+            plaintext = self._fernet.decrypt(data)
+            keys = json.loads(plaintext.decode("utf-8"))
+        except Exception as e:
+            logger.error("Failed to import keys: %s", e)
+            return 0
+        if not isinstance(keys, dict):
+            return 0
+        count = 0
+        for pid, key in keys.items():
+            if isinstance(key, str) and key.strip():
+                self.set_api_key(pid, key)
+                count += 1
+        return count
+
+    # ── Portable (password-based) export/import ─────────────────────────────
+    # These produce .enc files that can be transferred between machines or
+    # installations (Python script or compiled .exe) as long as the user
+    # supplies the same password. The file format is:
+    #   [16-byte random salt] + [Fernet-AES128 encrypted JSON payload]
+
+    EXPORT_MAGIC = b"OAKEYS1"
+    EXPORT_ITERATIONS = 480_000  # OWASP 2023 PBKDF2-SHA256 minimum
+
+    @classmethod
+    def _fernet_from_password(cls, password: str, salt: bytes) -> "Fernet":
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=cls.EXPORT_ITERATIONS,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode("utf-8")))
+        return Fernet(key)
+
+    def export_keys_portable(self, password: str) -> bytes:
+        """Export all API keys as a password-encrypted blob portable across machines.
+
+        Format: magic(7) + salt(16) + fernet_ciphertext
+        """
+        import os as _os
+        keys = self.get_all_keys()
+        plaintext = json.dumps(keys).encode("utf-8")
+        salt = _os.urandom(16)
+        fernet = self._fernet_from_password(password, salt)
+        ciphertext = fernet.encrypt(plaintext)
+        return self.EXPORT_MAGIC + salt + ciphertext
+
+    def import_keys_portable(self, data: bytes, password: str) -> int:
+        """Import API keys from a portable password-encrypted blob.
+
+        Returns the number of keys successfully imported, or raises ValueError
+        on bad magic/password.
+        """
+        if not data.startswith(self.EXPORT_MAGIC):
+            raise ValueError("Not a valid OpenAssist key backup (wrong file format).")
+        payload = data[len(self.EXPORT_MAGIC):]
+        if len(payload) < 17:
+            raise ValueError("Backup file is too short / corrupt.")
+        salt, ciphertext = payload[:16], payload[16:]
+        fernet = self._fernet_from_password(password, salt)
+        try:
+            plaintext = fernet.decrypt(ciphertext)
+        except Exception:
+            raise ValueError("Wrong password or corrupted backup file.")
+        try:
+            keys = json.loads(plaintext.decode("utf-8"))
+        except Exception:
+            raise ValueError("Backup payload is not valid JSON.")
+        if not isinstance(keys, dict):
+            raise ValueError("Invalid backup format (expected a JSON object).")
+        count = 0
+        for pid, key in keys.items():
+            if isinstance(key, str) and key.strip():
+                self.set_api_key(pid, key)
+                count += 1
+        return count
+
     def clear_all(self):
         self._data.clear()
         self._save()

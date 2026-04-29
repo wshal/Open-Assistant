@@ -64,10 +64,10 @@ class HistoryFeedView(QWidget):
         # P2.5: Export button (per session)
         self.export_btn = QPushButton("⬇ Export MD")
         self.export_btn.setStyleSheet("""
-            QPushButton { background: rgba(99,102,241,0.18); color: #a5b4fc;
-                border: 1px solid rgba(99,102,241,0.3); border-radius: 6px;
+            QPushButton { background: rgba(99,102,241,45); color: #a5b4fc;
+                border: 1px solid rgba(99,102,241,76); border-radius: 6px;
                 padding: 3px 10px; font-size: 10px; font-weight: 700; }
-            QPushButton:hover { background: rgba(99,102,241,0.35); color: white; }
+            QPushButton:hover { background: rgba(99,102,241,89); color: white; }
         """)
         self.export_btn.clicked.connect(self._export_current_session)
         self.export_btn.hide()
@@ -294,7 +294,7 @@ class HistoryFeedView(QWidget):
         strip = QLabel("  ".join(sources))
         strip.setStyleSheet(
             "color: #475569; font-size: 9px; font-weight: 700;"
-            " background: rgba(255,255,255,0.02); border-radius: 4px; padding: 2px 6px;"
+            " background: rgba(255,255,255,5); border-radius: 4px; padding: 2px 6px;"
         )
         return strip
 
@@ -351,7 +351,7 @@ class HistoryFeedView(QWidget):
             q = QLabel(f"Prompt: {prompt}")
             q.setWordWrap(True)
             q.setStyleSheet(
-                "background: rgba(56,189,248,0.10); color: #a5f3fc; padding: 8px; border-radius: 6px; font-size: 11px;"
+                "background: rgba(56,189,248,25); color: #a5f3fc; padding: 8px; border-radius: 6px; font-size: 11px;"
             )
             layout.addWidget(q)
 

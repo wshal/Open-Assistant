@@ -50,23 +50,40 @@ def init_providers(config) -> dict:
     validate = config.get("ai.providers.validate_on_init", False)
     timeout = config.get("ai.providers.health_check_timeout", 5)
 
+    # First, instantiate all configured providers
     for name, factory in candidates.items():
         try:
             prov = factory()
-            if prov.enabled and validate and _is_health_check_custom(prov):
-                try:
-                    ok = asyncio.run(asyncio.wait_for(prov.health_check(), timeout=timeout))
-                    if not ok:
-                        prov.enabled = False
-                        logger.warning(f"  x {name} failed health check")
-                except Exception as exc:
-                    prov.enabled = False
-                    logger.warning(f"  x {name} health check failed: {exc}")
-
             if prov.enabled:
                 providers[name] = prov
         except Exception as exc:
             logger.warning(f"  x {name} failed to load: {exc}")
+
+    # If validation is enabled, run all health checks concurrently to prevent massive startup delays
+    if validate and providers:
+        async def _check_provider(name, prov):
+            if not _is_health_check_custom(prov):
+                return
+            try:
+                ok = await asyncio.wait_for(prov.health_check(), timeout=timeout)
+                if not ok:
+                    prov.enabled = False
+                    logger.warning(f"  x {name} failed health check")
+            except Exception as exc:
+                prov.enabled = False
+                logger.warning(f"  x {name} health check failed: {exc}")
+
+        async def _run_all_checks():
+            tasks = [_check_provider(name, prov) for name, prov in providers.items()]
+            await asyncio.gather(*tasks)
+
+        try:
+            asyncio.run(_run_all_checks())
+        except Exception as e:
+            logger.error(f"Provider health check batch failed: {e}")
+
+        # Filter out providers that failed validation
+        providers = {name: prov for name, prov in providers.items() if prov.enabled}
 
     active = list(providers.keys())
     if active:

@@ -208,6 +208,25 @@ class Config:
         self._data["ai"]["cache"].setdefault("max_query_chars", 120)
         self._data["ai"]["cache"].setdefault("enable_fuzzy", False)
         self._data["ai"]["cache"].setdefault("fuzzy_threshold", 0.92)
+
+        self._data.setdefault("capture", {})
+        self._data["capture"].setdefault("screen", {})
+        self._data["capture"]["screen"].setdefault("enabled", True)
+        self._data["capture"]["screen"].setdefault("interval_ms", 500)
+        self._data["capture"]["screen"].setdefault("quality", "medium")
+        self._data["capture"]["screen"].setdefault("smart_crop", True)
+        self._data["capture"]["screen"].setdefault("ocr_engine", "windows")
+        # Editor crop retry — helps with window chrome; disabled by default
+        self._data["capture"]["screen"].setdefault("ocr_editor_recrop", False)
+        self._data["capture"]["screen"].setdefault("ocr_editor_top_crop_px", 60)
+        self._data["capture"]["screen"].setdefault("ocr_editor_left_crop_px", 70)
+        # Bug 4 fix: these keys were read in screen.py but never seeded here
+        self._data["capture"]["screen"].setdefault("stable_ttl_ms", 2000)
+        self._data["capture"]["screen"].setdefault("hash_threshold_bits", 2)
+        self._data["capture"]["screen"].setdefault("window_cache_size", 8)
+        self._data["capture"]["screen"].setdefault("key_by_window", True)
+        self._data["capture"]["screen"].setdefault("change_threshold", 0.15)
+
         self._data.setdefault("app", {})
         self._data["app"].setdefault("focus_on_show", False)
         self._data.setdefault("stealth", {})
@@ -233,6 +252,10 @@ class Config:
         hotkeys.setdefault("stealth", "ctrl+shift+z")
         hotkeys.setdefault("mini_mode", "ctrl+alt+n")
         hotkeys.setdefault("emergency_erase", "ctrl+shift+e")
+
+        self._data.setdefault("telemetry", {})
+        self._data["telemetry"].setdefault("enabled", True)
+        self._data["telemetry"].setdefault("log_interval_s", 300)
 
     def _resolve_env(self, d):
         if isinstance(d, dict):

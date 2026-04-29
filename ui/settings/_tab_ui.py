@@ -43,7 +43,7 @@ class UiTabMixin:
         self.stealth_opacity_slider.setStyleSheet(
             """
             QSlider::groove:horizontal {
-                background: rgba(255,255,255,0.08);
+                background: rgba(255,255,255,20);
                 height: 6px;
                 border-radius: 3px;
             }
@@ -102,7 +102,7 @@ class UiTabMixin:
         self.hud_opacity_slider.setStyleSheet(
             """
             QSlider::groove:horizontal {
-                background: rgba(255,255,255,0.08);
+                background: rgba(255,255,255,20);
                 height: 6px;
                 border-radius: 3px;
             }
@@ -242,7 +242,7 @@ class UiTabMixin:
         # Reset section (Factory Reset below performs a full first-run reset)
         sep = QFrame()
         sep.setStyleSheet(
-            "background: rgba(255,255,255,0.05); height: 1px; margin: 20px 0;"
+            "background: rgba(255,255,255,12); height: 1px; margin: 20px 0;"
         )
         l.addWidget(sep)
 
@@ -250,16 +250,16 @@ class UiTabMixin:
         btn_factory_reset.setStyleSheet(
             """
             QPushButton {
-                background: rgba(220, 38, 38, 0.14);
+                background: rgba(220,38,38,35);
                 color: #fecaca;
                 border-radius: 12px;
                 font-weight: 800;
                 font-size: 11px;
                 padding: 12px 24px;
-                border: 1px solid rgba(248, 113, 113, 0.35);
+                border: 1px solid rgba(248,113,113,89);
             }
             QPushButton:hover {
-                background: rgba(220, 38, 38, 0.22);
+                background: rgba(220,38,38,56);
                 color: white;
             }
             """

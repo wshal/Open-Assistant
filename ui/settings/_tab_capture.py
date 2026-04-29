@@ -57,7 +57,7 @@ class CaptureTabMixin:
 
         sep_mode = QFrame()
         sep_mode.setFixedHeight(1)
-        sep_mode.setStyleSheet("background: rgba(255,255,255,0.05);")
+        sep_mode.setStyleSheet("background: rgba(255,255,255,12);")
         l.addWidget(sep_mode)
 
         lbl = self._make_section_label("PRIMARY AUDIO SOURCE")
@@ -82,7 +82,7 @@ class CaptureTabMixin:
         l.addWidget(audio_desc)
         sep = QFrame()
         sep.setFixedHeight(1)
-        sep.setStyleSheet("background: rgba(255,255,255,0.05);")
+        sep.setStyleSheet("background: rgba(255,255,255,12);")
         l.addWidget(sep)
 
         # P2.3: Transcription Language Selector
@@ -117,7 +117,7 @@ class CaptureTabMixin:
 
         sep2 = QFrame()
         sep2.setFixedHeight(1)
-        sep2.setStyleSheet("background: rgba(255,255,255,0.05);")
+        sep2.setStyleSheet("background: rgba(255,255,255,12);")
         l.addWidget(sep2)
 
         # Q21: Whisper model size selector
@@ -164,7 +164,7 @@ class CaptureTabMixin:
 
         sep_wm = QFrame()
         sep_wm.setFixedHeight(1)
-        sep_wm.setStyleSheet("background: rgba(255,255,255,0.05);")
+        sep_wm.setStyleSheet("background: rgba(255,255,255,12);")
         l.addWidget(sep_wm)
 
         # P2.8: ASR Correction Provider Selector
@@ -187,7 +187,7 @@ class CaptureTabMixin:
 
         sep3 = QFrame()
         sep3.setFixedHeight(1)
-        sep3.setStyleSheet("background: rgba(255,255,255,0.05);")
+        sep3.setStyleSheet("background: rgba(255,255,255,12);")
         l.addWidget(sep3)
 
         lbl2 = self._make_section_label("VISION ENGINE")
@@ -277,7 +277,7 @@ class CaptureTabMixin:
 
         sep_text = QFrame()
         sep_text.setFixedHeight(1)
-        sep_text.setStyleSheet("background: rgba(255,255,255,0.05);")
+        sep_text.setStyleSheet("background: rgba(255,255,255,12);")
         l.addWidget(sep_text)
 
         # Text Priority + Race Mode (manual + audio queries)
