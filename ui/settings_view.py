@@ -639,6 +639,8 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
                 "capture.audio.mode",
                 selected_audio,
             )
+            if hasattr(self, "chk_vision_enabled"):
+                self.config.set("capture.screen.enabled", self.chk_vision_enabled.isChecked())
             self.config.set("capture.screen.smart_crop", self.chk_smart.isChecked())
             if hasattr(self, "chk_paid_vision_fallback"):
                 self.config.set(

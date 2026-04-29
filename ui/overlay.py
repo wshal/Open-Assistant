@@ -97,6 +97,8 @@ class OverlayWindow(QMainWindow):
         self._session_start_time = time.time()
         self.session_timer.setVisible(True)
         self.audio_status.setVisible(True)
+        self.vision_status.setVisible(True)
+        self.update_vision_state(reset_to_master=True)
         self.btn_end_session.setVisible(True)
         self.btn_history.setVisible(False)
         self.btn_settings.setVisible(False)
@@ -112,6 +114,7 @@ class OverlayWindow(QMainWindow):
         self._session_start_time = None
         self.session_timer.setVisible(False)
         self.audio_status.setVisible(False)
+        self.vision_status.setVisible(False)
         self.btn_end_session.setVisible(False)
         self.btn_history.setVisible(True)
         self.btn_settings.setVisible(True)
@@ -218,6 +221,23 @@ class OverlayWindow(QMainWindow):
         hl.addWidget(self.session_timer)
 
         hl.addStretch()
+
+        # PHASE 1: Interactive Vision Kill Switch (Placed BEFORE mic)
+        self.vision_status = QPushButton("👁️")
+        self.vision_status.setToolTip("Toggle Vision (OCR) on or off for this session")
+        self.vision_status.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.vision_status.setFixedSize(24, 24)
+        self.vision_status.setStyleSheet("""
+            QPushButton { 
+                color: #4ade80; font-size: 14px; background: transparent; border: none; border-radius: 12px;
+            }
+            QPushButton:hover { 
+                background: rgba(255,255,255,12); 
+            }
+        """)
+        self.vision_status.clicked.connect(self._toggle_vision)
+        self.vision_status.setVisible(False)
+        hl.addWidget(self.vision_status)
 
         # RESTORATION: Interactive Audio Status Pill in Header
         self.audio_status = QPushButton("🎙️")
@@ -686,6 +706,33 @@ class OverlayWindow(QMainWindow):
         )
 
         self.refresh_standby_state()
+
+    def _toggle_vision(self):
+        """Toggle vision mid-session."""
+        # Read current state from the screen capture module
+        current = self.app.screen._enabled if hasattr(self.app, "screen") and self.app.screen else False
+        new_state = not current
+        if hasattr(self.app, "screen") and self.app.screen:
+            self.app.screen.set_enabled(new_state)
+        self.update_vision_state(reset_to_master=False)
+
+    def update_vision_state(self, reset_to_master=False):
+        """Update Eye Icon to reflect current state. If reset_to_master is True, pulls from config."""
+        if reset_to_master:
+            master_enabled = self.config.get("capture.screen.enabled", True)
+            if hasattr(self.app, "screen") and self.app.screen:
+                self.app.screen.set_enabled(master_enabled)
+        
+        # Read true state from module
+        enabled = self.app.screen._enabled if hasattr(self.app, "screen") and self.app.screen else False
+        
+        # Unicode does not have a single "Eye with a slash" emoji, and combining characters
+        # render poorly on Windows. 🙈 (See-No-Evil Monkey) is the standard single-emoji alternative
+        # used in UIs for "vision disabled / hidden".
+        self.vision_status.setText("👁️" if enabled else "🙈")
+        self.vision_status.setStyleSheet(
+            f"color: {'#4ade80' if enabled else '#ef4444'}; font-size: 14px; background: transparent; border: none;"
+        )
 
     def _on_standby_mode_selected(self, mode):
         """Update app state when user clicks a mode button on standby screen."""

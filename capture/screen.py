@@ -89,6 +89,11 @@ class ScreenCapture(QObject):
         self.ocr._ensure_loaded()
         logger.info("  ✅ Screen capture pipeline ready")
 
+    def set_enabled(self, enabled: bool):
+        """Phase 1: Mid-session Vision Kill Switch."""
+        self._enabled = enabled
+        logger.debug(f"Screen capture enabled state set to: {enabled}")
+
     @property
     def last_img_hash(self) -> str:
         return self._last_img_hash
