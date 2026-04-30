@@ -240,6 +240,70 @@ class AudioCapture(QObject):
             self._drain_queue()
             logger.debug("Audio: Buffer flushed on unmute.")
 
+    # ── Hardware-Aware Whisper Loader ────────────────────────────────────────
+    # VRAM → (model_upgrade, compute_type) mapping.
+    # Only applied when the user has NOT overridden capture.audio.whisper_model
+    # in config.yaml.  Headroom is 0.7× usable VRAM to leave room for the OS,
+    # CUDA runtime, and intermediate buffers.
+    #
+    # Approximate faster-whisper VRAM footprints (float16 / int8):
+    #   large-v3-turbo : ~2.5GB float16,  ~1.5GB int8
+    #   medium.en      : ~3.0GB float16,  ~2.0GB int8
+    #   small.en       : ~1.0GB float16,  ~0.6GB int8
+    _GPU_TIERS: list[tuple[float, str, str]] = [
+        # (min_free_vram_gb, model, compute_type)   — checked largest-first
+        (3.5, "large-v3-turbo", "float16"),   # 4GB+ GPU — best accuracy
+        (2.5, "large-v3-turbo", "int8"),      # 3–3.5GB  — still great
+        (1.8, "medium.en",      "int8"),      # 2–2.5GB  — solid upgrade
+        (0.8, "small.en",       "float16"),   # 1–1.8GB  — GPU speedup only
+        # below 0.8GB free → stay on CPU
+    ]
+    # Config key sentinel: if user explicitly sets a model, we respect it.
+    _DEFAULT_MODEL_NAME = "small.en"
+
+    @staticmethod
+    def _probe_gpu() -> tuple[str, str, str]:
+        """Return (device, compute_type, model_override_or_empty).
+
+        Probes CUDA availability and free VRAM.  Returns:
+        - device      : "cuda" | "cpu"
+        - compute     : "float16" | "int8"
+        - model_hint  : suggested model name, or "" if no upgrade is warranted
+        """
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return "cpu", "int8", ""
+        except ImportError:
+            return "cpu", "int8", ""
+
+        # Try to get free VRAM via pynvml (most accurate)
+        free_gb = 0.0
+        gpu_name = "unknown GPU"
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+            gpu_name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(gpu_name, bytes):
+                gpu_name = gpu_name.decode()
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            free_gb = mem.free / (1024 ** 3)
+        except Exception:
+            # Fallback: use torch's own memory query (less accurate — excludes
+            # CUDA runtime overhead, so apply a 0.75 safety factor)
+            try:
+                props = torch.cuda.get_device_properties(torch.cuda.current_device())
+                gpu_name = props.name
+                total_gb = props.total_memory / (1024 ** 3)
+                allocated_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+                free_gb = (total_gb - allocated_gb) * 0.75
+            except Exception:
+                free_gb = 0.0
+
+        logger.info(f"[GPU] {gpu_name} detected — free VRAM ≈ {free_gb:.1f} GB")
+        return "cuda", "float16", free_gb, gpu_name
+
     def _ensure_whisper_loaded(self):
         with self._model_lock:
             if self._model_loaded:
@@ -247,26 +311,75 @@ class AudioCapture(QObject):
             try:
                 from faster_whisper import WhisperModel
 
-                # GPU auto-detection: CUDA float16 is 3–5x faster than CPU int8.
-                # Falls back gracefully to CPU if no CUDA-capable GPU is found.
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        device, compute = "cuda", "float16"
-                        logger.info(f"Whisper: CUDA GPU detected — using float16")
+                # Determine if the user has overridden the model explicitly.
+                user_set_model = (self._model_name != self._DEFAULT_MODEL_NAME)
+
+                # Probe GPU
+                probe = self._probe_gpu()
+                if probe[0] == "cuda":
+                    _, _, free_gb, gpu_name = probe
+                    device = "cuda"
+
+                    # Choose compute_type and optional model upgrade
+                    compute = "int8"   # safe default on CUDA
+                    model_hint = ""
+                    for min_gb, hint_model, hint_compute in self._GPU_TIERS:
+                        if free_gb >= min_gb:
+                            compute = hint_compute
+                            model_hint = hint_model
+                            break
+
+                    # Apply model upgrade only if user hasn't overridden
+                    if model_hint and not user_set_model:
+                        logger.info(
+                            f"[GPU] Auto-upgrading model: {self._model_name} → {model_hint} "
+                            f"({compute}, {free_gb:.1f}GB free on {gpu_name})"
+                        )
+                        self._model_name = model_hint
                     else:
-                        device, compute = "cpu", "int8"
-                except ImportError:
+                        if user_set_model:
+                            logger.info(
+                                f"[GPU] CUDA available ({gpu_name}, {free_gb:.1f}GB free) — "
+                                f"using user-configured model {self._model_name!r} on GPU"
+                            )
+                        else:
+                            logger.info(
+                                f"[GPU] CUDA available but low VRAM ({free_gb:.1f}GB) — "
+                                f"staying on {self._model_name} with int8"
+                            )
+                else:
                     device, compute = "cpu", "int8"
 
-                self.model = WhisperModel(
-                    self._model_name, device=device, compute_type=compute
-                )
-                self._model_loaded = True
-                logger.info(f"✅ Whisper Ready: {self._model_name} on {device}")
+                # Load model — with OOM guard for CUDA
+                try:
+                    self.model = WhisperModel(
+                        self._model_name, device=device, compute_type=compute
+                    )
+                    self._model_loaded = True
+                    logger.info(
+                        f"✅ Whisper Ready: {self._model_name} on {device} ({compute})"
+                    )
+                except Exception as load_err:
+                    if device == "cuda":
+                        # OOM or driver error — fall back to CPU gracefully
+                        logger.warning(
+                            f"[GPU] Failed to load {self._model_name} on CUDA "
+                            f"({load_err!r}) — falling back to small.en on CPU"
+                        )
+                        self._model_name = self._DEFAULT_MODEL_NAME
+                        self.model = WhisperModel(
+                            self._model_name, device="cpu", compute_type="int8"
+                        )
+                        self._model_loaded = True
+                        logger.info(
+                            f"✅ Whisper Ready (CPU fallback): {self._model_name} int8"
+                        )
+                    else:
+                        raise
             except Exception as e:
                 logger.error(f"Whisper Error: {e}")
                 self._model_loaded = False
+
 
     def start(self):
         with self._lock:
