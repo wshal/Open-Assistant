@@ -180,6 +180,163 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         self.assertEqual(calls[0][1], 16000)
         self.assertEqual(calls[0][0], int(16000 * 0.02) * 2)
 
+    def test_detect_speech_falls_back_to_webrtc(self):
+        audio = AudioCapture(ConfigStub({}))
+        audio._vad = Mock()
+        audio._webrtc_vad_has_speech = lambda block: True
+
+        has_speech, backend = audio._detect_speech(np.zeros((audio.block_size,), dtype=np.float32), 0.0)
+
+        self.assertTrue(has_speech)
+        self.assertEqual(backend, "webrtc")
+
+    def test_detect_speech_falls_back_to_rms_when_webrtc_unavailable(self):
+        audio = AudioCapture(ConfigStub({}))
+        audio._vad = None
+
+        has_speech, backend = audio._detect_speech(
+            np.ones((audio.block_size,), dtype=np.float32) * 0.01, 0.01
+        )
+
+        self.assertTrue(has_speech)
+        self.assertEqual(backend, "rms")
+
+    def test_required_silence_blocks_shortens_short_utterance(self):
+        audio = AudioCapture(
+            ConfigStub(
+                {
+                    "capture.audio.vad.short_utterance_max_s": 2.8,
+                    "capture.audio.vad.short_silence_ms": 500,
+                }
+            )
+        )
+
+        with patch("capture.audio.time.time", return_value=2.0):
+            short_blocks = audio._required_silence_blocks(0.0)
+        with patch("capture.audio.time.time", return_value=4.5):
+            long_blocks = audio._required_silence_blocks(0.0)
+
+        self.assertEqual(short_blocks, audio._short_silence_blocks)
+        self.assertEqual(long_blocks, audio.silence_blocks)
+
+    def test_required_silence_blocks_shortens_after_mid_utterance_slice(self):
+        audio = AudioCapture(
+            ConfigStub(
+                {
+                    "capture.audio.vad.short_silence_ms": 500,
+                    "capture.audio.vad.post_chunk_silence_ms": 500,
+                    "capture.audio.vad.short_utterance_max_s": 2.8,
+                }
+            )
+        )
+
+        # While the new chunk is still short (< short_utterance_max_s), the
+        # aggressive post-chunk tail should apply.
+        with patch("capture.audio.time.time", return_value=1.0):
+            blocks_short = audio._required_silence_blocks(
+                0.5,  # speech_started_at → elapsed = 0.5s (short)
+                had_mid_utterance_slice=True,
+            )
+        self.assertEqual(blocks_short, audio._post_chunk_silence_blocks)
+        # Document: 500ms config floors to 400ms effective given 200ms blocks
+        self.assertEqual(blocks_short * audio.block_ms, 400)
+
+        # Once the new chunk has run long (> short_utterance_max_s), the window
+        # must revert to the full silence_blocks — NOT stay on the short tail.
+        # This is the time-gate fix that prevents false early cuts on multi-clause prompts.
+        with patch("capture.audio.time.time", return_value=5.0):
+            blocks_long = audio._required_silence_blocks(
+                0.5,  # speech_started_at → elapsed = 4.5s (long)
+                had_mid_utterance_slice=True,
+            )
+        self.assertEqual(
+            blocks_long,
+            audio.silence_blocks,
+            "Post-chunk window must revert to silence_blocks for long new chunks "
+            "to prevent false early cuts on multi-clause prompts",
+        )
+
+    def test_emit_accumulated_records_vad_metrics(self):
+        audio = AudioCapture(ConfigStub())
+        audio._session_transcript_parts = ["what is react"]
+
+        with patch("capture.audio.time.time", side_effect=[2.0]):
+            audio._emit_accumulated(
+                speech_started_at=1.0,
+                provider="local",
+                transcribe_started_at=1.5,
+                vad_meta={"vad_backend": "webrtc", "end_silence_ms": 500},
+            )
+
+        metrics = audio.get_last_transcription_metrics()
+        self.assertEqual(metrics["vad_backend"], "webrtc")
+        self.assertEqual(metrics["end_silence_ms"], 500)
+        self.assertEqual(metrics["audio_duration_ms"], 500.0)
+        self.assertFalse(metrics["chunk_aware_eos"])
+
+    def test_local_transcribe_uses_benchmarked_decoder_settings(self):
+        audio = AudioCapture(ConfigStub())
+        calls = {}
+
+        class _FakeSegment:
+            text = "what is react"
+
+        class _FakeModel:
+            def transcribe(self, samples, **kwargs):
+                calls["samples_len"] = len(samples)
+                calls["kwargs"] = kwargs
+                return ([_FakeSegment()], None)
+
+        emitted = []
+        audio.model = _FakeModel()
+        audio._model_loaded = True
+        audio.transcription_ready.connect(emitted.append)
+
+        buffer = [np.ones((audio.block_size, 1), dtype=np.float32) * 0.01 for _ in range(5)]
+        audio._transcribe_local(buffer, speech_started_at=1.0, is_final=True)
+
+        self.assertEqual(emitted, ["what is react"])
+        self.assertEqual(calls["kwargs"]["beam_size"], 3)  # beam=3 is the production default after sweep
+        self.assertFalse(calls["kwargs"]["condition_on_previous_text"])
+        self.assertFalse(calls["kwargs"]["vad_filter"])
+        # initial_prompt at call-time equals the base prompt (context injector updates
+        # _whisper_initial_prompt only AFTER emit, for the next utterance).
+        self.assertEqual(
+            calls["kwargs"]["initial_prompt"],
+            audio._whisper_base_prompt,
+        )
+
+    def test_interim_transcribe_uses_same_decoder_bias_without_vad_filter(self):
+        audio = AudioCapture(ConfigStub())
+        calls = {}
+
+        class _FakeSegment:
+            text = "partial react question"
+
+        class _FakeModel:
+            def transcribe(self, samples, **kwargs):
+                calls["samples_len"] = len(samples)
+                calls["kwargs"] = kwargs
+                return ([_FakeSegment()], None)
+
+        emitted = []
+        audio.model = _FakeModel()
+        audio._model_loaded = True
+        audio.interim_transcription_ready.connect(emitted.append)
+        audio._interim_epoch = 3
+
+        buffer = [np.ones((audio.block_size, 1), dtype=np.float32) * 0.01 for _ in range(4)]
+        audio._transcribe_interim(buffer, speech_started_at=1.0, epoch=3)
+
+        self.assertEqual(emitted, ["partial react question"])
+        self.assertEqual(calls["kwargs"]["beam_size"], 3)  # beam=3 is the production default after sweep
+        self.assertFalse(calls["kwargs"]["condition_on_previous_text"])
+        self.assertFalse(calls["kwargs"]["vad_filter"])
+        self.assertEqual(
+            calls["kwargs"]["initial_prompt"],
+            audio._whisper_initial_prompt,
+        )
+
 
 class AIEngineParallelOrderingTests(unittest.TestCase):
     def test_parallel_generation_emits_completion_without_duplicate_chunks(self):
@@ -217,6 +374,68 @@ class AIEngineParallelOrderingTests(unittest.TestCase):
         self.assertEqual("".join(chunks).strip(), "parallel answer")
         self.assertEqual(completed, ["parallel answer"])
         self.assertEqual(history.entries[-1]["provider"], "parallel")
+
+    def test_clean_final_response_strips_audio_meta_preface(self):
+        engine = AIEngine(ConfigStub({"ai.mode": "general"}), HistoryStub(), rag=None)
+
+        cleaned = engine._clean_final_response(
+            "Based on the audio context, I'm assuming the ASR error was something like "
+            "\"React\" instead of \"ReactJS.\" React is a JavaScript library for building UIs."
+        )
+
+        self.assertEqual(
+            cleaned,
+            "React is a JavaScript library for building UIs.",
+        )
+
+    def test_effective_speech_query_prefers_refined_question(self):
+        engine = AIEngine(ConfigStub({"ai.mode": "general"}), HistoryStub(), rag=None)
+
+        effective = engine._effective_speech_query(
+            "What are the ways to post performance in React?",
+            "What are the ways to boost performance in React?",
+        )
+
+        self.assertEqual(
+            effective,
+            "What are the ways to boost performance in React?",
+        )
+
+
+class PromptBuilderSpeechTests(unittest.TestCase):
+    def test_general_knowledge_classifier_handles_noisy_polite_speech(self):
+        self.assertTrue(
+            PromptBuilder()._is_general_knowledge_query(
+                "Couldyou care to explain what is React?"
+            )
+        )
+
+    def test_speech_general_knowledge_prompt_avoids_audio_meta_instructions(self):
+        prompt = PromptBuilder().user(
+            query="What is React?",
+            audio="What is React?",
+            origin="speech",
+            mode="general",
+            nexus={"active_window": "Editor", "history_depth_secs": 60},
+        )
+
+        self.assertNotIn("(Origin: Audio. Fix ASR errors.)", prompt)
+        self.assertNotIn("[AUDIO]", prompt)
+        self.assertNotIn("[ENVIRONMENT]", prompt)
+        self.assertIn("silently correct them before answering", prompt)
+        self.assertIn("Do not mention audio context, ASR", prompt)
+
+    def test_speech_live_context_prompt_disallows_direct_screen_access_claims(self):
+        prompt = PromptBuilder().user(
+            query="How can you see the screen?",
+            audio="How can you see the screen?",
+            origin="speech",
+            mode="general",
+            nexus={"active_window": "Editor", "history_depth_secs": 60},
+            screen="visible code",
+        )
+
+        self.assertIn("captured screen/OCR context", prompt)
 
     def test_vision_fallback_clears_partial_stream_before_retry_success(self):
         config = ConfigStub(

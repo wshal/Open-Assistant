@@ -546,6 +546,10 @@ class OpenAssistApp(QObject):
         if not q or not self._ai_lock_ready.wait(timeout=2):
             return
 
+        if s == "speech":
+            from utils.text_utils import normalize_transcript
+            q = normalize_transcript(q) or q
+
         # P2: Self-Learning Detector Hook
         if hasattr(self.ai, "detector") and hasattr(self.ai.detector, "learn_from_query"):
             self.ai.detector.learn_from_query(q)
@@ -1429,9 +1433,15 @@ class OpenAssistApp(QObject):
             return
 
         # Phase 1: Smart Transcription Repair
-        from utils.text_utils import clean_question_text, glue_fragments, is_question_complete
-        t = clean_question_text(glue_fragments(t))
+        from utils.text_utils import is_question_complete, normalize_transcript
+        t = normalize_transcript(t)
         if not t:
+            return
+
+        if self._should_ignore_final_transcript(t):
+            logger.info("Audio: Ignoring short final transcript fragment: %r", t)
+            if hasattr(self.ai, "detector") and hasattr(self.ai.detector, "reset_fragment_buffer"):
+                self.ai.detector.reset_fragment_buffer("ignored-final-fragment")
             return
 
         self.nexus.push("audio", t)
@@ -1480,6 +1490,45 @@ class OpenAssistApp(QObject):
                     state="processing",
                 )
 
+    def _should_ignore_final_transcript(self, text: str) -> bool:
+        """Drop tiny non-question final ASR scraps before they enter context/history."""
+        from utils.text_utils import is_likely_fragment
+
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return True
+
+        if is_likely_fragment(cleaned):
+            return True
+
+        words = cleaned.replace("?", " ").split()
+        min_chars = int(self.config.get("detection.final_min_chars", 6) or 6)
+        min_words = int(self.config.get("detection.final_min_words", 2) or 2)
+        requires_signal = bool(
+            self.config.get("detection.final_requires_question_signal", True)
+        )
+
+        if len(cleaned) >= min_chars and len(words) >= min_words:
+            return False
+        if not requires_signal:
+            return False
+        return not self._looks_question_like_transcript(cleaned)
+
+    def _looks_question_like_transcript(self, text: str) -> bool:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return False
+        lower = cleaned.lower()
+        if "?" in cleaned:
+            return True
+
+        detector = getattr(getattr(self, "ai", None), "detector", None)
+        prefixes = getattr(detector, "question_prefixes", []) or []
+        patterns = getattr(detector, "question_patterns", []) or []
+        return any(lower.startswith(prefix) for prefix in prefixes) or any(
+            pattern in lower for pattern in patterns
+        )
+
     def _on_interim_transcription(self, t: str):
         """Best-effort live (partial) ASR updates while the user is still speaking.
 
@@ -1490,8 +1539,8 @@ class OpenAssistApp(QObject):
         if not self.session_active or not t:
             return
             
-        from utils.text_utils import clean_question_text, glue_fragments
-        t = clean_question_text(glue_fragments(t))
+        from utils.text_utils import normalize_transcript
+        t = normalize_transcript(t)
         if not t or not hasattr(self.ai, "detector"):
             return
 

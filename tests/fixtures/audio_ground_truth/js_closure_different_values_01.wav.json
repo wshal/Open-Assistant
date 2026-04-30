@@ -1,0 +1,12 @@
+{
+  "expected_transcript": "happening in the javascript closure example and why does each function remember a different value",
+  "expected_utterance_end_ms": 6600.0,
+  "expected_segments": 1,
+  "mode": "coding",
+  "tags": [
+    "javascript",
+    "closures",
+    "long_question"
+  ],
+  "notes": ""
+}

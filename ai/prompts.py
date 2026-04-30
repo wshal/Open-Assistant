@@ -1,6 +1,9 @@
 """Prompt templates for all modes — fully mode-profile-aware."""
 
+import re
 from typing import Any, Optional, List, Dict, Union
+
+from utils.text_utils import normalize_transcript
 
 
 class ContextRanker:
@@ -88,11 +91,12 @@ class PromptBuilder:
     # (Consolidated to reduce drift between SYSTEMS vs PROMPT_PACKS.)
     PROMPT_PACKS = {
         "general": {
-            "system": """You are OpenAssist AI, a real-time assistant with screen and audio access.
+            "system": """You are OpenAssist AI, a real-time assistant with live screen captures/OCR and audio transcripts.
 Rules:
 - Prefer a fast, direct answer. Use screen/audio context only when it is relevant to the question.
 - Use recent audio and session context as supporting evidence.
 - Distinguish clearly between observed facts and inference.
+- Never claim direct sensory, camera, or desktop access. If you mention the screen, describe it as captured screen/OCR/live session context.
 - Be concise, useful, and action-oriented.
 - Use bullets when scanning is easier. Code in fenced blocks. No filler.""",
         },
@@ -194,9 +198,25 @@ For MCQ: state correct answer first.""",
 
     @staticmethod
     def _is_general_knowledge_query(query: str) -> bool:
-        q = (query or "").strip().lower()
+        q = normalize_transcript(query).strip().lower()
         if not q:
             return False
+
+        q = re.sub(r"^(?:hey|okay|ok|so)\s+", "", q).strip()
+        for prefix in (
+            "can you please ",
+            "could you please ",
+            "would you please ",
+            "would you mind ",
+            "could you ",
+            "can you ",
+            "would you ",
+            "please ",
+            "care to ",
+            "tell me ",
+        ):
+            if q.startswith(prefix):
+                q = q[len(prefix):].strip()
 
         contextual_markers = (
             "this ", "current ", "shown ", "visible ", "on screen",
@@ -264,7 +284,10 @@ For MCQ: state correct answer first.""",
     ) -> str:
         """Build user prompt with mode-profile-aware context ranking and limits."""
         parts = []
-        suppress_live_context = origin == "manual" and self._is_general_knowledge_query(query)
+        suppress_live_context = (
+            origin in {"manual", "speech"}
+            and self._is_general_knowledge_query(query)
+        )
 
         # Conversation history — injected first so the model anchors on prior context
         # before reading the current query. Critical for follow-up queries.
@@ -297,7 +320,19 @@ For MCQ: state correct answer first.""",
             parts.append(f"[CLIP]\n{clipboard[:1000]}")
 
         if origin == "speech":
-            parts.append("(Origin: Audio. Fix ASR errors.)")
+            if suppress_live_context:
+                parts.append(
+                    "[TASK]\nAnswer the spoken question directly from general knowledge. "
+                    "If the transcript has minor ASR mistakes, silently correct them before answering. "
+                    "Do not mention audio context, ASR, transcription mistakes, or that you corrected the wording."
+                )
+            else:
+                parts.append(
+                    "[TASK]\nAnswer the spoken question using the live session context when it is relevant. "
+                    "If the transcript has minor ASR mistakes, silently correct them before answering. "
+                    "Do not mention audio context, ASR, transcription mistakes, or that you corrected the wording unless the user asks. "
+                    "If you reference the screen, describe it as captured screen/OCR context rather than direct sensory access."
+                )
         elif origin == "screen_analysis":
             parts.append(
                 "[TASK]\nAnalyse the attached screenshot first. Treat the image as the primary source of truth. "
@@ -319,7 +354,8 @@ For MCQ: state correct answer first.""",
                 parts.append(
                     "[TASK]\nAnswer the user's question using the current live session context. "
                     "Prefer the most recent on-screen evidence when relevant. "
-                    "If the question is generic and the live context is unrelated, answer directly without talking about the unrelated context."
+                    "If the question is generic and the live context is unrelated, answer directly without talking about the unrelated context. "
+                    "If you reference the screen, describe it as captured screen/OCR context rather than direct sensory access."
                 )
         elif origin == "quick":
             # Mode-specific quick-answer format injected here

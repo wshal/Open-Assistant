@@ -14,6 +14,7 @@ from collections import deque
 from typing import Optional, List
 from dataclasses import dataclass
 from utils.logger import setup_logger
+from utils.text_utils import normalize_transcript
 
 logger = setup_logger(__name__)
 
@@ -198,6 +199,8 @@ class QuestionDetector:
         self._debounce_seconds = 3.0
         self._last_text = ""
         self.fragment_buffer = deque(maxlen=4)
+        self._fragment_last_seen_at = 0.0
+        self._fragment_ttl_s = float(config.get("detection.fragment_ttl_s", 4.0) or 4.0)
         self.question_prefixes = [
             "what ",
             "how ",
@@ -617,7 +620,8 @@ class QuestionDetector:
 
     def learn_from_query(self, query: str):
         """Learn a successful query prefix to dynamically improve detection."""
-        extracted = self._extract_question_clause(query)
+        normalized = normalize_transcript(query)
+        extracted = self._extract_question_clause(normalized)
         text = (extracted or "").strip().lower()
         if not text:
             return
@@ -643,6 +647,12 @@ class QuestionDetector:
                     logger.info(f"QuestionDetector: Learned dynamic prefix: '{prefix_3}'")
                     self.question_prefixes.append(prefix_3)
 
+    def reset_fragment_buffer(self, reason: str = "") -> None:
+        self.fragment_buffer.clear()
+        self._fragment_last_seen_at = 0.0
+        if reason:
+            logger.debug("QuestionDetector: Fragment buffer reset (%s)", reason)
+
     def _classify_trigger(self, text: str) -> str:
         """Classify the type of trigger."""
         lower = text.lower()
@@ -663,13 +673,22 @@ class QuestionDetector:
         if not self.enabled or not text:
             return None
 
-        text = text.strip()
+        text = normalize_transcript(text).strip()
         if len(text) < 2:
             return None
+
+        now = time.time()
+        if (
+            self.fragment_buffer
+            and self._fragment_last_seen_at
+            and (now - self._fragment_last_seen_at) > self._fragment_ttl_s
+        ):
+            self.reset_fragment_buffer("stale")
 
         lower = text.lower()
         words = lower.split()
         self.fragment_buffer.append(text)
+        self._fragment_last_seen_at = now
 
         # Try a combined detection over the current buffer first.
         candidate = self._detect_from_buffer()
@@ -700,6 +719,10 @@ class QuestionDetector:
         # Keep the fragment if it looks like a continuation phrase.
         if self._looks_like_continuation(text, lower):
             logger.debug(f"QuestionDetector: Waiting for continuation: {text!r}")
+            return None
+
+        if self._has_sentence_terminal(text):
+            self.reset_fragment_buffer("terminal-non-question")
             return None
 
         if len(self.fragment_buffer) == self.fragment_buffer.maxlen:

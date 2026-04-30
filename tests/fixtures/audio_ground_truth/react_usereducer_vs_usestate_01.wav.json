@@ -1,0 +1,12 @@
+{
+  "expected_transcript": "is useReducer a better choice than useState when the component has complex state logic",
+  "expected_utterance_end_ms": 6600.0,
+  "expected_segments": 1,
+  "mode": "coding",
+  "tags": [
+    "react",
+    "hooks",
+    "long_question"
+  ],
+  "notes": ""
+}

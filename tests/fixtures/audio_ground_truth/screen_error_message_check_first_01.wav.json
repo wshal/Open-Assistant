@@ -1,0 +1,12 @@
+{
+  "expected_transcript": "what this error message on the screen means and what i should check first",
+  "expected_utterance_end_ms": 5200.0,
+  "expected_segments": 1,
+  "mode": "coding",
+  "tags": [
+    "screen_context",
+    "error_debugging",
+    "long_question"
+  ],
+  "notes": ""
+}

@@ -1,0 +1,13 @@
+{
+  "expected_transcript": "how to structure state in react when multiple form fields and validation rules are involved",
+  "expected_utterance_end_ms": 6250.0,
+  "expected_segments": 1,
+  "mode": "coding",
+  "tags": [
+    "react",
+    "forms",
+    "state",
+    "long_question"
+  ],
+  "notes": ""
+}

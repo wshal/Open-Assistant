@@ -1,0 +1,12 @@
+{
+  "expected_transcript": "difference between var let and const in javascript and when should i use each",
+  "expected_utterance_end_ms": 6300.0,
+  "expected_segments": 1,
+  "mode": "coding",
+  "tags": [
+    "javascript",
+    "basics",
+    "long_question"
+  ],
+  "notes": ""
+}

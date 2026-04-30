@@ -1,0 +1,12 @@
+{
+  "expected_transcript": "how can i boost performance in react",
+  "expected_utterance_end_ms": 2350.0,
+  "expected_segments": 1,
+  "mode": "interview",
+  "tags": [
+    "react",
+    "performance",
+    "frontend"
+  ],
+  "notes": ""
+}

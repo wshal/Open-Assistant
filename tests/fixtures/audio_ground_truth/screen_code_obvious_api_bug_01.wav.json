@@ -1,0 +1,13 @@
+{
+  "expected_transcript": "in the code on my screen and is there an obvious bug in the api call",
+  "expected_utterance_end_ms": 5650.0,
+  "expected_segments": 1,
+  "mode": "coding",
+  "tags": [
+    "screen_context",
+    "api",
+    "debugging",
+    "long_question"
+  ],
+  "notes": ""
+}

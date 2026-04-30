@@ -1,0 +1,12 @@
+{
+  "expected_transcript": "why do we use useEffect",
+  "expected_utterance_end_ms": 2450.0,
+  "expected_segments": 1,
+  "mode": "interview",
+  "tags": [
+    "react",
+    "useeffect",
+    "hooks"
+  ],
+  "notes": ""
+}

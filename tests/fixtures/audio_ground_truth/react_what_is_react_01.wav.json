@@ -1,0 +1,11 @@
+{
+  "expected_transcript": "what is react",
+  "expected_utterance_end_ms": 1750.0,
+  "expected_segments": 1,
+  "mode": "interview",
+  "tags": [
+    "react",
+    "frontend"
+  ],
+  "notes": ""
+}

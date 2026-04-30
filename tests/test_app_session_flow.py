@@ -292,6 +292,8 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
                 set_session_context=lambda ctx: None,
                 detector=SimpleNamespace(
                     set_mode=lambda m: None,
+                    question_prefixes=["what ", "how ", "why ", "can ", "could "],
+                    question_patterns=["what is", "how do", "can you", "could you"],
                 ),
             ),
             rag=SimpleNamespace(_cache={}, stop=lambda: None),
@@ -319,6 +321,8 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         app._sync_history_ui = lambda: OpenAssistApp._sync_history_ui(app)
         app._stop_background_tasks = lambda: None
         app._sync_state_from_config = lambda: OpenAssistApp._sync_state_from_config(app)
+        app._should_ignore_final_transcript = lambda text: OpenAssistApp._should_ignore_final_transcript(app, text)
+        app._looks_question_like_transcript = lambda text: OpenAssistApp._looks_question_like_transcript(app, text)
         return app
 
     def test_start_new_session_resets_state_and_updates_ui(self):
@@ -481,6 +485,83 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         OpenAssistApp.toggle_audio(app)
         self.assertFalse(app.audio.muted)
+
+    def test_short_final_transcript_fragment_is_ignored(self):
+        app = self._build_app()
+        app.session_active = True
+        pushed = []
+        generated = []
+        app.nexus = SimpleNamespace(push=lambda source, value: pushed.append((source, value)))
+        app.generate_response = lambda *args, **kwargs: generated.append((args, kwargs))
+        app.audio = SimpleNamespace(get_last_transcription_metrics=lambda: {})
+        app.ai.detector = SimpleNamespace(
+            question_prefixes=["what ", "how ", "why "],
+            question_patterns=["what is", "how do"],
+            detect_with_confidence=lambda text, source="audio": SimpleNamespace(
+                triggered=False,
+                confidence=0.0,
+                detected_text="",
+                should_auto_respond=lambda: False,
+            ),
+        )
+
+        OpenAssistApp._on_transcription(app, "API.")
+
+        self.assertEqual(pushed, [])
+        self.assertEqual(generated, [])
+        self.assertEqual(app.overlay.transcript_updates, [])
+
+    def test_continuation_fragment_transcript_is_ignored(self):
+        app = self._build_app()
+        app.session_active = True
+        resets = []
+        app.nexus = SimpleNamespace(push=lambda source, value: None)
+        app.generate_response = lambda *args, **kwargs: None
+        app.audio = SimpleNamespace(get_last_transcription_metrics=lambda: {})
+        app.ai.detector = SimpleNamespace(
+            question_prefixes=["what ", "how ", "why "],
+            question_patterns=["what is", "how do"],
+            reset_fragment_buffer=lambda reason="": resets.append(reason),
+            detect_with_confidence=lambda text, source="audio": SimpleNamespace(
+                triggered=False,
+                confidence=0.0,
+                detected_text="",
+                should_auto_respond=lambda: False,
+            ),
+        )
+
+        OpenAssistApp._on_transcription(app, "for Cloud Helps.")
+
+        self.assertEqual(app.overlay.transcript_updates, [])
+        self.assertEqual(resets, ["ignored-final-fragment"])
+
+    def test_short_question_transcript_still_reaches_detector(self):
+        app = self._build_app()
+        app.session_active = True
+        pushed = []
+        generated = []
+        detector_calls = []
+        app.nexus = SimpleNamespace(push=lambda source, value: pushed.append((source, value)), get_snapshot=lambda: {})
+        app.generate_response = lambda *args, **kwargs: generated.append((args, kwargs))
+        app.audio = SimpleNamespace(get_last_transcription_metrics=lambda: {})
+        app.ai.detector = SimpleNamespace(
+            question_prefixes=["what ", "how ", "why "],
+            question_patterns=["what is", "how do"],
+            detect_with_confidence=lambda text, source="audio": (
+                detector_calls.append((text, source)) or SimpleNamespace(
+                    triggered=True,
+                    confidence=1.0,
+                    detected_text=text,
+                    should_auto_respond=lambda: True,
+                )
+            ),
+        )
+
+        OpenAssistApp._on_transcription(app, "Why?")
+
+        self.assertEqual(pushed, [("audio", "Why?")])
+        self.assertEqual(detector_calls, [("Why?", "audio")])
+        self.assertEqual(len(generated), 1)
 
     def test_show_initial_window_respects_start_minimized(self):
         app = self._build_app()

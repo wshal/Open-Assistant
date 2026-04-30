@@ -512,11 +512,13 @@ class AIEngine(QObject):
             # ── Refinement: decide whether to run, build coroutine if so ────────
             refined_audio = audio_context
             refine_coro = None
-            is_general_knowledge = (
-                origin == "manual"
-                and self.prompts._is_general_knowledge_query(query)
+            is_general_knowledge = self.prompts._is_general_knowledge_query(query)
+            # Keep manual simple queries ultra-fast, but allow spoken queries to
+            # still refine transcript text so ASR slips do not leak into the answer.
+            skip_refinement = origin != "speech" and (
+                complexity == "simple"
+                or (origin == "manual" and is_general_knowledge)
             )
-            skip_refinement = complexity == "simple" or is_general_knowledge
             needs_refinement = (
                 audio_context
                 and not skip_refinement
@@ -575,9 +577,13 @@ class AIEngine(QObject):
                 session_context=getattr(self, "_session_context", ""),
             )
 
+            effective_query = query
+            if origin == "speech":
+                effective_query = self._effective_speech_query(query, refined_audio)
+
             # Resolve follow-up queries using recent history so short ambiguous
             # queries like "give me an example" inherit the previous topic context.
-            resolved_query = self._resolve_followup_query(query)
+            resolved_query = self._resolve_followup_query(effective_query)
 
             # Build conversation history block from last 3 turns (capped at 1500 chars).
             # Injected into the prompt so the model understands what was discussed.
@@ -625,7 +631,7 @@ class AIEngine(QObject):
                             for t in done:
                                 p = tasks.pop(t, None)
                                 try:
-                                    raced = (t.result() or "").strip()
+                                    raced = self._clean_final_response((t.result() or "").strip())
                                 except Exception as exc:
                                     # If a raced provider errors, immediately apply cooldown heuristics
                                     # so we don't keep hammering an overloaded endpoint.
@@ -698,7 +704,7 @@ class AIEngine(QObject):
             current_provider = provider
             while True:
                 try:
-                    ft_ms = int(self.config.get("ai.text.first_token_timeout_ms", 0) or 0)
+                    ft_ms = self._first_token_timeout_ms_for_provider(current_provider.name)
                     ft_timeout_s = max(ft_ms / 1000.0, 0.0) if ft_ms > 0 else 0.0
 
                     async for chunk in self._stream_with_first_token_timeout(
@@ -744,6 +750,7 @@ class AIEngine(QObject):
 
             # 5. Finalize
             if not self._is_cancelled:
+                full_response = self._clean_final_response(full_response)
                 latency_ms = (time.time() - start_time) * 1000
 
                 # P1: populate short-query cache after a successful response.
@@ -902,6 +909,65 @@ class AIEngine(QObject):
             return fixed.strip() if fixed else raw_text
         except:
             return raw_text
+
+    def _effective_speech_query(self, query: str, refined_audio: str) -> str:
+        """Prefer a corrected speech query when refinement yields a cleaner ask."""
+        candidate = (refined_audio or "").strip()
+        if not candidate:
+            return query
+
+        try:
+            extracted = self.detector.detect(candidate) if self.detector else None
+        except Exception:
+            extracted = None
+
+        candidate = (extracted or candidate).strip()
+        if not candidate:
+            return query
+
+        query_words = len((query or "").split())
+        candidate_words = len(candidate.split())
+        if candidate_words > max(query_words + 8, 24):
+            return query
+        return candidate
+
+    @staticmethod
+    def _clean_final_response(content: str) -> str:
+        """Strip leading meta narration about audio/ASR from the final answer."""
+        text = (content or "").strip()
+        if not text:
+            return text
+
+        patterns = [
+            r"^\s*based on the audio context[:,]?\s*i(?:'m| am)\s+assuming\s+[^.?!]*[.?!]\s*",
+            r"^\s*based on the audio context(?:\s+and\s+correcting\s+the\s+asr\s+error)?[:,]?\s*",
+            r"^\s*based on the (?:audio|spoken) context[:,]?\s*",
+            r"^\s*(?:correcting|fixing)\s+the\s+asr\s+error[:,]?\s*",
+            r"^\s*(?:it\s+seems|i'm assuming|i am assuming)\s+like\s+the\s+user\s+asked\s+about\s+[^.?!]*[.?!]\s*",
+        ]
+        for pattern in patterns:
+            updated = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
+            if updated != text:
+                text = updated.lstrip(" \"' -:\n\t")
+
+        return text.strip() or (content or "").strip()
+
+    def _first_token_timeout_ms_for_provider(self, provider_name: str) -> int:
+        """Resolve provider-specific TTFT guardrails before falling back to the global default."""
+        provider_overrides = self.config.get(
+            "ai.text.first_token_timeout_ms_by_provider", {}
+        )
+        if isinstance(provider_overrides, dict):
+            raw = provider_overrides.get(provider_name)
+            try:
+                if raw is not None:
+                    return int(raw or 0)
+            except (TypeError, ValueError):
+                pass
+        try:
+            return int(self.config.get("ai.text.first_token_timeout_ms", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
 
     async def generate_quick_response(
         self,

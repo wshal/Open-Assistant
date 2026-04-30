@@ -1,0 +1,13 @@
+{
+  "expected_transcript": "difference between var let and const",
+  "expected_utterance_end_ms": 4350.0,
+  "expected_segments": 1,
+  "mode": "interview",
+  "tags": [
+    "javascript",
+    "var",
+    "let",
+    "const"
+  ],
+  "notes": ""
+}

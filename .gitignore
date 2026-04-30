@@ -1,40 +1,64 @@
-# --- OpenAssist — Industry Standard Python Ignore ---
+# ── OpenAssist — Git Ignore ────────────────────────────────────────────────
+# Industry-standard Python + Windows desktop app ignores.
+# Sections ordered: secrets → runtime data → build artefacts → dev tooling.
 
-# ── Application Secrets & Encrypted State ────────────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🔐  Application Secrets & Encrypted State
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 config.yaml
+.env
+*.enc
 data/settings.enc
 data/history.enc
 
-# ── Runtime Data (auto-generated, user-specific) ──────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🗃️  Runtime / User-Generated Data  (auto-generated, user-specific)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 data/history/
 data/vectordb/
-data/__pycache__/
+data/cache/
 data/context_presets.json
 logs/
 .openassist/
 
-# ── Internal Docs & Private Assets ───────────────────────────────────────────
-data/cache/
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 📊  Benchmark Output  (large JSON reports, regenerated on demand)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Keep benchmark SCRIPTS but not the generated JSON sweep results.
+benchmarks/audio_asr_matrix_sweep.json
+benchmarks/audio_asr_model_sweep.json
+benchmarks/audio_asr_decoder_sweep.json
+benchmarks/audio_asr_report.json
+benchmarks/audio_asr_compare.json
+benchmarks/ocr_compare.json
+benchmarks/baseline_ocr.json
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 📁  Internal / Private Directories
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 cheating/
 scratch/
 docs/
+knowledge/
+stealth/
+openassist/
 
-# ── Python Environment ────────────────────────────────────────────────────────
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# C extensions
-*.so
-
-# Distribution / packaging
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🔨  Build Artefacts
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 build/
-develop-eggs/
 dist/
-downloads/
+*.spec
+*.manifest
+OpenAssist-AI.spec
+build.spec
+*.egg-info/
+*.egg
+MANIFEST
+develop-eggs/
 eggs/
 .eggs/
+downloads/
 lib/
 lib64/
 parts/
@@ -42,21 +66,25 @@ sdist/
 var/
 wheels/
 share/python-wheels/
-*.egg-info/
 .installed.cfg
-*.egg
-MANIFEST
 
-# Virtual Environments
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🐍  Python Environment & Cache
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
 venv/
 env/
 ENV/
 env.bak/
 venv.bak/
-.env
 .Python
 
-# ── Testing & Code Coverage ───────────────────────────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🧪  Testing & Coverage
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 .pytest_cache/
 .coverage
 htmlcov/
@@ -67,10 +95,13 @@ coverage.xml
 *.cover
 *.py,cover
 .hypothesis/
-.pytest_cache/
 cover/
+# scratch test outputs
+scratch/tests/
 
-# ── IDEs & Local Dev Artifacts ────────────────────────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🖥️  IDE & OS Artefacts
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 .vscode/
 .idea/
 *.swp
@@ -82,6 +113,13 @@ Thumbs.db
 *.bak
 *.tmp
 
-# ── PyInstaller Build ─────────────────────────────────────────────────────────
-*.manifest
-*.spec
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🤖  Whisper Model Cache  (large binary files, user-downloaded)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# faster-whisper downloads to ~/.cache/huggingface by default — not in repo.
+# If locally cached models are saved inside the project, ignore them:
+models/
+*.bin
+*.pt
+*.onnx
+*.gguf

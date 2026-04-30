@@ -642,6 +642,12 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             if hasattr(self, "chk_vision_enabled"):
                 self.config.set("capture.screen.enabled", self.chk_vision_enabled.isChecked())
             self.config.set("capture.screen.smart_crop", self.chk_smart.isChecked())
+            # Phase 2: Transcription engine and chunking
+            if hasattr(self, "transcription_provider"):
+                tp = "groq" if self.transcription_provider.currentIndex() == 1 else "local"
+                self.config.set("capture.audio.transcription_provider", tp)
+            if hasattr(self, "chk_chunking"):
+                self.config.set("capture.audio.chunking.enabled", self.chk_chunking.isChecked())
             if hasattr(self, "chk_paid_vision_fallback"):
                 self.config.set(
                     "ai.vision.allow_paid_fallback",

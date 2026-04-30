@@ -1,0 +1,13 @@
+{
+  "expected_transcript": "why does this useeffect keep running in a loop after i add the state variable to the dependency array",
+  "expected_utterance_end_ms": 6700.0,
+  "expected_segments": 1,
+  "mode": "coding",
+  "tags": [
+    "react",
+    "useeffect",
+    "dependencies",
+    "long_question"
+  ],
+  "notes": ""
+}

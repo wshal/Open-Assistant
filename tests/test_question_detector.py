@@ -44,6 +44,12 @@ class TestQuestionDetectorLearning(unittest.TestCase):
         self.assertIn("what is ", self.detector.question_prefixes)
         self.assertIn("what is react ", self.detector.question_prefixes)
 
+    def test_learn_from_query_normalizes_merged_speech_tokens(self):
+        self.detector.learn_from_query("Howcan yousee the screen even when the OCR is open?")
+        self.assertIn("how can ", self.detector.question_prefixes)
+        self.assertIn("how can you ", self.detector.question_prefixes)
+        self.assertNotIn("howcan yousee ", self.detector.question_prefixes)
+
 
 class TestQuestionDetectorHints(unittest.TestCase):
     def setUp(self):
@@ -89,6 +95,19 @@ class TestQuestionDetectorInterimGuardrails(unittest.TestCase):
             self.assertIsNone(self.detector.detect_interim_with_guardrails(text))
             self.assertEqual(self.detector.detect_interim_with_guardrails(text), "What is React")
             self.assertIsNone(self.detector.detect_interim_with_guardrails(text))
+
+
+class TestQuestionDetectorFragmentReset(unittest.TestCase):
+    def setUp(self):
+        from ai.detectors.question_detector import QuestionDetector
+
+        self.detector = QuestionDetector(_make_config(**{"detection.fragment_ttl_s": 4.0}))
+
+    def test_detect_resets_stale_fragment_buffer(self):
+        with patch("ai.detectors.question_detector.time.time", side_effect=[0.0, 6.0, 6.1, 6.2]):
+            self.assertIsNone(self.detector.detect("for cloud helps"))
+            self.assertIsNotNone(self.detector.detect("What is React?"))
+        self.assertEqual(list(self.detector.fragment_buffer), [])
 
 
 if __name__ == "__main__":

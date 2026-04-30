@@ -1,0 +1,12 @@
+{
+  "expected_transcript": "can you walk me through the difference between async await and promises in javascript using a simple example",
+  "expected_utterance_end_ms": 7550.0,
+  "expected_segments": 1,
+  "mode": "coding",
+  "tags": [
+    "javascript",
+    "async",
+    "long_question"
+  ],
+  "notes": ""
+}

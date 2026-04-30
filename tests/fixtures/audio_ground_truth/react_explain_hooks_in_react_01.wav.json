@@ -1,0 +1,12 @@
+{
+  "expected_transcript": "explain hooks in react",
+  "expected_utterance_end_ms": 2600.0,
+  "expected_segments": 1,
+  "mode": "interview",
+  "tags": [
+    "react",
+    "hooks",
+    "frontend"
+  ],
+  "notes": ""
+}

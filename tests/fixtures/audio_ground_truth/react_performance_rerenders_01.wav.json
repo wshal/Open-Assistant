@@ -1,0 +1,12 @@
+{
+  "expected_transcript": "performance in this react app without causing unnecessary re-renders across the whole page",
+  "expected_utterance_end_ms": 6750.0,
+  "expected_segments": 1,
+  "mode": "coding",
+  "tags": [
+    "react",
+    "performance",
+    "long_question"
+  ],
+  "notes": ""
+}

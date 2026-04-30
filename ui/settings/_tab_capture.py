@@ -126,19 +126,20 @@ class CaptureTabMixin:
         self.whisper_model = QComboBox()
         _whisper_models = ["tiny.en", "base.en", "small.en", "medium.en"]
         self.whisper_model.addItems([
-            "⚡ tiny.en  (fastest, ~40% faster, English-only)",
-            "✅ base.en  (default, good accuracy)",
-            "🔍 small.en (better accuracy, ~2× slower)",
-            "🧠 medium.en (best accuracy, ~4× slower)",
+            "⚡ tiny.en  (fastest, English-only)",
+            "✅ base.en  (balanced speed and accuracy)",
+            "🔍 small.en (default, best local benchmark result)",
+            "🧠 medium.en (best accuracy, heaviest runtime cost)",
         ])
         _wm_map = {m: i for i, m in enumerate(_whisper_models)}
-        saved_wm = self.config.get("capture.audio.whisper_model", "base.en")
-        self.whisper_model.setCurrentIndex(_wm_map.get(saved_wm, 1))
+        saved_wm = self.config.get("capture.audio.whisper_model", "small.en")
+        self.whisper_model.setCurrentIndex(_wm_map.get(saved_wm, 2))
         self.whisper_model.setToolTip(
             "Whisper model size affects transcription speed vs accuracy.\n"
-            "tiny.en: ~40% faster for English — great for fast interview Q&A.\n"
-            "base.en: default — good balance of speed and accuracy.\n"
-            "small.en / medium.en: higher accuracy, slower response.\n"
+            "tiny.en: fastest, but benchmarked weakest on long coding questions.\n"
+            "base.en: balanced fallback with lower CPU cost.\n"
+            "small.en: current default and best local benchmark winner.\n"
+            "medium.en: higher accuracy potential, but much slower.\n"
             "⚠️ Changing this requires an app restart to take effect."
         )
         self._style_combo(self.whisper_model)
@@ -155,8 +156,8 @@ class CaptureTabMixin:
             self._whisper_restart_lbl.setVisible(idx != _orig_wm_idx)
         self.whisper_model.currentIndexChanged.connect(_on_whisper_model_changed)
         wm_desc = QLabel(
-            "Select the Whisper ASR model size. tiny.en is recommended for low-latency "
-            "English-only interviews. Changes apply after restart."
+            "Select the Whisper ASR model size. small.en is the current recommended "
+            "default for local coding Q&A. Changes apply after restart."
         )
         wm_desc.setWordWrap(True)
         wm_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
@@ -166,6 +167,37 @@ class CaptureTabMixin:
         sep_wm.setFixedHeight(1)
         sep_wm.setStyleSheet("background: rgba(255,255,255,12);")
         l.addWidget(sep_wm)
+
+        # Phase 2: Transcription Engine
+        lbl_tprov = self._make_section_label("TRANSCRIPTION ENGINE")
+        l.addWidget(lbl_tprov)
+        self.transcription_provider = QComboBox()
+        self.transcription_provider.addItems([
+            "⚡ Local (Faster-Whisper)",
+            "☁️ Cloud (Groq Whisper — Fastest)",
+        ])
+        _saved_tp = self.config.get("capture.audio.transcription_provider", "local")
+        self.transcription_provider.setCurrentIndex(0 if _saved_tp != "groq" else 1)
+        self._style_combo(self.transcription_provider)
+        l.addWidget(self.transcription_provider)
+        tp_desc = QLabel(
+            "Local uses your CPU/GPU with no internet. "
+            "Groq Cloud uses the whisper-large-v3 model for sub-100ms transcription (requires Groq API key)."
+        )
+        tp_desc.setWordWrap(True)
+        tp_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+        l.addWidget(tp_desc)
+
+        self.chk_chunking = PremiumCheckBox("Enable Low-Latency Dynamic Chunking")
+        self.chk_chunking.setChecked(bool(self.config.get("capture.audio.chunking.enabled", True)))
+        l.addWidget(self.chk_chunking)
+        chunking_desc = QLabel(
+            "Slices long utterances at natural micro-pauses (2–4 s window) and streams each "
+            "chunk to Whisper in parallel. No word-slicing, no overlap deduplication."
+        )
+        chunking_desc.setWordWrap(True)
+        chunking_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+        l.addWidget(chunking_desc)
 
         # P2.8: ASR Correction Provider Selector
         lbl_corr = self._make_section_label("TRANSCRIPT CORRECTION PROVIDER")

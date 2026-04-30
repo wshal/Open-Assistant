@@ -179,7 +179,19 @@ class Config:
         )
         self._data["ai"]["text"].setdefault("race_enabled", False)
         # P1: First-token timeout for streaming (0 disables).
-        self._data["ai"]["text"].setdefault("first_token_timeout_ms", 1200)
+        # Keep the global default conservative enough to avoid false failovers,
+        # and allow slower providers like Ollama to override it explicitly.
+        self._data["ai"]["text"].setdefault("first_token_timeout_ms", 2000)
+        self._data["ai"]["text"].setdefault(
+            "first_token_timeout_ms_by_provider",
+            {
+                "groq": 1800,
+                "cerebras": 1800,
+                "gemini": 2000,
+                "together": 2000,
+                "ollama": 2500,
+            },
+        )
         # P2: Local-only mode to force Ollama usage without YAML edits.
         self._data["ai"]["text"].setdefault("local_only", False)
         self._data["ai"].setdefault("vision", {})
@@ -226,6 +238,31 @@ class Config:
         self._data["capture"]["screen"].setdefault("window_cache_size", 8)
         self._data["capture"]["screen"].setdefault("key_by_window", True)
         self._data["capture"]["screen"].setdefault("change_threshold", 0.15)
+
+        # Phase 2: Transcription provider ("local" = faster-whisper, "groq" = Groq Cloud)
+        self._data["capture"].setdefault("audio", {})
+        self._data["capture"]["audio"].setdefault("transcription_provider", "local")
+        # Phase 2: Hybrid micro-pause VAD chunking
+        # Slicing begins only after min_chunk_s and fires on any micro-pause up to max_chunk_s.
+        self._data["capture"]["audio"].setdefault("chunking", {})
+        self._data["capture"]["audio"]["chunking"].setdefault("enabled", True)
+        self._data["capture"]["audio"]["chunking"].setdefault("min_chunk_s", 2.0)
+        self._data["capture"]["audio"]["chunking"].setdefault("max_chunk_s", 4.0)
+        # Phase 2: Ambient noise calibration window at session start
+        self._data["capture"]["audio"].setdefault("ambient_calibration_ms", 500)
+        self._data["capture"]["audio"].setdefault("vad", {})
+        self._data["capture"]["audio"]["vad"].setdefault("frame_ms", 20)
+        self._data["capture"]["audio"]["vad"].setdefault("mode", 2)
+        self._data["capture"]["audio"]["vad"].setdefault("short_utterance_max_s", 2.8)
+        self._data["capture"]["audio"]["vad"].setdefault("short_silence_ms", 500)
+
+        # Final speech transcript gating: ignore tiny non-question scraps like
+        # "API." so they do not pollute live context or auto-trigger answers.
+        self._data.setdefault("detection", {})
+        self._data["detection"].setdefault("final_min_chars", 6)
+        self._data["detection"].setdefault("final_min_words", 2)
+        self._data["detection"].setdefault("final_requires_question_signal", True)
+        self._data["detection"].setdefault("fragment_ttl_s", 4.0)
 
         self._data.setdefault("app", {})
         self._data["app"].setdefault("focus_on_show", False)

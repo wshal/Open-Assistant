@@ -2,6 +2,53 @@
 
 import re
 
+QUESTION_WORDS = {
+    "what", "who", "where", "when", "why", "how", "which",
+}
+HELPER_WORDS = {
+    "can", "could", "would", "should", "will", "do", "does", "did",
+    "is", "are", "am", "was", "were", "have", "has", "had",
+}
+PRONOUN_WORDS = {
+    "you", "we", "i", "me", "us", "they", "them", "he", "she", "it",
+    "this", "that", "these", "those",
+}
+ACTION_WORDS = {
+    "tell", "explain", "define", "describe", "show", "give", "use", "see",
+    "mean", "means", "work", "works", "help", "helps", "fix", "build",
+    "create", "answer", "expand", "compare", "solve", "understand",
+}
+CONNECTOR_WORDS = {
+    "and", "or", "but", "if", "then", "also", "because", "about", "with",
+    "without", "from", "into", "onto", "over", "under", "between", "through",
+    "around", "after", "before",
+}
+PREPOSITION_WORDS = {
+    "in", "on", "at", "to", "of", "for", "by", "as",
+}
+TECH_WORDS = {
+    "react", "hook", "hooks", "frontend", "backend", "javascript",
+    "typescript", "python", "api", "ocr", "component", "state", "props",
+}
+PRESERVE_WORDS = {
+    "frontend", "backend", "javascript", "typescript",
+}
+COMMON_WORDS = (
+    QUESTION_WORDS
+    | HELPER_WORDS
+    | PRONOUN_WORDS
+    | ACTION_WORDS
+    | CONNECTOR_WORDS
+    | PREPOSITION_WORDS
+    | TECH_WORDS
+    | {"about", "please", "care", "question", "screen", "react", "hook", "hooks"}
+)
+CONTINUATION_STARTERS = {
+    "and", "or", "but", "so", "because", "then", "also",
+    "for", "to", "with", "without", "about", "from", "in", "on", "at", "by",
+}
+
+
 def clean_question_text(text: str) -> str:
     """Remove double spaces and normalize duplicate stutter phrases."""
     if not text:
@@ -11,7 +58,10 @@ def clean_question_text(text: str) -> str:
     cleaned = re.sub(r'\s+', ' ', text).strip()
     
     # Remove duplicate phrases like "get started. get started." or "Okay. Okay."
-    phrase_pattern = re.compile(r'(\b\S+.*?\b)\s+\1', re.IGNORECASE)
+    phrase_pattern = re.compile(
+        r'(?P<phrase>\b\S+.*?\b)\s+(?P=phrase)(?=\s|$|[.?!,;:])',
+        re.IGNORECASE,
+    )
     prev = ""
     while cleaned != prev:
         prev = cleaned
@@ -31,7 +81,8 @@ def is_stop_word(word: str) -> bool:
     stops = {
         "the", "a", "an", "is", "are", "do", "does", "did", "was", "were",
         "to", "of", "in", "for", "on", "with", "as", "at", "by", "from",
-        "it", "this", "that", "these", "those", "and", "or", "but", "if"
+        "it", "this", "that", "these", "those", "and", "or", "but", "if",
+        "i", "you", "we", "they", "he", "she", "me", "us", "them",
     }
     return word.lower() in stops
 
@@ -47,13 +98,15 @@ def glue_fragments(text: str) -> str:
     current = ""
     
     for word in words:
-        if len(word) == 1 or (word.startswith('α') and len(word) <= 4):
+        single_char_fragment = len(word) == 1 and word.lower() != "i"
+        alpha_fragment = word.startswith('α') and len(word) <= 4
+        if single_char_fragment or alpha_fragment:
             current += word
-        else:
-            if current:
-                glued.append(current)
-            glued.append(word)
-            current = ""
+            continue
+        if current:
+            glued.append(current)
+        glued.append(word)
+        current = ""
             
     if current:
         glued.append(current)
@@ -88,6 +141,98 @@ def glue_fragments(text: str) -> str:
         
     final.append(buffer)
     return " ".join(final)
+
+
+def _split_punctuation(token: str):
+    match = re.match(r"^([^A-Za-z0-9]*)([A-Za-z][A-Za-z'-]*)([^A-Za-z0-9]*)$", token)
+    if not match:
+        return "", token, ""
+    return match.group(1), match.group(2), match.group(3)
+
+
+def _merged_split_score(left: str, right: str) -> int:
+    score = 0
+    if left in QUESTION_WORDS and right in (HELPER_WORDS | PRONOUN_WORDS | ACTION_WORDS):
+        score += 10
+    if left in HELPER_WORDS and right in (PRONOUN_WORDS | ACTION_WORDS | QUESTION_WORDS):
+        score += 9
+    if left in PRONOUN_WORDS and right in (HELPER_WORDS | ACTION_WORDS):
+        score += 8
+    if left in ACTION_WORDS and right in (PRONOUN_WORDS | PREPOSITION_WORDS | CONNECTOR_WORDS):
+        score += 7
+    if left in COMMON_WORDS and right in COMMON_WORDS:
+        score += 6
+    if right in (PREPOSITION_WORDS | CONNECTOR_WORDS) and len(left) >= 4:
+        score += 5
+    if left in TECH_WORDS and right in COMMON_WORDS:
+        score += 4
+    if left.endswith("s") and right in PREPOSITION_WORDS and len(left) >= 5:
+        score += 3
+    return score
+
+
+def repair_merged_words(text: str) -> str:
+    """Split likely merged tokens such as 'couldyou' -> 'could you'."""
+    if not text:
+        return ""
+
+    repaired = []
+    for token in re.split(r"\s+", text.strip()):
+        prefix, core, suffix = _split_punctuation(token)
+        lower = core.lower()
+        if not core or not lower.isalpha() or len(lower) < 5 or lower in PRESERVE_WORDS:
+            repaired.append(token)
+            continue
+
+        best = None
+        best_score = 0
+        for idx in range(2, len(lower) - 1):
+            left = lower[:idx]
+            right = lower[idx:]
+            score = _merged_split_score(left, right)
+            if score > best_score:
+                best = idx
+                best_score = score
+
+        if best is None or best_score < 6:
+            repaired.append(token)
+            continue
+
+        repaired.append(f"{prefix}{core[:best]} {core[best:]}{suffix}")
+
+    return " ".join(repaired)
+
+
+def normalize_transcript(text: str) -> str:
+    """Apply layered ASR cleanup without overfitting to exact phrases."""
+    if not text:
+        return ""
+    cleaned = clean_question_text(glue_fragments(text))
+    cleaned = repair_merged_words(cleaned)
+    cleaned = clean_question_text(cleaned)
+    return cleaned.strip()
+
+
+def is_likely_fragment(text: str) -> bool:
+    """Heuristic filter for low-information trailing scraps from speech ASR."""
+    if not text:
+        return True
+
+    trimmed = text.strip()
+    lower = trimmed.lower()
+    words = [w for w in re.split(r"\s+", re.sub(r"[.?!,;:]+", " ", lower)) if w]
+    if not words:
+        return True
+
+    if trimmed.endswith("?"):
+        return False
+    if words[0] in CONTINUATION_STARTERS:
+        return True
+    if len(words) <= 3 and not any(w in QUESTION_WORDS for w in words):
+        return True
+    if len(words) <= 5 and words[0] in {"for", "to", "with", "about"}:
+        return True
+    return False
 
 
 def is_question_complete(text: str) -> bool:
