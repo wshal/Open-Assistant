@@ -642,28 +642,39 @@ class OpenAssistApp(QObject):
                 au = c.get("audio")
                 sc_hash = (c.get("screen_hash") or self.screen.last_img_hash or "")
             else:
-                # Fire both concurrently — capture_context is a coroutine,
-                # get_transcript is sync so wrap in an executor to avoid blocking.
-                _t0_parallel = __import__("time").time()
-                async def _get_audio_async():
-                    return self.audio.get_transcript()
-                sc, au = await asyncio.gather(
-                    self.screen.capture_context(),
-                    _get_audio_async(),
-                    return_exceptions=True,
-                )
-                # Unwrap exceptions gracefully
-                if isinstance(sc, Exception):
-                    logger.warning("[Q10 Parallel] screen capture failed: %s", sc)
+                # Vision kill-switch short-circuit: if the eye toggle has disabled vision,
+                # skip the entire screen capture await immediately — no screenshot, no OCR,
+                # no frame hash.  This saves 10-50ms per query versus letting capture_context()
+                # run and return empty.  Audio is always fetched regardless.
+                vision_on = getattr(self.screen, "_enabled", True)
+                if not vision_on:
                     sc = ""
-                if isinstance(au, Exception):
-                    logger.warning("[Q10 Parallel] audio fetch failed: %s", au)
-                    au = ""
-                sc_hash = self.screen.last_img_hash or ""
-                logger.debug(
-                    "[Q10 Parallel] Screen + audio fetched concurrently in %.0fms",
-                    (__import__("time").time() - _t0_parallel) * 1000,
-                )
+                    sc_hash = ""
+                    au = self.audio.get_transcript()
+                    logger.debug("[Vision OFF] Screen capture skipped — AI using audio-only context")
+                else:
+                    # Fire both concurrently — capture_context is a coroutine,
+                    # get_transcript is sync so wrap in an executor to avoid blocking.
+                    _t0_parallel = __import__("time").time()
+                    async def _get_audio_async():
+                        return self.audio.get_transcript()
+                    sc, au = await asyncio.gather(
+                        self.screen.capture_context(),
+                        _get_audio_async(),
+                        return_exceptions=True,
+                    )
+                    # Unwrap exceptions gracefully
+                    if isinstance(sc, Exception):
+                        logger.warning("[Q10 Parallel] screen capture failed: %s", sc)
+                        sc = ""
+                    if isinstance(au, Exception):
+                        logger.warning("[Q10 Parallel] audio fetch failed: %s", au)
+                        au = ""
+                    sc_hash = self.screen.last_img_hash or ""
+                    logger.debug(
+                        "[Q10 Parallel] Screen + audio fetched concurrently in %.0fms",
+                        (__import__("time").time() - _t0_parallel) * 1000,
+                    )
 
             # P1.3: Log the screen_hash being used for cache fingerprinting
             if sc_hash:

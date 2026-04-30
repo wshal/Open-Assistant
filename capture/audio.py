@@ -281,7 +281,7 @@ class AudioCapture(QObject):
         free_gb = 0.0
         gpu_name = "unknown GPU"
         try:
-            import pynvml
+            import pynvml  # type: ignore[import-untyped]
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
             gpu_name = pynvml.nvmlDeviceGetName(handle)

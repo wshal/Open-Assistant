@@ -224,7 +224,7 @@ class OverlayWindow(QMainWindow):
 
         # PHASE 1: Interactive Vision Kill Switch (Placed BEFORE mic)
         self.vision_status = QPushButton("👁️")
-        self.vision_status.setToolTip("Toggle Vision (OCR) on or off for this session")
+        self.vision_status.setToolTip("Toggle Vision (Screen Capture + OCR) — when OFF the AI answers from audio only, no screenshots are taken")
         self.vision_status.setCursor(Qt.CursorShape.PointingHandCursor)
         self.vision_status.setFixedSize(24, 24)
         self.vision_status.setStyleSheet("""
@@ -708,31 +708,70 @@ class OverlayWindow(QMainWindow):
         self.refresh_standby_state()
 
     def _toggle_vision(self):
-        """Toggle vision mid-session."""
-        # Read current state from the screen capture module
+        """Full vision kill switch — toggles screen capture + OCR as a unit.
+
+        When OFF:
+          - ScreenCapture._enabled = False  → no screenshots, no OCR, no frame hashing
+          - _process_ai short-circuits the screen branch (saves 10-50ms per query)
+          - ANALYZE SCREEN button is disabled (no point capturing when vision is off)
+          - Config is persisted so the state survives session restarts
+        When ON:
+          - All of the above restored
+          - ANALYZE SCREEN button re-enabled
+        """
         current = self.app.screen._enabled if hasattr(self.app, "screen") and self.app.screen else False
         new_state = not current
+
+        # 1. Apply to the live ScreenCapture module
         if hasattr(self.app, "screen") and self.app.screen:
             self.app.screen.set_enabled(new_state)
+
+        # 2. Persist to config so it survives session restarts
+        try:
+            self.config.set("capture.screen.enabled", new_state)
+            if hasattr(self.config, "save"):
+                self.config.save()
+        except Exception:
+            pass
+
+        # 3. Update UI
         self.update_vision_state(reset_to_master=False)
 
+        # 4. Transcript feedback so user knows what happened
+        if getattr(self.app, "session_active", False):
+            msg = "🌐 Listening..." if new_state else "👁️ Vision OFF — answering from audio only"
+            state = "listening" if new_state else "idle"
+            self.update_transcript(msg, state=state)
+
     def update_vision_state(self, reset_to_master=False):
-        """Update Eye Icon to reflect current state. If reset_to_master is True, pulls from config."""
+        """Sync eye icon + ANALYZE SCREEN button to current ScreenCapture._enabled state.
+
+        If reset_to_master=True, reads the canonical value from config and applies it
+        to the live module (called at session start to snap back to the saved setting).
+        """
         if reset_to_master:
             master_enabled = self.config.get("capture.screen.enabled", True)
             if hasattr(self.app, "screen") and self.app.screen:
                 self.app.screen.set_enabled(master_enabled)
-        
-        # Read true state from module
+
+        # Read true live state from module (not from config — they may differ mid-session)
         enabled = self.app.screen._enabled if hasattr(self.app, "screen") and self.app.screen else False
-        
-        # Unicode does not have a single "Eye with a slash" emoji, and combining characters
-        # render poorly on Windows. 🙈 (See-No-Evil Monkey) is the standard single-emoji alternative
-        # used in UIs for "vision disabled / hidden".
+
+        # Eye icon: 👁️ = on (green), 🙈 = off (red)
+        # 🙈 is the standard single-emoji "hidden" symbol — renders reliably on Windows
         self.vision_status.setText("👁️" if enabled else "🙈")
         self.vision_status.setStyleSheet(
             f"color: {'#4ade80' if enabled else '#ef4444'}; font-size: 14px; background: transparent; border: none;"
         )
+
+        # Disable ANALYZE SCREEN when vision is fully off — no point capturing
+        if hasattr(self, "btn_analyze_screen"):
+            self.btn_analyze_screen.setEnabled(enabled)
+            self.btn_analyze_screen.setToolTip(
+                "Capture the current screen and analyze it with live session context"
+                if enabled
+                else "Vision is OFF — enable vision (👁️) to use screen analysis"
+            )
 
     def _on_standby_mode_selected(self, mode):
         """Update app state when user clicks a mode button on standby screen."""
