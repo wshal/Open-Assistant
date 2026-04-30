@@ -435,8 +435,163 @@ class CaptureTabMixin:
         self._style_combo(self.image_quality)
         l.addWidget(self.image_quality)
 
+        # ── KNOWLEDGE BASE ──────────────────────────────────────────────────
+        sep_kb = QFrame()
+        sep_kb.setFixedHeight(1)
+        sep_kb.setStyleSheet("background: rgba(255,255,255,12);")
+        l.addWidget(sep_kb)
+
+        lbl_kb = self._make_section_label("KNOWLEDGE BASE")
+        l.addWidget(lbl_kb)
+
+        kb_desc = QLabel(
+            "Feed the AI your own documents. Drop PDFs, Q&A JSON files, or plain text "
+            "into the knowledge folder and they will be indexed automatically on next startup. "
+            "Or use the button below to import files right now."
+        )
+        kb_desc.setWordWrap(True)
+        kb_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+        l.addWidget(kb_desc)
+
+        # Status label (shows how many chunks are in the DB)
+        self._kb_status_lbl = QLabel("📚 Loading knowledge base info...")
+        self._kb_status_lbl.setStyleSheet("color: #818cf8; font-size: 10px; background: transparent;")
+        l.addWidget(self._kb_status_lbl)
+        self._refresh_kb_status()
+
+        kb_row = QHBoxLayout()
+        kb_row.setSpacing(8)
+
+        btn_import_kb = QPushButton("📥 Import Files")
+        btn_import_kb.setFixedHeight(30)
+        btn_import_kb.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_import_kb.setToolTip(
+            "Import PDF, JSON Q&A, or text files into the knowledge base.\n"
+            "Files are copied to the knowledge folder and indexed immediately."
+        )
+        btn_import_kb.setStyleSheet("""
+            QPushButton {
+                background: rgba(99,102,241,35); color: #818cf8;
+                border: 1px solid rgba(99,102,241,76); border-radius: 8px;
+                font-size: 11px; font-weight: 700; padding: 0 12px;
+            }
+            QPushButton:hover { background: rgba(99,102,241,60); color: white; }
+        """)
+        btn_import_kb.clicked.connect(self._import_knowledge_files)
+        kb_row.addWidget(btn_import_kb)
+
+        btn_open_kb = QPushButton("📂 Open Folder")
+        btn_open_kb.setFixedHeight(30)
+        btn_open_kb.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open_kb.setToolTip("Open the knowledge documents folder in Explorer")
+        btn_open_kb.setStyleSheet("""
+            QPushButton {
+                background: rgba(255,255,255,8); color: #94a3b8;
+                border: 1px solid rgba(255,255,255,15); border-radius: 8px;
+                font-size: 11px; padding: 0 12px;
+            }
+            QPushButton:hover { background: rgba(255,255,255,18); color: white; }
+        """)
+        btn_open_kb.clicked.connect(self._open_knowledge_folder)
+        kb_row.addWidget(btn_open_kb)
+        kb_row.addStretch()
+        l.addLayout(kb_row)
+
         l.addStretch()
         scroll.setWidget(w)
         return scroll
 
+    def _refresh_kb_status(self):
+        """Update the knowledge base chunk count label."""
+        try:
+            import threading
+            def _count():
+                try:
+                    rag = getattr(self.app, "rag", None)
+                    if rag:
+                        rag._ensure_loaded()
+                        count = rag.collection.count() if rag.collection else 0
+                        from core.constants import DOCS_DIR
+                        from pathlib import Path
+                        files = list(Path(DOCS_DIR).rglob("*"))
+                        n_files = sum(1 for f in files if f.is_file())
+                        msg = f"📚 {count} chunks indexed from {n_files} file(s)"
+                    else:
+                        msg = "📚 RAG engine not available"
+                    from PyQt6.QtCore import QMetaObject, Qt as _Qt
+                    # Safe cross-thread UI update
+                    if hasattr(self, "_kb_status_lbl"):
+                        self._kb_status_lbl.setText(msg)
+                except Exception:
+                    pass
+            threading.Thread(target=_count, daemon=True).start()
+        except Exception:
+            pass
 
+    def _import_knowledge_files(self):
+        """File picker → copy to DOCS_DIR → re-index in background thread."""
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        from pathlib import Path
+        import shutil
+        import threading
+        from core.constants import DOCS_DIR
+
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Import Knowledge Files",
+            "",
+            "Supported Files (*.pdf *.json *.txt *.md *.py *.yaml *.yml);;"
+            "PDF Files (*.pdf);;"
+            "Q&A JSON (*.json);;"
+            "Text Files (*.txt *.md);;"
+            "All Files (*.*)",
+        )
+        if not paths:
+            return
+
+        dest_dir = Path(DOCS_DIR)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        copied = []
+        for src in paths:
+            try:
+                dst = dest_dir / Path(src).name
+                shutil.copy2(src, dst)
+                copied.append(Path(src).name)
+            except Exception as e:
+                QMessageBox.warning(self, "Copy Error", f"Could not copy {Path(src).name}:\n{e}")
+
+        if not copied:
+            return
+
+        # Re-index in background — don't block the UI
+        def _reindex():
+            try:
+                from knowledge.ingest import ingest_all
+                rag = getattr(self.app, "rag", None)
+                if rag:
+                    ingest_all(rag, dest_dir)
+                    self._refresh_kb_status()
+            except Exception as ex:
+                pass
+
+        threading.Thread(target=_reindex, daemon=True, name="kb-import").start()
+
+        names = ", ".join(copied[:5])
+        if len(copied) > 5:
+            names += f" (+{len(copied)-5} more)"
+        QMessageBox.information(
+            self,
+            "Files Imported",
+            f"✅ Copied {len(copied)} file(s) to knowledge folder:\n{names}\n\n"
+            f"Indexing in background — will be available on next query.",
+        )
+
+    def _open_knowledge_folder(self):
+        """Open the knowledge documents folder in Windows Explorer."""
+        from pathlib import Path
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        from core.constants import DOCS_DIR
+        p = Path(DOCS_DIR)
+        p.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))

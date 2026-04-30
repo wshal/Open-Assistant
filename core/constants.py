@@ -1,14 +1,52 @@
 """App-wide constants."""
 
+import os
+import sys
+from pathlib import Path
+
 APP_NAME = "OpenAssist AI"
 APP_VERSION = "4.0.0"
 APP_ID = "com.openassist.ai"
-SETTINGS_FILE = "data/settings.enc"
-CONFIG_FILE = "config.yaml"
-DB_DIR = "data/vectordb"
-CACHE_DIR = "data/cache"
-LOG_DIR = "logs"
-DOCS_DIR = "knowledge/documents"
+
+
+def _get_user_data_dir() -> Path:
+    """Return the directory where ALL mutable user data lives.
+
+    Strategy:
+      • Frozen (.exe via PyInstaller):
+          Prefer a sibling 'data' folder next to the .exe so the user
+          can see and edit their files in Explorer.
+          Path: <exe_dir>/OpenAssist_Data/
+
+      • Development (running from source):
+          Use the project root — same behaviour as before.
+
+    This single function is the ONLY place that needs to know about
+    PyInstaller's _MEIPASS / sys.frozen — everything else uses the
+    path constants below.
+    """
+    if getattr(sys, "frozen", False):          # running as .exe
+        exe_dir = Path(sys.executable).parent  # folder containing the .exe
+        data_dir = exe_dir / "OpenAssist_Data"
+    else:                                       # running from source
+        data_dir = Path(".")                    # project root (current behaviour)
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+
+_USER_DATA = _get_user_data_dir()
+
+# ---------------------------------------------------------------------------
+# Mutable paths — all live inside _USER_DATA so they survive .exe packaging
+# ---------------------------------------------------------------------------
+SETTINGS_FILE = str(_USER_DATA / "data" / "settings.enc")
+CONFIG_FILE   = str(_USER_DATA / "config.yaml")
+DB_DIR        = str(_USER_DATA / "data" / "vectordb")
+CACHE_DIR     = str(_USER_DATA / "data" / "cache")
+LOG_DIR       = str(_USER_DATA / "logs")
+DOCS_DIR      = str(_USER_DATA / "knowledge" / "documents")
+KNOWLEDGE_DIR = str(_USER_DATA / "knowledge")
 
 # Provider metadata — display names, URLs, free tier info
 PROVIDERS = {

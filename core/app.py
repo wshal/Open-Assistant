@@ -1642,12 +1642,26 @@ class OpenAssistApp(QObject):
                 logger.error(f"Audio Warmup Fault: {e}")
 
         def _warm_knowledge_deferred():
-            """Index knowledge base quietly — does NOT block READY signal."""
+            """Index knowledge base — handles PDFs, Q&A files, and text/code docs.
+
+            Drop any file into knowledge/documents/ and it is indexed here:
+              .pdf              → PyMuPDF text extraction → chunked → indexed
+              .json/.txt (Q&A)  → Q/A pair parser → 'Q:..\nA:..' chunks → indexed
+              .txt/.md/.py etc  → add_directory as before
+            Does NOT block the READY signal — runs fully in background.
+            """
             try:
-                self.rag.add_directory("./knowledge")
+                from knowledge.ingest import ingest_all
+                from pathlib import Path
+                from core.constants import DOCS_DIR
+                ingest_all(self.rag, Path(DOCS_DIR))
                 self.warmup_status_update.emit("📚 Knowledge Ready", 95, False)
             except Exception as e:
                 logger.error(f"RAG Warmup Fault: {e}")
+                try:
+                    self.rag.add_directory("./knowledge")
+                except Exception:
+                    pass
 
         # Tier 1: critical — only these are joined before emitting READY
         # Both complete in ~2-3s (Ollama health + basic AI setup)

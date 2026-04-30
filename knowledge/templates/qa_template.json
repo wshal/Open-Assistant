@@ -1,0 +1,22 @@
+[
+  {
+    "q": "What is the difference between useEffect and useLayoutEffect in React?",
+    "a": "useEffect runs after the browser has painted the screen (asynchronous), while useLayoutEffect fires synchronously after all DOM mutations but before the browser paints. Use useLayoutEffect only when you need to measure DOM elements or synchronously update the DOM before the user sees it — otherwise always prefer useEffect."
+  },
+  {
+    "q": "Why does my useEffect run twice in React 18?",
+    "a": "In React 18 Strict Mode, effects intentionally run twice in development to help you detect side effects. This only happens in development — in production it runs once. The fix is to ensure your cleanup function properly tears down whatever the effect set up, not to remove Strict Mode."
+  },
+  {
+    "q": "How do I prevent a React component from re-rendering?",
+    "a": "Use React.memo() to wrap a functional component — it shallow-compares props and skips re-render if nothing changed. For expensive computations, use useMemo(). For callbacks passed as props, use useCallback(). Never create new objects/arrays/functions inside the render body if you want referential stability."
+  },
+  {
+    "q": "What is the dependency array in useEffect?",
+    "a": "The second argument to useEffect is an array of values the effect depends on. React compares these values between renders using Object.is(). Empty array [] means run once on mount. No array means run on every render. Values in the array: run whenever any of them changes. Common mistake: including objects or arrays — they get new references every render even with the same content, causing infinite loops."
+  },
+  {
+    "q": "How does useReducer differ from useState?",
+    "a": "useState is for simple, independent state values. useReducer is better when: (1) next state depends on previous state logic, (2) multiple sub-values are managed together, (3) state transitions are complex. useReducer takes (state, action) => newState and returns [state, dispatch]. It follows the Redux pattern but stays local to the component."
+  }
+]
