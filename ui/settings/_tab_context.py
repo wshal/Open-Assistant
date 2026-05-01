@@ -71,7 +71,7 @@ class ContextTabMixin:
         load_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         load_btn.setStyleSheet(
             "QPushButton { background: rgba(80,85,255,45); color: #c0c0ff; border-radius: 6px; "
-            "font-size: 10px; font-weight: 800; border: 1px solid rgba(129,140,248,102); padding: 0 10px; }"
+            "font-size: 10px; font-weight: 800; border: 1px solid rgba(129,140,248,102); padding: 0 10px; } "
             "QPushButton:hover { background: rgba(80,85,255,76); color: white; }"
         )
         load_btn.clicked.connect(self._load_ctx_preset)
@@ -90,9 +90,9 @@ class ContextTabMixin:
         self._ctx_edit.setStyleSheet(
             """
             QTextEdit {
-                background: rgba(12, 12, 28, 200);
+                background: rgba(12,12,28,200);
                 color: #d0d0f0;
-                border: 1px solid rgba(99, 102, 241, 30);
+                border: 1px solid rgba(99,102,241,30);
                 border-radius: 8px;
                 padding: 12px;
                 font-size: 11px;
@@ -100,7 +100,7 @@ class ContextTabMixin:
                 line-height: 1.5;
             }
             QTextEdit:focus {
-                border: 1px solid rgba(99, 102, 241, 80);
+                border: 1px solid rgba(99,102,241,80);
             }
             """
         )
@@ -131,7 +131,7 @@ class ContextTabMixin:
         save_preset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         save_preset_btn.setStyleSheet(
             "QPushButton { background: rgba(16,185,129,38); color: #6ee7b7; border-radius: 6px; "
-            "font-size: 10px; font-weight: 800; border: 1px solid rgba(52,211,153,76); padding: 0 12px; }"
+            "font-size: 10px; font-weight: 800; border: 1px solid rgba(52,211,153,76); padding: 0 12px; } "
             "QPushButton:hover { background: rgba(16,185,129,63); color: white; }"
         )
         save_preset_btn.clicked.connect(self._save_ctx_as_preset)
@@ -142,7 +142,7 @@ class ContextTabMixin:
         del_preset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         del_preset_btn.setStyleSheet(
             "QPushButton { background: rgba(220,38,38,30); color: #fca5a5; border-radius: 6px; "
-            "font-size: 10px; font-weight: 800; border: 1px solid rgba(248,113,113,71); padding: 0 12px; }"
+            "font-size: 10px; font-weight: 800; border: 1px solid rgba(248,113,113,71); padding: 0 12px; } "
             "QPushButton:hover { background: rgba(220,38,38,56); color: white; }"
         )
         del_preset_btn.clicked.connect(self._delete_ctx_preset)
@@ -244,6 +244,5 @@ class ContextTabMixin:
             color = "#fca5a5" if n > 2000 else "#64748b"
             self._ctx_char_label.setText(f"{n} / 2000 chars")
             self._ctx_char_label.setStyleSheet(
-                f"color: {color}; font-size: 9px; background: transparent;"
+                f"QLabel {{ color: {color}; font-size: 9px; background: transparent; }}"
             )
-

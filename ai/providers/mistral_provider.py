@@ -18,7 +18,7 @@ class MistralProvider(BaseProvider):
         try:
             from mistralai import Mistral
             self.client = Mistral(api_key=key)
-            logger.info("  â Mistral ready (Codestral)")
+            logger.info("  [OK] Mistral ready (Codestral)")
         except Exception as e:
             logger.warning(f"  â Mistral: {e}")
             self.enabled = False

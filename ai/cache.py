@@ -204,6 +204,7 @@ class EmbeddingTier:
         # Q18: separate write-lock to prevent concurrent np.save races
         self._persist_lock = threading.Lock()
         self._persist_timer: threading.Timer = None
+        self._persist_thread: Optional[threading.Thread] = None
 
         # In-memory index: parallel lists for fast numpy batch cosine similarity
         self._vectors: List[np.ndarray] = []   # each shape (384,) float32
@@ -310,33 +311,38 @@ class EmbeddingTier:
     def _persist(self) -> None:
         if not self._dirty or not self._vectors:
             return
+        with self._persist_lock:
+            if self._persist_thread and self._persist_thread.is_alive():
+                return
         # Q18: Run in background thread to avoid blocking response path
         def _do_persist():
-            with self._persist_lock:
-                try:
-                    with self._data_lock:
-                        if not self._vectors:
-                            return
-                        vecs = np.stack(self._vectors)
-                        meta = [
-                            {
-                                "mode": r.mode,
-                                "context_fp": r.context_fp,
-                                "cache_query": r.cache_query,
-                                "history_fp": r.history_fp,
-                                "ts": ts,
-                            }
-                            for r, ts in zip(self._records, self._timestamps)
-                        ]
-                    self._vectors_path.parent.mkdir(parents=True, exist_ok=True)
-                    np.save(str(self._vectors_path), vecs)
-                    self._meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-                    with self._data_lock:
-                        self._dirty = False
-                    logger.debug("[Q18 Persist] Embedding index saved in background (%d vectors)", len(vecs))
-                except Exception as e:
-                    logger.debug("EmbeddingTier: background persist failed: %s", e)
-        threading.Thread(target=_do_persist, daemon=True, name="embed-persist").start()
+            try:
+                with self._data_lock:
+                    if not self._vectors:
+                        return
+                    vecs = np.stack(self._vectors)
+                    meta = [
+                        {
+                            "mode": r.mode,
+                            "context_fp": r.context_fp,
+                            "cache_query": r.cache_query,
+                            "history_fp": r.history_fp,
+                            "ts": ts,
+                        }
+                        for r, ts in zip(self._records, self._timestamps)
+                    ]
+                self._vectors_path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(str(self._vectors_path), vecs)
+                self._meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                with self._data_lock:
+                    self._dirty = False
+                logger.debug("[Q18 Persist] Embedding index saved in background (%d vectors)", len(vecs))
+            except Exception as e:
+                logger.debug("EmbeddingTier: background persist failed: %s", e)
+
+        thread = threading.Thread(target=_do_persist, daemon=True, name="embed-persist")
+        self._persist_thread = thread
+        thread.start()
 
     def _schedule_persist_timer(self, interval: float = 30.0) -> None:
         """Q18: Periodic background persist every 30s — restarts itself."""

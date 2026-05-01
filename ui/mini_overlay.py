@@ -121,9 +121,9 @@ class MiniOverlay(QMainWindow):
         self.type_btn.setToolTip("Type last response into active window")
         self.type_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.type_btn.setStyleSheet(
-            "background: rgba(80,200,120,30); color: #4ade80; border: none;"
-            " border-radius: 11px; font-size: 11px;"
-            " QPushButton:hover { background: rgba(80,200,120,63); }"
+            "QPushButton { background: rgba(80,200,120,30); color: #4ade80; border: none; "
+            "border-radius: 11px; font-size: 11px; } "
+            "QPushButton:hover { background: rgba(80,200,120,63); }"
         )
         self.type_btn.clicked.connect(self._type_response)
         self.type_btn.setVisible(False)  # only shown once a response exists
@@ -253,9 +253,9 @@ class MiniOverlay(QMainWindow):
 
         toast = QLabel(msg, self)
         toast.setStyleSheet(
-            "background: rgba(30, 41, 59, 0.95); "
+            "background: rgba(30,41,59,242); "
             "color: #818cf8; "
-            "border: 1px solid rgba(99, 102, 241, 0.3); "
+            "border: 1px solid rgba(99,102,241,76); "
             "border-radius: 6px; "
             "padding: 6px 10px; "
             "font-size: 11px; "

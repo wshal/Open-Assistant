@@ -20,7 +20,7 @@ class GroqProvider(BaseProvider):
         try:
             from groq import AsyncGroq
             self.client = AsyncGroq(api_key=key)
-            logger.info("  â Groq ready (1300 tok/s)")
+            logger.info("  [OK] Groq ready (1300 tok/s)")
         except Exception as e:
             logger.warning(f"  â Groq: {e}")
             self.enabled = False

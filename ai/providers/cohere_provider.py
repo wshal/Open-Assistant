@@ -18,7 +18,7 @@ class CohereProvider(BaseProvider):
         try:
             import cohere
             self.client = cohere.AsyncClientV2(api_key=key)
-            logger.info("  â Cohere ready (best for RAG)")
+            logger.info("  [OK] Cohere ready (best for RAG)")
         except Exception as e:
             logger.warning(f"  â Cohere: {e}")
             self.enabled = False

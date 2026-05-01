@@ -170,10 +170,9 @@ class AudioCapture(QObject):
         ]:
             _eff = _blocks * self.block_ms
             if _eff != _cfg_ms:
-                logger.warning(
-                    f"VAD: {_cfg_key}={_cfg_ms}ms floors to {_eff}ms "
-                    f"({_blocks}\u00d7{self.block_ms}ms blocks). "
-                    f"Use a multiple of {self.block_ms}ms for exact timing."
+                logger.debug(
+                    f"VAD: {_cfg_key}={_cfg_ms}ms adjusted to {_eff}ms "
+                    f"({_blocks}\u00d7{self.block_ms}ms blocks)."
                 )
         self._vad_backend_name = "rms"
 

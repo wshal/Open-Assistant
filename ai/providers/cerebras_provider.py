@@ -19,7 +19,7 @@ class CerebrasProvider(BaseProvider):
         try:
             from openai import AsyncOpenAI
             self.client = AsyncOpenAI(api_key=key, base_url=ep)
-            logger.info("  â Cerebras ready (2100 tok/s)")
+            logger.info("  [OK] Cerebras ready (2100 tok/s)")
         except Exception as e:
             logger.warning(f"  â Cerebras: {e}")
             self.enabled = False

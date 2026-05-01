@@ -3,15 +3,15 @@ ui/settings/constants.py
 Shared styling and constants for the Settings UI.
 """
 
-BG_DARK = "background: rgba(15, 15, 30, 245);"
+BG_DARK = "background: rgba(15,15,30,245);"
 TEXT_PRIMARY = "color: #c0c0ff;"
 TEXT_MUTED = "color: #64748b;"
 
 SS_INPUT = """
 QLineEdit, QComboBox {
-    background: rgba(20, 20, 40, 220);
+    background: rgba(20,20,40,220);
     color: #e0e0f5;
-    border: 1px solid rgba(80, 85, 255, 20);
+    border: 1px solid rgba(80,85,255,20);
     border-radius: 6px;
     padding: 6px 10px;
     font-size: 11px;

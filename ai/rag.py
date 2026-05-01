@@ -12,6 +12,7 @@ import hashlib
 from pathlib import Path
 from typing import List, Optional
 from utils.logger import setup_logger
+from ai.embedding_manager import EmbeddingManager
 
 logger = setup_logger(__name__)
 
@@ -88,27 +89,16 @@ class RAGEngine:
                         "knowledge", metadata={"hnsw:space": "cosine"}
                     )
 
-                # Initialize Embeddings (Fallback to SentenceTransformers if FastEmbed missing)
-                try:
-                    os.environ.setdefault("FASTEMBED_CACHE_PATH", "./data/cache/fastembed")
-                    from fastembed import TextEmbedding
+                def _embed_texts(texts):
+                    vectors = []
+                    for text in texts:
+                        vec = EmbeddingManager().embed(text)
+                        if vec is None:
+                            raise RuntimeError("embedding backend unavailable during startup")
+                        vectors.append(vec.tolist())
+                    return vectors
 
-                    emb = TextEmbedding(
-                        model_name=self.config.get(
-                            "rag.embedding_model", "BAAI/bge-small-en-v1.5"
-                        )
-                    )
-                    self._embed_fn = lambda texts: [
-                        e.tolist() for e in emb.embed(texts)
-                    ]
-                except Exception as embed_error:
-                    if _is_expected_offline_error(embed_error):
-                        raise RuntimeError(
-                            "embedding model unavailable during startup; RAG warmup skipped"
-                        ) from embed_error
-                    raise RuntimeError(
-                        f"fastembed is unavailable ({embed_error}); install local embedding support to enable RAG"
-                    ) from embed_error
+                self._embed_fn = _embed_texts
 
                 self._loaded = True
                 logger.info(f"✅ RAG Ready ({self.collection.count()} chunks)")

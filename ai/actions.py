@@ -12,6 +12,7 @@ import re
 import asyncio
 import subprocess
 import os
+import shutil
 import time
 from typing import Optional, Tuple, List, Dict, Any
 from pathlib import Path
@@ -19,6 +20,8 @@ from pathlib import Path
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+_WINDOWS_SHELL_BUILTINS = {"dir", "set", "start"}
 
 
 # ---------------------------------------------------------------------------
@@ -291,27 +294,42 @@ class ActionExecutor:
         )
         t0 = time.perf_counter()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=self._cwd,
-            )
+            if not command:
+                return "[Action execution failed: empty command]"
+
+            if os.name == "nt" and command[0].lower() in _WINDOWS_SHELL_BUILTINS:
+                run_cmd = ["cmd", "/c", *command]
+            else:
+                resolved = shutil.which(command[0])
+                if not resolved:
+                    logger.warning(
+                        f"[P3.3 Actions] Command not found: '{command[0]}'"
+                    )
+                    return f"[Command not found: {command[0]}]"
+                run_cmd = [resolved, *command[1:]]
+
+            def _run_command():
+                return subprocess.run(
+                    run_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    cwd=self._cwd,
+                    check=False,
+                )
+
             try:
-                stdout_bytes, _ = await asyncio.wait_for(
-                    proc.communicate(), timeout=self._timeout_s
+                completed = await asyncio.wait_for(
+                    asyncio.to_thread(_run_command), timeout=self._timeout_s
                 )
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
                 logger.warning(
                     f"[P3.3 Actions] '{intent_label}' timed out after {self._timeout_s}s"
                 )
                 return f"[Action timed out after {self._timeout_s:.0f}s]"
 
             elapsed = (time.perf_counter() - t0) * 1000
-            output = (stdout_bytes or b"").decode("utf-8", errors="replace").strip()
-            rc = proc.returncode
+            output = (completed.stdout or b"").decode("utf-8", errors="replace").strip()
+            rc = completed.returncode
 
             logger.info(
                 f"[P3.3 Actions] '{intent_label}' finished in {elapsed:.0f}ms, "
@@ -328,11 +346,6 @@ class ActionExecutor:
             header = f"$ {' '.join(command)}\n"
             return header + output
 
-        except FileNotFoundError:
-            logger.warning(
-                f"[P3.3 Actions] Command not found: '{command[0]}'"
-            )
-            return f"[Command not found: {command[0]}]"
         except Exception as e:
             logger.error(f"[P3.3 Actions] Execution error: {e}")
             return f"[Action execution failed: {e}]"

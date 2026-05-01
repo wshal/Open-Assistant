@@ -41,14 +41,14 @@ from utils.context_store import get_store as get_context_store
 logger = setup_logger(__name__)
 
 # --- Premium Midnight Styling ---
-BG_DARK = "background: rgba(15, 15, 30, 245);"
+BG_DARK = "background: rgba(15,15,30,245);"
 TEXT_PRIMARY = "color: #c0c0ff;"
 TEXT_MUTED = "color: #64748b;"
 SS_INPUT = """
 QLineEdit, QComboBox {
-    background: rgba(20, 20, 40, 220);
+    background: rgba(20,20,40,220);
     color: #e0e0f5;
-    border: 1px solid rgba(80, 85, 255, 20);
+    border: 1px solid rgba(80,85,255,20);
     border-radius: 6px;
     padding: 6px 10px;
     font-size: 11px;
@@ -429,7 +429,7 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
 
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet("""
-            QTabWidget::pane { border: 1px solid rgba(80, 85, 255, 10); background: transparent; border-radius: 8px; }
+            QTabWidget::pane { border: 1px solid rgba(80,85,255,10); background: transparent; border-radius: 8px; }
             QTabBar::tab { background: rgba(0,0,0,76); color: #778; padding: 10px 20px; font-size: 10px; font-weight: bold; border-top-left-radius: 8px; border-top-right-radius: 8px; margin-right: 2px; }
             QTabBar::tab:selected { background: rgba(80,85,255,20); color: #c0c0ff; border-bottom: 2px solid #6366f1; }
         """)

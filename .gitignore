@@ -17,6 +17,8 @@ data/history.enc
 data/history/
 data/vectordb/
 data/cache/
+data/chroma_db/
+data/test_tmp/
 data/context_presets.json
 logs/
 .openassist/
@@ -50,8 +52,7 @@ build/
 dist/
 *.spec
 *.manifest
-OpenAssist-AI.spec
-build.spec
+!OpenAssist-AI.spec
 *.egg-info/
 *.egg
 MANIFEST

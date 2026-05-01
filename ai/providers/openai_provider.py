@@ -32,7 +32,7 @@ class OpenAIProvider(BaseProvider):
         try:
             from openai import AsyncOpenAI
             self.client = AsyncOpenAI(api_key=key)
-            logger.info("  â OpenAI ready (GPT-4o)")
+            logger.info("  [OK] OpenAI ready (GPT-4o)")
         except ImportError:
             logger.warning("  â OpenAI: pip install openai")
             self.enabled = False

@@ -14,10 +14,15 @@ import time
 from typing import List, Optional, Tuple
 
 from utils.logger import setup_logger
+from utils.platform_utils import PlatformInfo
 
 logger = setup_logger(__name__)
 
-_DB_DIR = pathlib.Path.home() / ".openassist" / "chroma_db"
+_DB_DIR = (
+    PlatformInfo.get_app_data_dir() / "chroma_db"
+    if PlatformInfo.IS_FROZEN
+    else pathlib.Path("data") / "chroma_db"
+)
 _COLLECTION_NAME = "session_memory"
 _MAX_RESULTS = 3
 _RELEVANCE_THRESHOLD = 0.55   # cosine similarity floor (0=unrelated, 1=identical)
@@ -90,7 +95,9 @@ class LongTermMemory:
                 "run: pip install chromadb"
             )
         except Exception as e:
-            logger.error(f"[LongTermMemory] Init failed: {e}")
+            self._ready = False
+            self._enabled = False
+            logger.warning(f"[LongTermMemory] Init skipped: {e}")
 
     # ------------------------------------------------------------------
     # Public API

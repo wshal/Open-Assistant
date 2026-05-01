@@ -23,7 +23,7 @@ class GeminiProvider(BaseProvider):
         try:
             from google import genai
             self.client = genai.Client(api_key=key)
-            logger.info("  â Gemini ready (best quality free)")
+            logger.info("  [OK] Gemini ready (best quality free)")
         except Exception as e:
             logger.warning(f"  â Gemini: {e}")
             self.enabled = False

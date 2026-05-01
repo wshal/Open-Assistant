@@ -824,34 +824,36 @@ class TestTier3AsyncPersist(unittest.TestCase):
         """Q18: Calling _persist() must return immediately (< 50ms)."""
         import time
         from ai.cache import EmbeddingTier, _EmbedRecord
-        import tempfile, pathlib
+        import pathlib
         import numpy as np
 
-        with tempfile.TemporaryDirectory() as tmp:
-            vp = pathlib.Path(tmp) / "vecs.npy"
-            mp = pathlib.Path(tmp) / "meta.json"
-            et = EmbeddingTier(vectors_path=vp, meta_path=mp, ttl_s=60)
-            # Cancel the 30s timer so it doesn't fire during cleanup
-            if et._persist_timer:
-                et._persist_timer.cancel()
+        test_root = pathlib.Path("data") / "test_tmp" / "persist_non_blocking"
+        test_root.mkdir(parents=True, exist_ok=True)
+        vp = test_root / "vecs.npy"
+        mp = test_root / "meta.json"
+        et = EmbeddingTier(vectors_path=vp, meta_path=mp, ttl_s=60)
+        # Cancel the 30s timer so it doesn't fire after the assertion
+        if et._persist_timer:
+            et._persist_timer.cancel()
 
-            with et._data_lock:
-                et._vectors = [np.zeros(384, dtype="float32")]
-                et._records = [_EmbedRecord(mode="g", context_fp="c",
-                                            cache_query="q", history_fp="h")]
-                et._timestamps = [time.time()]
-                et._dirty = True
+        with et._data_lock:
+            et._vectors = [np.zeros(384, dtype="float32")]
+            et._records = [_EmbedRecord(mode="g", context_fp="c",
+                                        cache_query="q", history_fp="h")]
+            et._timestamps = [time.time()]
+            et._dirty = True
 
-            t0 = time.time()
-            et._persist()
-            elapsed_ms = (time.time() - t0) * 1000
+        t0 = time.time()
+        et._persist()
+        elapsed_ms = (time.time() - t0) * 1000
 
-            # Should return almost instantly — background thread does the I/O
-            self.assertLess(elapsed_ms, 50,
-                            f"_persist() took {elapsed_ms:.0f}ms — should be <50ms (non-blocking)")
+        # Should return almost instantly — background thread does the I/O
+        self.assertLess(elapsed_ms, 50,
+                        f"_persist() took {elapsed_ms:.0f}ms — should be <50ms (non-blocking)")
 
-            # Wait for background thread to finish before tempdir cleanup
-            time.sleep(0.3)
+        # Wait for background thread to finish and verify that it wrote something.
+        time.sleep(0.3)
+        self.assertTrue(vp.exists() or mp.exists())
 
 
 class TestTier3DevServerIntents(unittest.TestCase):

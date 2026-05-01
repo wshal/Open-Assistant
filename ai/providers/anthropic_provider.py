@@ -36,7 +36,7 @@ class AnthropicProvider(BaseProvider):
             if not key.startswith("sk-ant-"):
                 logger.warning("  â ï¸ Anthropic key doesn't start with 'sk-ant-'")
 
-            logger.info("  â Anthropic ready (Claude)")
+            logger.info("  [OK] Anthropic ready (Claude)")
         except ImportError:
             logger.warning("  â Anthropic: pip install anthropic")
             self.enabled = False

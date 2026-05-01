@@ -181,7 +181,7 @@ class OverlayWindow(QMainWindow):
         self.box = QFrame()
         self.box.setObjectName("box")
         self.box.setStyleSheet(
-            "#box { background: rgba(12, 12, 25, 250); border: 1px solid rgba(80, 85, 255, 30); border-radius: 14px; }"
+            "#box { background: rgba(12,12,25,250); border: 1px solid rgba(80,85,255,30); border-radius: 14px; }"
         )
         box_layout = QVBoxLayout(self.box)
         box_layout.setContentsMargins(0, 0, 0, 0)
@@ -201,7 +201,7 @@ class OverlayWindow(QMainWindow):
         self.header = QFrame()
         self.header.setFixedHeight(40)
         self.header.setStyleSheet(
-            "background: rgba(25, 25, 45, 255); border-bottom: 1px solid rgba(255,255,255,10);"
+            "background: rgba(25,25,45,255); border-bottom: 1px solid rgba(255,255,255,10);"
         )
         hl = QHBoxLayout(self.header)
 
@@ -527,14 +527,14 @@ class OverlayWindow(QMainWindow):
                            3: ("T3", "#a78bfa", "🧠"), 4: ("T4", "#94a3b8", "≈")}
             label, colour, icon = tier_labels.get(cache_tier, ("T?", "#94a3b8", "≈"))
             badge = (
-                f"<span style='background:rgba(74,222,128,0.12);color:{colour};"
+                f"<span style='background:rgba(74,222,128,31);color:{colour};"
                 f"font-size:9px;font-weight:700;padding:1px 5px;border-radius:4px;"
                 f"margin-left:6px;'>{icon} Cache {label}</span>"
             )
         elif provider:
             safe_p = provider[:12]
             badge = (
-                f"<span style='background:rgba(99,102,241,0.12);color:#818cf8;"
+                f"<span style='background:rgba(99,102,241,31);color:#818cf8;"
                 f"font-size:9px;font-weight:700;padding:1px 5px;border-radius:4px;"
                 f"margin-left:6px;'>🌐 {safe_p}</span>"
             )
@@ -558,9 +558,9 @@ class OverlayWindow(QMainWindow):
 
         toast = QLabel(msg, self.response_area)
         toast.setStyleSheet(
-            "background: rgba(30, 41, 59, 0.95); "
+            "background: rgba(30,41,59,242); "
             "color: #818cf8; "
-            "border: 1px solid rgba(99, 102, 241, 0.3); "
+            "border: 1px solid rgba(99,102,241,76); "
             "border-radius: 6px; "
             "padding: 8px 16px; "
             "font-size: 13px; "
@@ -797,7 +797,7 @@ class OverlayWindow(QMainWindow):
     def update_audio_state(self, muted):
         self.audio_status.setText("🔇" if muted else "🎙️")
         self.audio_status.setStyleSheet(
-            f"color: {'#ef4444' if muted else '#4ade80'}; font-size: 12px;"
+            f"QPushButton {{ color: {'#ef4444' if muted else '#4ade80'}; font-size: 12px; background: transparent; border: none; }}"
         )
 
         self.refresh_standby_state()
@@ -856,7 +856,7 @@ class OverlayWindow(QMainWindow):
         # 🙈 is the standard single-emoji "hidden" symbol — renders reliably on Windows
         self.vision_status.setText("👁️" if enabled else "🙈")
         self.vision_status.setStyleSheet(
-            f"color: {'#4ade80' if enabled else '#ef4444'}; font-size: 14px; background: transparent; border: none;"
+            f"QPushButton {{ color: {'#4ade80' if enabled else '#ef4444'}; font-size: 14px; background: transparent; border: none; }}"
         )
 
         # Disable ANALYZE SCREEN when vision is fully off — no point capturing
@@ -1038,15 +1038,15 @@ class OverlayWindow(QMainWindow):
         if enabled:
             self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
             self.box.setStyleSheet(
-                "#box { background: rgba(12, 12, 25, 100); border: 1px solid rgba(80, 85, 255, 10); border-radius: 14px; }"
+                "#box { background: rgba(12,12,25,100); border: 1px solid rgba(80,85,255,10); border-radius: 14px; }"
             )
             self.response_area.setStyleSheet(
-                "background: transparent; color: rgba(208, 208, 232, 150); border: none; font-size: 13px;"
+                "background: transparent; color: rgba(208,208,232,150); border: none; font-size: 13px;"
             )
         else:
             self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, False)
             self.box.setStyleSheet(
-                "#box { background: rgba(12, 12, 25, 250); border: 1px solid rgba(80, 85, 255, 30); border-radius: 14px; }"
+                "#box { background: rgba(12,12,25,250); border: 1px solid rgba(80,85,255,30); border-radius: 14px; }"
             )
             self.response_area.setStyleSheet(
                 "background: transparent; color: #d0d0e8; border: none; font-size: 13px;"
@@ -1141,7 +1141,7 @@ class OverlayWindow(QMainWindow):
             alpha = int(t_opa * 255)
             
             self.box.setStyleSheet(
-                f"#box {{ background: rgba(12, 12, 25, {alpha}); border: 1px solid rgba(80, 85, 255, 10); border-radius: 14px; }}"
+                f"#box {{ background: rgba(12, 12, 25, {alpha}); border: 1px solid rgba(80,85,255,10); border-radius: 14px; }}"
             )
             self.response_area.setStyleSheet(
                 f"background: transparent; color: rgba(208, 208, 232, {min(255, max(40, alpha+40))}); border: none; font-size: 13px;"
@@ -1149,7 +1149,7 @@ class OverlayWindow(QMainWindow):
         else:
             # Restore to fully opaque
             self.box.setStyleSheet(
-                "#box { background: rgba(12, 12, 25, 250); border: 1px solid rgba(80, 85, 255, 30); border-radius: 14px; }"
+                "#box { background: rgba(12,12,25,250); border: 1px solid rgba(80,85,255,30); border-radius: 14px; }"
             )
             self.response_area.setStyleSheet(
                 "background: transparent; color: #d0d0e8; border: none; font-size: 13px;"

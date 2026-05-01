@@ -1,6 +1,8 @@
 import os
 import threading
 import logging
+import io
+import contextlib
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,9 @@ class EmbeddingManager:
 
             try:
                 os.environ.setdefault("FASTEMBED_CACHE_PATH", "./data/cache/fastembed")
+                # Silence HF Hub authentication noise (we only use public cached models)
+                os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
                 from fastembed import TextEmbedding
                 self._model = TextEmbedding(model_name=self._model_name)
                 # fastembed returns generator
@@ -56,10 +61,11 @@ class EmbeddingManager:
 
             try:
                 from sentence_transformers import SentenceTransformer
-                self._model = SentenceTransformer(
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    backend="onnx",
-                )
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self._model = SentenceTransformer(
+                        "sentence-transformers/all-MiniLM-L6-v2",
+                        backend="onnx",
+                    )
                 self._embed_fn = lambda x: self._model.encode(x)
                 logger.info("✅ Shared EmbeddingManager loaded via sentence-transformers (ONNX backend)")
                 return
@@ -68,7 +74,8 @@ class EmbeddingManager:
 
             try:
                 from sentence_transformers import SentenceTransformer
-                self._model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self._model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
                 self._embed_fn = lambda x: self._model.encode(x)
                 logger.info("✅ Shared EmbeddingManager loaded via sentence-transformers (PyTorch)")
                 return

@@ -48,16 +48,16 @@ class StandbyView(QWidget):
     STYLE_INACTIVE = """
         QPushButton {
             color: #94a3b8;
-            background: rgba(22, 24, 40, 200);
-            border: 1px solid rgba(99, 102, 241, 20);
+            background: rgba(22,24,40,200);
+            border: 1px solid rgba(99,102,241,20);
             border-radius: 10px;
             padding: 9px 14px;
             font-size: 10px;
             font-weight: 700;
         }
         QPushButton:hover {
-            background: rgba(40, 42, 65, 240);
-            border: 1px solid rgba(129, 140, 248, 50);
+            background: rgba(40,42,65,240);
+            border: 1px solid rgba(129,140,248,50);
             color: #c0caff;
         }
     """
@@ -71,7 +71,7 @@ class StandbyView(QWidget):
                 stop:1 #8b5cf6
             );
             color: white;
-            border: 1px solid rgba(255, 255, 255, 60);
+            border: 1px solid rgba(255,255,255,60);
             border-radius: 10px;
             padding: 9px 14px;
             font-size: 10px;
@@ -91,7 +91,7 @@ class StandbyView(QWidget):
             border-radius: 26px;
             font-weight: 900;
             font-size: 13px;
-            border: 1px solid rgba(255, 255, 255, 18);
+            border: 1px solid rgba(255,255,255,18);
         }
         QPushButton:hover:enabled {
             background: qlineargradient(
@@ -99,12 +99,12 @@ class StandbyView(QWidget):
                 stop:0 #6a68ff,
                 stop:1 #9b6bff
             );
-            border: 1px solid rgba(255, 255, 255, 40);
+            border: 1px solid rgba(255,255,255,40);
         }
         QPushButton:disabled {
-            background: rgba(255, 255, 255, 8);
-            color: rgba(255, 255, 255, 25);
-            border: 1px solid rgba(255, 255, 255, 13);
+            background: rgba(255,255,255,8);
+            color: rgba(255,255,255,25);
+            border: 1px solid rgba(255,255,255,13);
         }
     """
 
@@ -119,7 +119,7 @@ class StandbyView(QWidget):
             border-radius: 26px;
             font-weight: 900;
             font-size: 13px;
-            border: 1px solid rgba(255, 255, 255, 18);
+            border: 1px solid rgba(255,255,255,18);
         }
         QPushButton:hover:enabled {
             background: qlineargradient(
@@ -127,12 +127,12 @@ class StandbyView(QWidget):
                 stop:0 #34d399,
                 stop:1 #10b981
             );
-            border: 1px solid rgba(255, 255, 255, 40);
+            border: 1px solid rgba(255,255,255,40);
         }
         QPushButton:disabled {
-            background: rgba(255, 255, 255, 8);
-            color: rgba(255, 255, 255, 25);
-            border: 1px solid rgba(255, 255, 255, 13);
+            background: rgba(255,255,255,8);
+            color: rgba(255,255,255,25);
+            border: 1px solid rgba(255,255,255,13);
         }
     """
 
@@ -184,8 +184,8 @@ class StandbyView(QWidget):
                 background: qradialgradient(
                     cx:0.5, cy:0.45, radius:0.70,
                     fx:0.5, fy:0.38,
-                    stop:0 rgba(167, 139, 250, 65),
-                    stop:0.40 rgba(99, 102, 241, 22),
+                    stop:0 rgba(167,139,250,65),
+                    stop:0.40 rgba(99,102,241,22),
                     stop:1 rgba(0, 0, 0, 0)
                 );
                 border: none;
@@ -303,9 +303,9 @@ class StandbyView(QWidget):
         self.model_bar.setFixedHeight(30)
         self.model_bar.setStyleSheet("""
             QFrame {
-                background: rgba(10, 12, 24, 180);
+                background: rgba(10,12,24,180);
                 border-radius: 15px;
-                border: 1px solid rgba(99, 102, 241, 18);
+                border: 1px solid rgba(99,102,241,18);
             }
         """)
         self.model_bar_layout = QHBoxLayout(self.model_bar)

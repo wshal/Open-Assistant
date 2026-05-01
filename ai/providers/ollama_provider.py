@@ -208,7 +208,7 @@ class OllamaProvider(BaseProvider):
                 vtarget = self._pick_available_vision_model(configured_vision)
                 if vtarget:
                     self._resolved_vision_model = vtarget
-                    logger.info(f"  Ollama vision ready (model: {vtarget})")
+                    logger.debug(f"  Ollama vision ready (model: {vtarget})")
 
                 return True
 

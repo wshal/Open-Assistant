@@ -48,7 +48,7 @@ KEY_PATTERNS: Dict[str, Dict] = {
         "prefix": "",
         "min_length": 20,
         "max_length": 200,
-        "pattern": r'^[a-f0-9]{40,}$',
+        "pattern": None,
     },
     "mistral": {
         "prefix": "",
@@ -254,7 +254,7 @@ class Config:
         self._data["capture"]["audio"]["vad"].setdefault("frame_ms", 20)
         self._data["capture"]["audio"]["vad"].setdefault("mode", 2)
         self._data["capture"]["audio"]["vad"].setdefault("short_utterance_max_s", 2.8)
-        self._data["capture"]["audio"]["vad"].setdefault("short_silence_ms", 500)
+        self._data["capture"]["audio"]["vad"].setdefault("short_silence_ms", 400)
 
         # Final speech transcript gating: ignore tiny non-question scraps like
         # "API." so they do not pollute live context or auto-trigger answers.

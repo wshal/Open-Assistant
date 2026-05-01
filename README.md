@@ -133,7 +133,7 @@ openassist/
 ├── stealth/        # Anti-screen-capture and input simulator
 ├── docs/           # Architecture deep-dives and technical reports
 ├── scripts/        # Utility and build scripts
-├── tests/          # Unit test suite (238 tests)
+├── tests/          # Unit test suite (291 tests)
 └── data/           # Runtime data (encrypted, gitignored)
 ```
 
@@ -145,10 +145,10 @@ openassist/
 python -m unittest discover -s tests
 ```
 
-All **238 tests** should pass. Tests cover session lifecycle, context store, mode switching, prompt injection, audio pipeline behavior, semantic caching, background async workers, and question detection.
+All **291 tests** should pass. Tests cover session lifecycle, context store, mode switching, prompt injection, audio pipeline behavior, semantic caching, background async workers, and question detection.
 
 ---
 
 ## 🛡️ License
 
-[Your Choice of License] — *Made with passion for developers who demand the best.*
+MIT — *Made with passion for developers who demand the best.*
