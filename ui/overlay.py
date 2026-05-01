@@ -544,6 +544,66 @@ class OverlayWindow(QMainWindow):
         self._source_badge = badge   # stored so _render_markdown_now can inject it
         self._render_markdown_now()  # final full render with proper markdown
 
+    def _on_bg_complete(self, query: str, response: str):
+        """Called when a background generation finishes."""
+        short_q = query[:40] + ("..." if len(query) > 40 else "")
+        msg = f"📖 \"{short_q}\" answered — Press ← to view"
+        self._show_toast(msg)
+
+    def _show_toast(self, msg: str):
+        """Slide-in toast notification at the bottom of the response area."""
+        from PyQt6.QtWidgets import QLabel
+        from PyQt6.QtCore import QPropertyAnimation, QRect, QTimer, QEasingCurve
+        from PyQt6.QtGui import QColor, QPalette
+
+        toast = QLabel(msg, self.response_area)
+        toast.setStyleSheet(
+            "background: rgba(30, 41, 59, 0.95); "
+            "color: #818cf8; "
+            "border: 1px solid rgba(99, 102, 241, 0.3); "
+            "border-radius: 6px; "
+            "padding: 8px 16px; "
+            "font-size: 13px; "
+            "font-weight: 500;"
+        )
+        toast.adjustSize()
+        # Position at bottom center of response_area
+        w = self.response_area.width()
+        h = self.response_area.height()
+        tw = toast.width()
+        th = toast.height()
+        
+        start_rect = QRect((w - tw) // 2, h, tw, th)
+        end_rect = QRect((w - tw) // 2, h - th - 20, tw, th)
+        
+        toast.setGeometry(start_rect)
+        toast.show()
+        
+        anim = QPropertyAnimation(toast, b"geometry", toast)
+        anim.setDuration(400)
+        anim.setStartValue(start_rect)
+        anim.setEndValue(end_rect)
+        anim.setEasingCurve(QEasingCurve.Type.OutBack)
+        anim.start()
+        
+        # Store ref to prevent GC
+        if not hasattr(self, "_active_toasts"):
+            self._active_toasts = []
+        self._active_toasts.append(toast)
+        
+        def _dismiss():
+            if toast in self._active_toasts:
+                self._active_toasts.remove(toast)
+            fade = QPropertyAnimation(toast, b"geometry", toast)
+            fade.setDuration(300)
+            fade.setStartValue(end_rect)
+            fade.setEndValue(start_rect)
+            fade.setEasingCurve(QEasingCurve.Type.InBack)
+            fade.finished.connect(toast.deleteLater)
+            fade.start()
+            
+        QTimer.singleShot(8000, _dismiss)
+
     def update_warmup_status(self, m, p, r):
         self.standby_view.set_warmup_status(m, p, r)
 

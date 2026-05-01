@@ -23,6 +23,7 @@ from ai.detectors.question_detector import QuestionDetector
 from ai.router import SmartRouter
 from ai.parallel import ParallelInference
 from ai.cache import ShortQueryCache
+from ai.background_slot import BackgroundGenerationSlot
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -36,6 +37,7 @@ class AIEngine(QObject):
 
     response_chunk = pyqtSignal(str)
     response_complete = pyqtSignal(str)
+    background_complete = pyqtSignal(str, str)  # (query, response)
     error_occurred = pyqtSignal(str)
     provider_status = pyqtSignal(dict)  # Emits health for UI dashboard
 
@@ -57,6 +59,7 @@ class AIEngine(QObject):
         self._router = None
         self._selected_tier = "balanced"
         self._parallel = None
+        self._bg_slot = BackgroundGenerationSlot()
 
         # Provider speed ranking (fastest first)
         self._provider_priority = ["groq", "cerebras", "gemini", "together", "ollama"]
@@ -275,6 +278,24 @@ class AIEngine(QObject):
         self._is_cancelled = True
         logger.info("AI: Generation cancel flag set")
 
+    def demote_to_background(self):
+        """Demotes a query to finish in the background."""
+        if not self._loop or not getattr(self, "_current_gen_kwargs", None):
+            return
+            
+        kwargs = dict(self._current_gen_kwargs)
+        
+        # FIX: Clear immediately to prevent Double-Demote race condition
+        self._current_gen_kwargs = None 
+        
+        # FIX: Cancel the foreground instance so it stops fighting Q2 for the UI
+        self.cancel()
+        
+        query = kwargs.get("query", "")
+        logger.info(f"AI: Demoting query '{query[:20]}...' to background slot")
+        kwargs["bg_mode"] = True
+        self._bg_slot.assign(self.generate_response(**kwargs), self._loop)
+
     async def generate_response(
         self,
         query: str,
@@ -286,12 +307,25 @@ class AIEngine(QObject):
         screen_hash: Optional[str] = None,
         window_id: Optional[str] = None,
         boost_context: Optional[str] = None,  # Q16: prior-turn entity keywords
+        bg_mode: bool = False,
     ):
         """
         RESTORED: Main async generation task.
         Control flow managed by the App Master Loop.
         """
-        self._is_cancelled = False
+        if not bg_mode:
+            self._is_cancelled = False
+            self._current_gen_kwargs = {
+                "query": query,
+                "nexus_snapshot": nexus_snapshot,
+                "screen_context": screen_context,
+                "audio_context": audio_context,
+                "origin": origin,
+                "request_metadata": request_metadata,
+                "screen_hash": screen_hash,
+                "window_id": window_id,
+                "boost_context": boost_context,
+            }
         start_time = time.time()
         self._last_request_at = start_time
         stage_timings = {}
@@ -368,6 +402,7 @@ class AIEngine(QObject):
                     metadata={
                         "cache_hit": True,
                         "cache_tier": cache_tier,  # Q14: tier for overlay badge
+                        "background": bg_mode,
                         "stage_timings": {
                             **stage_timings,
                             "request_to_complete_ms": (time.time() - request_started_at) * 1000,
@@ -380,11 +415,15 @@ class AIEngine(QObject):
                     },
                 )
                 for ch in self._chunk_response(cached.response, chunk_size=8):
-                    if self._is_cancelled:
+                    if self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled:
                         return
-                    self.response_chunk.emit(ch)
+                    if not bg_mode:
+                        self.response_chunk.emit(ch)
                     await asyncio.sleep(0)
-                self.response_complete.emit(cached.response)
+                if not bg_mode:
+                    self.response_complete.emit(cached.response)
+                else:
+                    self.background_complete.emit(query, cached.response)
                 return
 
         # Smart routing: analyse query complexity and select provider
@@ -427,7 +466,7 @@ class AIEngine(QObject):
                     sys_prompt, user_msg, task=mode_id
                 )
 
-                if self._is_cancelled:
+                if self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled:
                     return
 
                 latency_ms = (time.time() - start_time) * 1000
@@ -438,6 +477,7 @@ class AIEngine(QObject):
                     mode=mode_id,
                     latency=latency_ms,
                     metadata={
+                        "background": bg_mode,
                         "stage_timings": {
                             **stage_timings,
                             "request_to_complete_ms": (time.time() - request_started_at) * 1000,
@@ -456,13 +496,18 @@ class AIEngine(QObject):
                     batch.append(word)
                     chunk = " ".join(batch) + " "
                     if len(chunk) >= batch_size:
-                        self.response_chunk.emit(chunk)
+                        if not bg_mode:
+                            self.response_chunk.emit(chunk)
                         batch = []
                         await asyncio.sleep(0)  # yield to event loop between batches
                 if batch:
-                    self.response_chunk.emit(" ".join(batch))
+                    if not bg_mode:
+                        self.response_chunk.emit(" ".join(batch))
 
-                self.response_complete.emit(full_response)
+                if not bg_mode:
+                    self.response_complete.emit(full_response)
+                else:
+                    self.background_complete.emit(query, full_response)
                 logger.info(f"Parallel AI: Response complete ({latency_ms:.0f}ms)")
                 return
             except Exception as e:
@@ -471,6 +516,24 @@ class AIEngine(QObject):
                 )
 
         provider, tier = self._select_provider(mode_obj or mode_id, complexity, preferred_providers)
+        
+        # --- Tier Downgrading for Background tasks ---
+        cloud_bg_fallback = False
+        if bg_mode:
+            ollama_prov = self._providers.get("ollama")
+            safe_model = None
+            if ollama_prov and getattr(ollama_prov, "enabled", False):
+                safe_model = ollama_prov._pick_available_model("qwen3-coder:480b-cloud")
+                
+            if safe_model:
+                provider = ollama_prov
+                tier = "local_background"
+                provider._resolved_model = safe_model
+                logger.info(f"AI: Downgraded background task to local ollama ({safe_model})")
+            else:
+                cloud_bg_fallback = True
+                logger.info("AI: No local model available for background task. Falling back to cloud with strict caps.")
+
         self._selected_tier = tier
         if not provider:
             self.error_occurred.emit("No available AI provider found.")
@@ -592,6 +655,10 @@ class AIEngine(QObject):
                 session_context=getattr(self, "_session_context", ""),
             )
 
+            # Strict Output Cap for Cloud Background Fallback
+            if bg_mode and cloud_bg_fallback:
+                sys_prompt += "\n\nCRITICAL INSTRUCTION: You are generating a background thought. Keep your response extremely concise, under 100 words. Do not ramble."
+
             # GAP 6: resolved_query already computed before RAG coro (used for RAG search).
             # Re-apply speech refinement if transcript was refined after the initial resolution.
             if origin == "speech" and refined_audio and refined_audio != audio_context:
@@ -600,7 +667,11 @@ class AIEngine(QObject):
 
             # Build conversation history block from last 3 turns (capped at 1500 chars).
             # Injected into the prompt so the model understands what was discussed.
-            history_block = self._build_history_block(max_turns=3, max_chars=1500)
+            if bg_mode and cloud_bg_fallback:
+                history_block = ""
+                logger.debug("AI: Cloud bg fallback — skipping history block generation to save tokens.")
+            else:
+                history_block = self._build_history_block(max_turns=3, max_chars=1500)
 
             user_msg = self.prompts.user(
                 query=resolved_query,
@@ -651,7 +722,7 @@ class AIEngine(QObject):
                                     self._maybe_cooldown_provider(p, exc)
                                     continue
 
-                                if self._is_cancelled:
+                                if self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled:
                                     return
 
                                 for other in list(tasks.keys()):
@@ -667,6 +738,7 @@ class AIEngine(QObject):
                                     mode=mode_id,
                                     latency=latency_ms,
                                     metadata={
+                                        "background": bg_mode,
                                         "stage_timings": {
                                             **stage_timings,
                                             "request_to_complete_ms": (time.time() - request_started_at) * 1000,
@@ -694,16 +766,21 @@ class AIEngine(QObject):
                                     words = raced.split()
                                     batch: list = []
                                     for word in words:
-                                        if self._is_cancelled:
+                                        if self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled:
                                             return
                                         batch.append(word)
                                         if len(batch) >= 6:  # ~40–50 chars per emit
-                                            self.response_chunk.emit(" ".join(batch) + " ")
+                                            if not bg_mode:
+                                                self.response_chunk.emit(" ".join(batch) + " ")
                                             batch = []
                                             await asyncio.sleep(0.015)  # 15ms between batches
                                     if batch:
-                                        self.response_chunk.emit(" ".join(batch))
-                                self.response_complete.emit(raced)
+                                        if not bg_mode:
+                                            self.response_chunk.emit(" ".join(batch))
+                                if not bg_mode:
+                                    self.response_complete.emit(raced)
+                                else:
+                                    self.background_complete.emit(query, raced)
                                 return
                     finally:
                         for t in list(tasks.keys()):
@@ -739,7 +816,7 @@ class AIEngine(QObject):
                         user_msg,
                         first_token_timeout_s=ft_timeout_s,
                     ):
-                        if self._is_cancelled:
+                        if self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled:
                             logger.warning("AI: Stream cancelled mid-token")
                             return
 
@@ -750,7 +827,8 @@ class AIEngine(QObject):
                             stage_timings["request_to_first_token_ms"] = (
                                 first_token_time - request_started_at
                             ) * 1000
-                        self.response_chunk.emit(chunk)
+                        if not bg_mode:
+                            self.response_chunk.emit(chunk)
                     generation_succeeded = True
                     break  # Stream completed successfully
 
@@ -775,7 +853,7 @@ class AIEngine(QObject):
                     logger.info(f"AI: Falling back to '{next_id}'")
 
             # 5. Finalize
-            if not self._is_cancelled:
+            if not (self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled):
                 full_response = self._clean_final_response(full_response)
                 latency_ms = (time.time() - start_time) * 1000
 
@@ -803,6 +881,7 @@ class AIEngine(QObject):
                     mode=mode_id,
                     latency=latency_ms,
                     metadata={
+                        "background": bg_mode,
                         "stage_timings": {
                             **stage_timings,
                             "request_to_complete_ms": (time.time() - request_started_at) * 1000,
@@ -824,7 +903,10 @@ class AIEngine(QObject):
                         "had_rag": bool(rag_context.strip()) if rag_context else False,
                     }
                 )
-                self.response_complete.emit(full_response)
+                if not bg_mode:
+                    self.response_complete.emit(full_response)
+                else:
+                    self.background_complete.emit(query, full_response)
                 logger.info(f"AI: Response complete ({latency_ms:.0f}ms) | {stage_timings}")
 
         except Exception as e:

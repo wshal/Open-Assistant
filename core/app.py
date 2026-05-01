@@ -151,6 +151,13 @@ class OpenAssistApp(QObject):
         self.mini_overlay.user_query.connect(self.generate_response)
         self.ai.response_chunk.connect(lambda c: self.overlay.append_response(c))
         self.ai.response_chunk.connect(lambda c: self.mini_overlay.append_response(c))
+        if hasattr(self.ai, "background_complete"):
+            self.ai.background_complete.connect(
+                lambda q, r: self.overlay._on_bg_complete(q, r)
+            )
+            self.ai.background_complete.connect(
+                lambda q, r: self.mini_overlay._on_bg_complete(q, r)
+            )
         # GAP 5: on_complete is now called by _on_response_complete (below) with
         # cache_tier + provider so the source badge can be rendered in the response area.
         # We keep a direct error→on_complete connection for error text display.
@@ -177,6 +184,10 @@ class OpenAssistApp(QObject):
         """Update overlay status bar with latency after each response.
         GAP 5: also passes cache_tier + provider to on_complete for the source badge.
         """
+        # Ensure we don't accidentally demote a completed task to the background
+        if hasattr(self.ai, "_current_gen_kwargs"):
+            self.ai._current_gen_kwargs = None
+
         entries = self.history.get_last(1)
         latency_ms = 0
         provider = None
@@ -309,6 +320,9 @@ class OpenAssistApp(QObject):
                 self.overlay.update_transcript("Ready...", state="idle")
 
     def _on_ai_error(self, error_text: str):
+        if hasattr(self.ai, "_current_gen_kwargs"):
+            self.ai._current_gen_kwargs = None
+        
         if self._screen_analysis_pending:
             self.overlay.update_transcript("Screen captured, but analysis failed.")
             if hasattr(self.overlay, "set_analysis_provider_badge"):
@@ -585,12 +599,18 @@ class OpenAssistApp(QObject):
         self._last_query = q
         self._last_query_time = now
 
-        # P1.4: New query should cancel any in-flight generation (new wins).
-        if s in {"manual", "speech", "quick"} and hasattr(self.ai, "cancel"):
-            try:
-                self.ai.cancel()
-            except Exception:
-                pass
+        # P1.4: New query should gracefully demote any in-flight generation to background.
+        if s in {"manual", "speech", "quick"}:
+            if bool(self.config.get("ai.background_generation.enabled", True)) and hasattr(self.ai, "demote_to_background"):
+                try:
+                    self.ai.demote_to_background()
+                except Exception:
+                    pass
+            elif hasattr(self.ai, "cancel"):
+                try:
+                    self.ai.cancel()
+                except Exception:
+                    pass
         # SNAP-LOCK: Capture target window HWND at moment of query
         if s in ["manual", "speech", "quick"]:
             hwnd = self.simulator.get_foreground_window()

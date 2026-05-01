@@ -240,6 +240,63 @@ class MiniOverlay(QMainWindow):
         else:
             self.type_btn.setVisible(False)
 
+    def _on_bg_complete(self, query: str, response: str):
+        """Called when a background generation finishes."""
+        short_q = query[:25] + ("..." if len(query) > 25 else "")
+        msg = f"📖 \"{short_q}\" answered — Press ← to view"
+        self._show_toast(msg)
+
+    def _show_toast(self, msg: str):
+        """Slide-in toast notification."""
+        from PyQt6.QtWidgets import QLabel
+        from PyQt6.QtCore import QPropertyAnimation, QRect, QTimer, QEasingCurve
+
+        toast = QLabel(msg, self)
+        toast.setStyleSheet(
+            "background: rgba(30, 41, 59, 0.95); "
+            "color: #818cf8; "
+            "border: 1px solid rgba(99, 102, 241, 0.3); "
+            "border-radius: 6px; "
+            "padding: 6px 10px; "
+            "font-size: 11px; "
+            "font-weight: 500;"
+        )
+        toast.adjustSize()
+        w = self.width()
+        h = self.height()
+        tw = min(toast.width(), w - 10)
+        th = toast.height()
+        
+        start_rect = QRect((w - tw) // 2, h, tw, th)
+        end_rect = QRect((w - tw) // 2, h - th - 10, tw, th)
+        
+        toast.setGeometry(start_rect)
+        toast.show()
+        
+        anim = QPropertyAnimation(toast, b"geometry", toast)
+        anim.setDuration(400)
+        anim.setStartValue(start_rect)
+        anim.setEndValue(end_rect)
+        anim.setEasingCurve(QEasingCurve.Type.OutBack)
+        anim.start()
+        
+        if not hasattr(self, "_active_toasts"):
+            self._active_toasts = []
+        self._active_toasts.append(toast)
+        
+        def _dismiss():
+            if toast in self._active_toasts:
+                self._active_toasts.remove(toast)
+            fade = QPropertyAnimation(toast, b"geometry", toast)
+            fade.setDuration(300)
+            fade.setStartValue(end_rect)
+            fade.setEndValue(start_rect)
+            fade.setEasingCurve(QEasingCurve.Type.InBack)
+            fade.finished.connect(toast.deleteLater)
+            fade.start()
+            
+        QTimer.singleShot(8000, _dismiss)
+
     def set_response(self, text: str):
         self._raw_buffer = text or ""
         self._render_markdown_now()
