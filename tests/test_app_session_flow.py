@@ -99,7 +99,7 @@ class OverlayStub:
     def update_transcript(self, text, state="auto"):
         self.transcript_updates.append(text)
 
-    def on_complete(self, text, query=None):
+    def on_complete(self, text, query=None, cache_tier: int = 0, provider: str = ""):
         self.completed.append((text, query))
 
     def update_history_state(self, *state):
@@ -173,7 +173,7 @@ class MiniOverlayStub:
     def update_mode(self, mode):
         self.mode_updates.append(mode)
 
-    def on_complete(self, text, query=None):
+    def on_complete(self, text, query=None, cache_tier: int = 0, provider: str = ""):
         self.completed.append((text, query))
 
     def set_ready(self):

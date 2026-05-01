@@ -314,8 +314,12 @@ class AIEngine(QObject):
             and isinstance(query, str)
             and len(query.strip()) > 0
             and len(query.strip()) <= max_q_chars
-            and (not self.rag)  # conservative: avoid caching RAG-conditioned answers
+            # GAP 1: Cache is now allowed even when RAG is enabled.
+            # We track _rag_from_live_call below — if the RAG result came from
+            # prefetch/LRU (zero-latency), the response is stable and cacheable.
+            # We only block caching when a live ChromaDB call was made.
         )
+        _rag_from_live_call: bool = False  # set True only if ChromaDB was queried
         context_fp = ""
         history_fp = ""
         if allow_cache:
@@ -484,12 +488,22 @@ class AIEngine(QObject):
             # Now parallel:           wait(max(RAG, refine))   = ~400ms worst-case.
             # Cache / prefetch hits remain zero-latency (no coroutine created).
 
+            # ── GAP 6: Resolve follow-up query BEFORE building RAG coro ─────────────
+            # Previously resolved_query was built AFTER the RAG coro was scheduled.
+            # That meant follow-ups like "give me an example" hit ChromaDB with no
+            # topic signal.  Now we resolve first, so RAG searches with context.
+            effective_query = query
+            if origin == "speech":
+                effective_query = self._effective_speech_query(query, audio_context or "")
+            resolved_query = self._resolve_followup_query(effective_query)
+            _rag_search_query = resolved_query  # enriched query used for RAG
+
             # ── RAG: resolve from cache or build coroutine for parallel exec ─────────
             rag_context = ""
             rag_coro = None
             if self.rag:
                 now = time.time()
-                cache_key = query.lower().strip()[:100]
+                cache_key = _rag_search_query.lower().strip()[:100]
 
                 # Prefetch hit: zero-latency, no coroutine needed
                 prefetch_fp = self._rag_prefetch_fingerprint(
@@ -499,15 +513,16 @@ class AIEngine(QObject):
                 prefetch_hit = self._rag_prefetch.get(prefetch_fp)
                 if prefetch_hit and now < prefetch_hit[1]:
                     rag_context = prefetch_hit[0]
-                    logger.debug("RAG: Prefetch Hit (zero-latency)")
+                    logger.debug("RAG: Prefetch Hit (zero-latency) — response cache remains eligible")
                 # Regular cache hit: also zero-latency
                 elif cache_key in self._rag_cache and now < self._rag_cache[cache_key][1]:
                     rag_context = self._rag_cache[cache_key][0]
                     self._rag_cache.move_to_end(cache_key)
-                    logger.debug("RAG: Cache Hit")
+                    logger.debug("RAG: LRU Cache Hit (zero-latency) — response cache remains eligible")
                 else:
-                    # Miss — schedule for parallel execution
-                    rag_coro = self.rag.query(query)
+                    # Miss — schedule for parallel execution using resolved (enriched) query
+                    _rag_from_live_call = True  # GAP 1: live call — block response cache
+                    rag_coro = self.rag.query(_rag_search_query)  # GAP 6: uses resolved query
 
             # ── Refinement: decide whether to run, build coroutine if so ────────
             refined_audio = audio_context
@@ -577,13 +592,11 @@ class AIEngine(QObject):
                 session_context=getattr(self, "_session_context", ""),
             )
 
-            effective_query = query
-            if origin == "speech":
+            # GAP 6: resolved_query already computed before RAG coro (used for RAG search).
+            # Re-apply speech refinement if transcript was refined after the initial resolution.
+            if origin == "speech" and refined_audio and refined_audio != audio_context:
                 effective_query = self._effective_speech_query(query, refined_audio)
-
-            # Resolve follow-up queries using recent history so short ambiguous
-            # queries like "give me an example" inherit the previous topic context.
-            resolved_query = self._resolve_followup_query(effective_query)
+                resolved_query = self._resolve_followup_query(effective_query)
 
             # Build conversation history block from last 3 turns (capped at 1500 chars).
             # Injected into the prompt so the model understands what was discussed.
@@ -676,7 +689,20 @@ class AIEngine(QObject):
                                     },
                                 )
                                 if raced:
-                                    self.response_chunk.emit(raced)
+                                    # GAP 3: Fake-stream the race winner word-by-word so
+                                    # the UI feels like real streaming (not blank→flash).
+                                    words = raced.split()
+                                    batch: list = []
+                                    for word in words:
+                                        if self._is_cancelled:
+                                            return
+                                        batch.append(word)
+                                        if len(batch) >= 6:  # ~40–50 chars per emit
+                                            self.response_chunk.emit(" ".join(batch) + " ")
+                                            batch = []
+                                            await asyncio.sleep(0.015)  # 15ms between batches
+                                    if batch:
+                                        self.response_chunk.emit(" ".join(batch))
                                 self.response_complete.emit(raced)
                                 return
                     finally:
@@ -753,8 +779,11 @@ class AIEngine(QObject):
                 full_response = self._clean_final_response(full_response)
                 latency_ms = (time.time() - start_time) * 1000
 
-                # P1: populate short-query cache after a successful response.
-                if allow_cache and (full_response or "").strip():
+                # GAP 1: Populate short-query cache after a successful response.
+                # Only cache if allow_cache AND the RAG result did NOT require a
+                # live ChromaDB call.  Prefetch/LRU RAG hits are stable and cacheable.
+                cache_eligible = allow_cache and not _rag_from_live_call
+                if cache_eligible and (full_response or "").strip():
                     try:
                         self._short_cache.set(
                             mode=mode_id,

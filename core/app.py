@@ -151,12 +151,9 @@ class OpenAssistApp(QObject):
         self.mini_overlay.user_query.connect(self.generate_response)
         self.ai.response_chunk.connect(lambda c: self.overlay.append_response(c))
         self.ai.response_chunk.connect(lambda c: self.mini_overlay.append_response(c))
-        self.ai.response_complete.connect(
-            lambda t: self.overlay.on_complete(t, self._last_query)
-        )
-        self.ai.response_complete.connect(
-            lambda t: self.mini_overlay.on_complete(t, self._last_query)
-        )
+        # GAP 5: on_complete is now called by _on_response_complete (below) with
+        # cache_tier + provider so the source badge can be rendered in the response area.
+        # We keep a direct error→on_complete connection for error text display.
         self.ai.error_occurred.connect(
             lambda e: self.overlay.on_complete(f"ERROR: {e}")
         )
@@ -177,7 +174,9 @@ class OpenAssistApp(QObject):
         self.state.stealth_changed.connect(lambda _: self._apply_ui_only())
 
     def _on_response_complete(self, full_text: str):
-        """Update overlay status bar with latency after each response."""
+        """Update overlay status bar with latency after each response.
+        GAP 5: also passes cache_tier + provider to on_complete for the source badge.
+        """
         entries = self.history.get_last(1)
         latency_ms = 0
         provider = None
@@ -268,6 +267,21 @@ class OpenAssistApp(QObject):
             had_action=had_action,
             had_prefetch=had_prefetch,
             cache_tier=cache_tier,
+        )
+
+        # GAP 5: call on_complete with badge metadata so the source badge renders
+        # in the response area header (cache tier or live provider name).
+        self.overlay.on_complete(
+            full_text,
+            query=self._last_query,
+            cache_tier=cache_tier,
+            provider=provider or "",
+        )
+        self.mini_overlay.on_complete(
+            full_text,
+            query=self._last_query,
+            cache_tier=cache_tier,
+            provider=provider or "",
         )
 
         # ── Reset transcript label to Listening/Ready ─────────────────────────────
@@ -594,18 +608,41 @@ class OpenAssistApp(QObject):
             label = f"⏳ Processing: {q[:55]}..." if len(q) > 55 else "⏳ Processing..."
             self.overlay.update_transcript(label, state="processing")
 
-            # Show query immediately in response area — do not wait for first token
+            # Show query immediately in response area — do not wait for first token.
+            # GAP 2: We set a _pending_query flag instead of writing "Thinking..."
+            # immediately.  The first response_chunk (or cache hit) will clear this
+            # flag and paint the real content.  If no chunk arrives within 80ms we
+            # fall back to showing "Thinking..." via a deferred QTimer so the user
+            # never sees a blank screen on slow providers.
             self.overlay.show_chat_view()
             self.overlay._current_query = q
-            self.overlay.response_area.clear()
+            self.overlay._pending_thinking = True   # signal: waiting for first chunk
+
             race_hint = ""
             if s in {"manual", "speech"} and bool(self.config.get("ai.text.race_enabled", False)):
-                race_hint = " (race mode — no streaming)"
+                race_hint = " (race mode)"
+
+            # Show QUERY header immediately — this is always useful feedback
             self.overlay.response_area.setHtml(
                 f"<div style='color:#64748b;font-size:10px;margin-bottom:5px;'>"
                 f"<b>QUERY:</b> {q}</div>"
-                f"<div style='color:#f59e0b;font-size:11px;font-style:italic;'>⏳ Thinking{race_hint}...</div>"
             )
+
+            # After 80ms: if we still haven't received a chunk, paint "Thinking..."
+            # (cache hits return in <20ms so they'll have replaced this already)
+            from PyQt6.QtCore import QTimer as _QTimer
+            def _show_thinking():
+                if getattr(self.overlay, "_pending_thinking", False):
+                    from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor
+                    cursor = self.overlay.response_area.textCursor()
+                    cursor.movePosition(QTextCursor.MoveOperation.End)
+                    fmt = QTextCharFormat()
+                    fmt.setForeground(QColor("#f59e0b"))
+                    cursor.setCharFormat(fmt)
+                    cursor.insertText(f"⏳ Thinking{race_hint}...")
+                    self.overlay.response_area.setTextCursor(cursor)
+            _QTimer.singleShot(80, _show_thinking)
+
 
         # Start timing for instrumentation
         self._current_request_start = time.time()

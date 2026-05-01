@@ -445,8 +445,12 @@ class OverlayWindow(QMainWindow):
 
         self._last_rendered_content = content
 
+        # GAP 5: Inject source badge into query header (set by on_complete).
+        # Only shown after completion — empty string during streaming.
+        badge = getattr(self, "_source_badge", "")
         q_html = (
-            f"<div style='color: #64748b; font-size: 10px; margin-bottom: 5px;'><b>QUERY:</b> {self._current_query}</div>"
+            f"<div style='color: #64748b; font-size: 10px; margin-bottom: 5px;'>"
+            f"<b>QUERY:</b> {self._current_query}{badge}</div>"
             if self._current_query
             else ""
         )
@@ -469,6 +473,9 @@ class OverlayWindow(QMainWindow):
             # First chunk: switch into streaming mode
             self._is_streaming = True
             self._raw_buffer = ""
+            # GAP 2: Clear the deferred-Thinking flag so the 80ms QTimer
+            # singleShot won't overwrite our content with "Thinking...".
+            self._pending_thinking = False
             self.response_area.clear()
             # Show query header immediately so user sees their question reflected
             if self._current_query:
@@ -500,13 +507,41 @@ class OverlayWindow(QMainWindow):
         if not self._user_is_scrolling:
             self.response_area.moveCursor(QTextCursor.MoveOperation.End)
 
-    def on_complete(self, full_text: str, query: str = None):
-        """Called when streaming finishes. Does a final full Markdown render."""
+    def on_complete(self, full_text: str, query: str = None, cache_tier: int = 0, provider: str = ""):
+        """Called when streaming finishes. Does a final full Markdown render.
+
+        GAP 5: Prepends a source badge to the query header so the user always
+        knows whether the answer came from cache (and which tier) or a live
+        provider call.
+        """
         self._render_timer.stop()    # stop the periodic timer
         self._is_streaming = False
+        self._pending_thinking = False  # GAP 2: always clear on completion
         if query:
             self._current_query = query
         self._raw_buffer = full_text
+
+        # GAP 5: Build source badge for the response header
+        if cache_tier and cache_tier > 0:
+            tier_labels = {1: ("T1", "#4ade80", "⚡"), 2: ("T2", "#818cf8", "🔮"),
+                           3: ("T3", "#a78bfa", "🧠"), 4: ("T4", "#94a3b8", "≈")}
+            label, colour, icon = tier_labels.get(cache_tier, ("T?", "#94a3b8", "≈"))
+            badge = (
+                f"<span style='background:rgba(74,222,128,0.12);color:{colour};"
+                f"font-size:9px;font-weight:700;padding:1px 5px;border-radius:4px;"
+                f"margin-left:6px;'>{icon} Cache {label}</span>"
+            )
+        elif provider:
+            safe_p = provider[:12]
+            badge = (
+                f"<span style='background:rgba(99,102,241,0.12);color:#818cf8;"
+                f"font-size:9px;font-weight:700;padding:1px 5px;border-radius:4px;"
+                f"margin-left:6px;'>🌐 {safe_p}</span>"
+            )
+        else:
+            badge = ""
+
+        self._source_badge = badge   # stored so _render_markdown_now can inject it
         self._render_markdown_now()  # final full render with proper markdown
 
     def update_warmup_status(self, m, p, r):

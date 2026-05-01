@@ -51,8 +51,57 @@ class ResponseHistory:
         self.sessions = self.index_storage.get("sessions_index") or []
         # No longer auto-starting session here. Wait for start_new_session.
 
+        # GAP 4: Pre-load the last session's tail entries so follow-up resolution
+        # and the 3-turn history block work across app restarts.
+        # Only the last 10 entries are loaded — enough for context without bloat.
+        self._preload_last_session(max_entries=10)
+
     def _new_session_id(self) -> str:
         return f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+
+    def _preload_last_session(self, max_entries: int = 10) -> None:
+        """GAP 4: Seed in-memory history with tail entries from the last session.
+
+        This enables cross-session follow-up resolution and the 3-turn history
+        block in prompts, so 'give me an example of that' works after a restart.
+
+        Entries are marked read-only via metadata so they are not re-saved into
+        the new session's permanent record.
+        """
+        if not self.sessions:
+            return
+        last_session = self.sessions[0]  # most recent is always index 0
+        last_id = last_session.get("id", "")
+        if not last_id or last_id == self.current_session_id:
+            return
+        try:
+            prev_entries = self.read_session(last_id)
+            if prev_entries:
+                tail = prev_entries[-max_entries:]
+                for e in tail:
+                    # Mark as prior-session context so engine doesn't re-cache them
+                    e.metadata = {**e.metadata, "_prior_session": True}
+                self.entries = tail
+                self.current_index = len(self.entries) - 1
+                logger.debug(
+                    "[GAP4] Preloaded %d entries from prior session %s for follow-up context",
+                    len(tail), last_id[:16],
+                )
+        except Exception as exc:
+            logger.debug("[GAP4] Could not preload prior session: %s", exc)
+
+    def start_new_session(self):
+        """Starts a fresh session and archives the current one."""
+        self.save()  # Ensure current is saved
+
+        self.current_session_id = self._new_session_id()
+        self.current_storage = SecureStorage(
+            str(self.history_dir / f"{self.current_session_id}.enc")
+        )
+        self.entries = []
+        self.current_index = -1
+        self.screen_analyses = []
+        logger.info(f"🆕 Started new session: {self.current_session_id}")
 
     def _ensure_current_session_meta(self):
         for session in self.sessions:
