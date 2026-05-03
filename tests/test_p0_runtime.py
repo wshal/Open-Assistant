@@ -1185,7 +1185,7 @@ class StealthManagerTests(unittest.TestCase):
             manager.apply_to_window(FakeWindow(), False)
 
         self.assertEqual(manager._last_affinity_state[101], (False, 0x00000000))
-        self.assertEqual(manager.get_status()["state"], "protected")
+        self.assertEqual(manager.get_status()["state"], "unprotected")
 
     def test_linux_status_reports_limited_protection(self):
         manager = StealthManager(ConfigStub({"stealth.enabled": True}))

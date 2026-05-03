@@ -449,12 +449,21 @@ class AudioCapture(QObject):
             self.start()
 
     def _close_streams(self):
+        import subprocess
         for s in list(self._active_streams):
             try:
-                if s and hasattr(s, "stop"):
-                    s.stop()
-                if s and hasattr(s, "close"):
-                    s.close()
+                if isinstance(s, subprocess.Popen):
+                    if s.poll() is None:
+                        s.terminate()
+                        try:
+                            s.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            s.kill()
+                else:
+                    if s and hasattr(s, "stop"):
+                        s.stop()
+                    if s and hasattr(s, "close"):
+                        s.close()
             except Exception as e:
                 logger.warning(f"Audio stream close error: {e}")
         self._active_streams.clear()
@@ -517,6 +526,97 @@ class AudioCapture(QObject):
             resampled[:, ch] = np.interp(dst_x, src_x, indata[:, ch])
         return resampled
 
+    def _start_macos_system_audio(self):
+        """macOS: Spawn SystemAudioDump and pipe its output to the queue."""
+        import subprocess
+        import sys
+        from utils.platform_utils import PlatformInfo
+        
+        # Kill any existing instances first
+        try:
+            subprocess.run(["pkill", "-f", "SystemAudioDump"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+        bin_path = str(PlatformInfo.get_resource_path("assets/SystemAudioDump"))
+        if not os.path.exists(bin_path):
+            logger.error(f"macOS SystemAudioDump binary not found at {bin_path}")
+            return False
+            
+        # Ensure executable
+        try:
+            os.chmod(bin_path, 0o755)
+        except Exception as e:
+            logger.debug(f"macOS: Failed to chmod SystemAudioDump: {e}")
+
+        logger.info(f"🎤 Binding to macOS SystemAudioDump: {bin_path}")
+        
+        # Spawn the process
+        proc = subprocess.Popen(
+            [bin_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0  # unbuffered
+        )
+        self._active_streams.append(proc)
+        
+        # Start a dedicated thread to read from stdout
+        t = threading.Thread(target=self._macos_audio_reader, args=(proc,), daemon=True, name="macos-sysaudio")
+        t.start()
+        return True
+
+    def _macos_audio_reader(self, proc):
+        """Read 24000Hz 16-bit stereo PCM from SystemAudioDump stdout, downsample, and queue."""
+        source_rate = 24000
+        channels = 2
+        bytes_per_sample = 2
+        
+        chunk_frames = int(source_rate * (self.block_ms / 1000.0))
+        bytes_to_read = chunk_frames * channels * bytes_per_sample
+        
+        while self._running and proc.poll() is None:
+            try:
+                # Read exactly bytes_to_read
+                raw_data = proc.stdout.read(bytes_to_read)
+                if not raw_data:
+                    break
+                    
+                if not self._paused and self._running:
+                    # Convert to numpy int16
+                    audio_data = np.frombuffer(raw_data, dtype=np.int16)
+                    
+                    if len(audio_data) % channels == 0:
+                        audio_data = audio_data.reshape(-1, channels)
+                    else:
+                        frames = len(audio_data) // channels
+                        audio_data = audio_data[:frames * channels].reshape(-1, channels)
+                    
+                    # Convert to float32 [-1.0, 1.0]
+                    audio_float = audio_data.astype(np.float32) / 32768.0
+                    
+                    # Resample to target rate (self.sr)
+                    resampled = self._resample_to_target_rate(audio_float, source_rate)
+                    
+                    # Convert to mono
+                    data = np.mean(resampled, axis=1, keepdims=True).astype(np.float32)
+                    
+                    try:
+                        self.q.put_nowait(data)
+                        self._current_rms = float(np.sqrt(np.mean(resampled**2)))
+                    except queue.Full:
+                        logger.debug("Audio queue full; dropping frame")
+            except Exception as e:
+                if self._running:
+                    logger.debug(f"macOS SystemAudioDump read error: {e}")
+                break
+                
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
     def _capture_loop(self):
         import sounddevice as sd
 
@@ -557,38 +657,42 @@ class AudioCapture(QObject):
                         s_mic.start()
 
                     if mode in ["system", "both"]:
-                        idx, name, is_loopback = self._find_system_audio_source()
-                        if idx is not None:
-                            d = sd.query_devices(idx)
-                            logger.info(
-                                f"🎤 Binding to System Audio: {name} (Loopback: {is_loopback})"
-                            )
-                            native_rate = int(d.get("default_samplerate", self.sr))
-                            input_channels = int(d.get("max_input_channels", 0))
-                            output_channels = int(d.get("max_output_channels", 0))
-                            kwargs = {
-                                "device": idx,
-                                "samplerate": native_rate,
-                                "channels": max(
-                                    1, min(2, input_channels or output_channels or 1)
-                                ),
-                                "callback": make_cb(native_rate),
-                            }
-                            if is_loopback:
-                                try:
-                                    kwargs["loopback"] = True
-                                    kwargs["channels"] = max(
-                                        1, min(2, output_channels or 2)
-                                    )
+                        import sys
+                        if sys.platform == "darwin":
+                            self._start_macos_system_audio()
+                        else:
+                            idx, name, is_loopback = self._find_system_audio_source()
+                            if idx is not None:
+                                d = sd.query_devices(idx)
+                                logger.info(
+                                    f"🎤 Binding to System Audio: {name} (Loopback: {is_loopback})"
+                                )
+                                native_rate = int(d.get("default_samplerate", self.sr))
+                                input_channels = int(d.get("max_input_channels", 0))
+                                output_channels = int(d.get("max_output_channels", 0))
+                                kwargs = {
+                                    "device": idx,
+                                    "samplerate": native_rate,
+                                    "channels": max(
+                                        1, min(2, input_channels or output_channels or 1)
+                                    ),
+                                    "callback": make_cb(native_rate),
+                                }
+                                if is_loopback:
+                                    try:
+                                        kwargs["loopback"] = True
+                                        kwargs["channels"] = max(
+                                            1, min(2, output_channels or 2)
+                                        )
+                                        s_sys = sd.InputStream(**kwargs)
+                                    except TypeError:
+                                        raise RuntimeError(
+                                            "Installed sounddevice build has no WASAPI loopback support"
+                                        )
+                                else:
                                     s_sys = sd.InputStream(**kwargs)
-                                except TypeError:
-                                    raise RuntimeError(
-                                        "Installed sounddevice build has no WASAPI loopback support"
-                                    )
-                            else:
-                                s_sys = sd.InputStream(**kwargs)
-                            self._active_streams.append(s_sys)
-                            s_sys.start()
+                                self._active_streams.append(s_sys)
+                                s_sys.start()
 
                     logger.info("🎙️ Audio Hardware Successfully Synchronized.")
                     break

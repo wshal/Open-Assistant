@@ -172,9 +172,43 @@ class StealthManager:
         self._last_affinity_state[hwnd] = current
 
     def _macos_anti_capture(self, window, enabled):
-        """macOS: limited best-effort behavior only."""
+        """macOS: AppKit native stealth for Mission Control and all-workspaces."""
         try:
             window.setWindowFlag(Qt.WindowType.WindowTransparentForInput, enabled)
+
+            # Native AppKit behavior
+            try:
+                import objc
+                from AppKit import (
+                    NSWindowCollectionBehaviorCanJoinAllSpaces,
+                    NSWindowCollectionBehaviorMoveToActiveSpace,
+                    NSWindowCollectionBehaviorTransient,
+                )
+
+                hwnd = int(window.winId())
+                if hwnd != 0:
+                    # winId on macOS PyQt returns a pointer to the NSView
+                    ns_view = objc.objc_object(c_void_p=hwnd)
+                    ns_window = ns_view.window()
+                    if ns_window is not None:
+                        behavior = (
+                            NSWindowCollectionBehaviorCanJoinAllSpaces
+                            | NSWindowCollectionBehaviorMoveToActiveSpace
+                        )
+                        if enabled:
+                            behavior |= NSWindowCollectionBehaviorTransient
+
+                        ns_window.setCollectionBehavior_(behavior)
+                        logger.info("Stealth: macOS AppKit NSWindow behaviors applied.")
+            except ImportError:
+                logger.debug(
+                    "Stealth: pyobjc not installed. Skipping native macOS window behaviors."
+                )
+            except Exception as e:
+                logger.debug(
+                    f"Stealth: Failed to apply native macOS window behaviors: {e}"
+                )
+
             logger.info(
                 f"Stealth: macOS transparency {'enabled' if enabled else 'disabled'}"
             )
