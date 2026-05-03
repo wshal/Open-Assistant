@@ -4,10 +4,12 @@ import os
 import re
 import copy
 import yaml
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from utils.crypto import SecureStorage
 from utils.logger import setup_logger
+from core.constants import CONFIG_FILE
 
 logger = setup_logger(__name__)
 
@@ -90,11 +92,39 @@ KEY_PATTERNS: Dict[str, Dict] = {
 
 
 class Config:
-    def __init__(self, path: str = "config.yaml"):
+    def __init__(self, path: str = CONFIG_FILE):
         self._path = Path(path)
+        self._maybe_import_legacy_config()
         self._data = {}
         self.secrets = SecureStorage()
+        logger.info("Config: using file %s", self._path)
         self._load()
+
+    def _maybe_import_legacy_config(self) -> None:
+        """Migrate legacy side-by-side config.yaml into the persistent config path."""
+        if self._path.exists():
+            return
+
+        legacy_path = Path("config.yaml")
+        if legacy_path.resolve() == self._path.resolve():
+            return
+        if not legacy_path.exists():
+            return
+
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(legacy_path, self._path)
+            logger.info(
+                "Config: imported legacy config from %s -> %s",
+                legacy_path,
+                self._path,
+            )
+        except Exception as e:
+            logger.warning(
+                "Config: could not import legacy config from %s: %s",
+                legacy_path,
+                e,
+            )
 
     def _load(self):
         if self._path.exists():

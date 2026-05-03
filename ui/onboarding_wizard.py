@@ -4,6 +4,7 @@ First-run setup wizard to guide users through initial configuration.
 """
 
 import os
+import traceback
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -18,11 +19,15 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QSizePolicy,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from ui.custom_widgets import PremiumCheckBox
 from PyQt6.QtGui import QFont, QDesktopServices
 from PyQt6.QtCore import QUrl
 from core.constants import PROVIDERS
+from ui.settings_view import ProviderTestWorker
+from utils.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 STYLE_CARD = """
     QFrame {
@@ -62,6 +67,48 @@ STYLE_BTN_SECONDARY = """
     QPushButton:hover {
         background: rgba(255,255,255,20);
         color: white;
+    }
+"""
+
+STYLE_LINK_BUTTON = """
+    QPushButton {
+        background: rgba(56,189,248,30);
+        color: #bae6fd;
+        border-radius: 10px;
+        font-weight: 700;
+        font-size: 11px;
+        padding: 0 16px;
+        border: 1px solid rgba(56,189,248,71);
+    }
+    QPushButton:hover {
+        background: rgba(56,189,248,45);
+        border: 1px solid rgba(125,211,252,127);
+        color: white;
+    }
+"""
+
+STYLE_TEST_BUTTON = """
+    QPushButton {
+        background: rgba(80,85,255,45);
+        color: #f8fafc;
+        border-radius: 8px;
+        font-size: 10px;
+        font-weight: 800;
+        padding: 0 14px;
+        border: 1px solid rgba(129,140,248,140);
+    }
+    QPushButton:hover:enabled {
+        background: rgba(80,85,255,89);
+        color: white;
+        border: 1px solid rgba(165,180,252,216);
+    }
+    QPushButton:pressed {
+        background: rgba(67,56,202,140);
+    }
+    QPushButton:disabled {
+        background: rgba(255,255,255,7);
+        color: rgba(255,255,255,51);
+        border: 1px solid rgba(255,255,255,12);
     }
 """
 
@@ -115,6 +162,9 @@ class OnboardingWizard(QWidget):
         """Reset internal wizard progress and re-sync with core config."""
         self._current_step = 0
         self._total_steps = 4
+        self._provider_test_cooldowns = {}
+        self._provider_test_worker = None
+        self._provider_preview_statuses = {}
         
         # In-memory state for "Save-at-End" logic
         self.wizard_state = {
@@ -125,6 +175,7 @@ class OnboardingWizard(QWidget):
                 "gemini": self.config.get_api_key("gemini") or "",
                 "ollama": "",
             },
+            "provider_test_results": {},
             "ai_mode": self.config.get("ai.mode", "general"),
             "audio_mode": self.config.get("capture.audio.mode", "system"),
             "gaze_enabled": self.config.get("app.gaze_fade.enabled", False),
@@ -382,63 +433,91 @@ class OnboardingWizard(QWidget):
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         self.content_layout.addWidget(self.provider_combo, 0, Qt.AlignmentFlag.AlignCenter)
 
-        self.content_layout.addSpacing(20) # Grouping gap
+        self.content_layout.addSpacing(20)
 
-        # API Key input
+        self.provider_card = QFrame()
+        self.provider_card.setFixedWidth(300)
+        self.provider_card.setStyleSheet(
+            "QFrame {"
+            "background: rgba(255,255,255,5);"
+            "border-radius: 12px;"
+            "border: 1px solid rgba(255,255,255,10);"
+            "padding: 10px;"
+            "}"
+        )
+        card_layout = QVBoxLayout(self.provider_card)
+        card_layout.setContentsMargins(14, 12, 14, 12)
+        card_layout.setSpacing(8)
+
+        card_top = QHBoxLayout()
+        card_top.setContentsMargins(0, 0, 0, 0)
+        card_top.setSpacing(10)
+
+        self.provider_card_label = QLabel("Connection")
+        self.provider_card_label.setStyleSheet(
+            "color: #a0a0cc; font-weight: 700; font-size: 11px; background: transparent;"
+        )
+        card_top.addWidget(self.provider_card_label)
+        card_top.addStretch()
+
+        self.provider_status_icon = QLabel("\u26aa")
+        self.provider_status_icon.setStyleSheet(
+            "background: transparent; font-size: 11px; color: #64748b;"
+        )
+        card_top.addWidget(self.provider_status_icon)
+
+        self.provider_test_btn = QPushButton("TEST")
+        self.provider_test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.provider_test_btn.setStyleSheet(STYLE_TEST_BUTTON)
+        self.provider_test_btn.setFixedSize(68, 28)
+        self.provider_test_btn.clicked.connect(self._test_selected_provider)
+        card_top.addWidget(self.provider_test_btn)
+        card_layout.addLayout(card_top)
+
+        self.provider_link_btn = QPushButton("Get API key")
+        self.provider_link_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.provider_link_btn.setStyleSheet(STYLE_LINK_BUTTON)
+        self.provider_link_btn.setFixedHeight(30)
+        self.provider_link_btn.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.provider_link_btn.clicked.connect(self._open_provider_link)
+        card_layout.addWidget(self.provider_link_btn, 0, Qt.AlignmentFlag.AlignLeft)
+
         self.lbl_key = QLabel("API Key")
         self.lbl_key.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 600;")
-        self.lbl_key.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.content_layout.addWidget(self.lbl_key)
-        
-        self.content_layout.addSpacing(4)
+        card_layout.addWidget(self.lbl_key)
 
-        self.provider_link = QLabel()
-        self.provider_link.setOpenExternalLinks(False)
-        self.provider_link.setWordWrap(False)
-        self.provider_link.setSizePolicy(
-            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
-        )
-        self.provider_link.linkActivated.connect(
-            lambda url: QDesktopServices.openUrl(QUrl(url))
-        )
-        self.provider_link.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.provider_link.setStyleSheet(
-            """
-            QLabel {
-                color: #bae6fd;
-                font-size: 10px;
-                font-weight: 700;
-                background: rgba(56,189,248,30);
-                border: 1px solid rgba(56,189,248,71);
-                border-radius: 10px;
-                padding: 4px 10px;
-            }
-            QLabel:hover {
-                background: rgba(56,189,248,45);
-                border: 1px solid rgba(125,211,252,127);
-            }
-            """
-        )
-        self.content_layout.addWidget(self.provider_link)
-
-        self.content_layout.addSpacing(4)
+        key_row = QHBoxLayout()
+        key_row.setContentsMargins(0, 0, 0, 0)
+        key_row.setSpacing(8)
 
         self.api_key_input = QLineEdit()
         self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key_input.setPlaceholderText("Enter your API key...")
         self.api_key_input.setStyleSheet(STYLE_INPUT)
-        self.api_key_input.setFixedWidth(280) 
-        
-        # Restore key
+        self.api_key_input.setFixedHeight(42)
         self.api_key_input.setText(self.wizard_state["api_keys"].get(current_p, ""))
-        
-        self.content_layout.addWidget(self.api_key_input, 0, Qt.AlignmentFlag.AlignCenter)
+        self.api_key_input.textChanged.connect(self._on_provider_key_changed)
+        key_row.addWidget(self.api_key_input)
 
-        # Initial visibility check for Ollama
-        is_ollama = (current_p == "ollama")
-        self.lbl_key.setVisible(not is_ollama)
-        self.api_key_input.setVisible(not is_ollama)
+        lock_lbl = QLabel("\U0001f512")
+        lock_lbl.setStyleSheet("background: transparent; font-size: 12px;")
+        lock_lbl.setToolTip(
+            "Your API key is stored encrypted (AES-128 Fernet) on this machine only. "
+            "Never sent to any server."
+        )
+        key_row.addWidget(lock_lbl)
+        card_layout.addLayout(key_row)
+
+        self.provider_detail = QLabel("Not tested yet")
+        self.provider_detail.setWordWrap(True)
+        self.provider_detail.setStyleSheet("color: #64748b; font-size: 10px; background: transparent;")
+        card_layout.addWidget(self.provider_detail)
+
+        self.input_container = self.provider_card
+        self.content_layout.addWidget(self.input_container, 0, Qt.AlignmentFlag.AlignCenter)
+
         self._refresh_provider_link(current_p)
+        self._apply_provider_test_state(current_p)
 
         self.content_layout.addSpacing(10)
 
@@ -548,7 +627,7 @@ class OnboardingWizard(QWidget):
 
         self.content_layout.addSpacing(18)
 
-        self.chk_start_minimized = PremiumCheckBox("Start minimized to system tray")
+        self.chk_start_minimized = PremiumCheckBox("Launch in background (system tray)")
         self.chk_start_minimized.setChecked(
             self.wizard_state.get("start_minimized", False)
         )
@@ -557,7 +636,7 @@ class OnboardingWizard(QWidget):
         )
 
         desc_tray = QLabel(
-            "Useful if you want OpenAssist ready in the background right after login."
+            "Keeps OpenAssist in the system tray on launch instead of opening the HUD immediately."
         )
         desc_tray.setStyleSheet("color: #64748b; font-size: 9px; text-align: center;")
         desc_tray.setWordWrap(True)
@@ -626,17 +705,20 @@ class OnboardingWizard(QWidget):
             # Save current step data to in-memory state
             self._save_step_data()
             self._show_step(self._current_step + 1)
-        else:
+            return
+
+        try:
             # Final Commitment Screen
             self._save_step_data()
-            
+
             # --- FINAL COMMIT TO DISK ---
             # 1. AI Provider & Keys
             p = self.wizard_state["provider"]
             self.config.set("ai.fixed_provider", p)
             for prov, k in self.wizard_state["api_keys"].items():
-                if k: self.config.set_api_key(prov, k)
-                
+                if k:
+                    self.config.set_api_key(prov, k)
+
             # 2. Audio & UI
             self.config.set("ai.mode", self.wizard_state["ai_mode"])
             self.config.set("capture.audio.mode", self.wizard_state["audio_mode"])
@@ -644,24 +726,37 @@ class OnboardingWizard(QWidget):
             self.config.set(
                 "app.start_minimized", self.wizard_state["start_minimized"]
             )
-            
+
             # 3. Mark Completed
             self.config.set("onboarding.completed", True)
             self.config.save()
-            
+            logger.info(
+                "[Onboarding] Saved provider=%s mode=%s audio=%s",
+                self.wizard_state["provider"],
+                self.wizard_state["ai_mode"],
+                self.wizard_state["audio_mode"],
+            )
+
             # Apply settings immediately to engine
             if self.app:
                 self.app.state.mode = self.wizard_state["ai_mode"]
                 self.app.state.audio_source = self.wizard_state["audio_mode"]
+                logger.info("[Onboarding] Applying settings to running app")
                 self.app._apply_settings()
-                # Explicitly sync StandbyView UI to reflect new selections
-                if hasattr(self.app, 'overlay') and hasattr(self.app.overlay, 'standby_view'):
+                if hasattr(self.app, "overlay") and hasattr(
+                    self.app.overlay, "standby_view"
+                ):
                     self.app.overlay.standby_view.refresh_highlights(
                         mode=self.wizard_state["ai_mode"],
-                        audio=self.wizard_state["audio_mode"]
+                        audio=self.wizard_state["audio_mode"],
                     )
-                
+            logger.info("[Onboarding] Complete setup finished; emitting finished signal")
             self.finished.emit()
+        except Exception as e:
+            logger.error("[Onboarding] Finalize failed: %s", e)
+            logger.error(traceback.format_exc())
+            self.btn_next.setEnabled(True)
+            self.btn_next.setText("Get Started ->")
 
     def _on_back(self):
         """Handle back button click."""
@@ -684,11 +779,20 @@ class OnboardingWizard(QWidget):
             if hasattr(self, "provider_combo"):
                 idx = self.provider_combo.currentIndex()
                 providers = ["groq", "cerebras", "gemini", "ollama"]
-                self.wizard_state["provider"] = providers[idx]
+                selected_provider = providers[idx]
+                previous_provider = self.wizard_state.get("provider", selected_provider)
+
+                if hasattr(self, "api_key_input"):
+                    self.wizard_state["api_keys"][previous_provider] = (
+                        self.api_key_input.text().strip()
+                    )
+                    if previous_provider != selected_provider:
+                        self.wizard_state["api_keys"][selected_provider] = (
+                            self.wizard_state["api_keys"].get(selected_provider, "")
+                        )
 
                 # Update key for just THIS provider in-memory
-                key = self.api_key_input.text().strip()
-                self.wizard_state["api_keys"][providers[idx]] = key
+                self.wizard_state["provider"] = selected_provider
 
         elif self._current_step == 2:
             # Audio step
@@ -716,31 +820,49 @@ class OnboardingWizard(QWidget):
         """Update API key input when provider changes in Screen 2. Sync with in-memory state."""
         providers = ["groq", "cerebras", "gemini", "ollama"]
         p = providers[idx]
+
+        prev_provider = self.wizard_state.get("provider", p)
+        if hasattr(self, "api_key_input"):
+            self.wizard_state["api_keys"][prev_provider] = self.api_key_input.text().strip()
+        self.wizard_state["provider"] = p
         
         # In-memory restoration
         self.api_key_input.setText(self.wizard_state["api_keys"].get(p, ""))
         
-        # Dynamic visibility: Hide key box for local-only Ollama
-        is_ollama = (p == "ollama")
-        self.lbl_key.setVisible(not is_ollama)
-        self.api_key_input.setVisible(not is_ollama)
         self._refresh_provider_link(p)
+        self._apply_provider_test_state(p)
 
     def _refresh_provider_link(self, provider_id: str):
         provider_meta = PROVIDERS.get(provider_id, {})
         url = provider_meta.get("url", "")
         if not url:
-            self.provider_link.clear()
-            self.provider_link.setToolTip("")
+            self.provider_link_btn.setVisible(False)
+            self.provider_link_btn.setToolTip("")
+            self.provider_link_btn.setProperty("provider_url", "")
             return
 
         link_text = "Install Ollama" if provider_id == "ollama" else "Get API key"
-        self.provider_link.setText(f'<a href="{url}">{link_text}</a>')
-        self.provider_link.setToolTip(
+        self.provider_link_btn.setText(link_text)
+        self.provider_link_btn.setVisible(True)
+        self.provider_link_btn.setProperty("provider_url", url)
+        self.provider_card_label.setText(
+            "Local engine" if provider_id == "ollama" else "Connection"
+        )
+        self.lbl_key.setText("Endpoint" if provider_id == "ollama" else "API Key")
+        self.api_key_input.setPlaceholderText(
+            "Optional Ollama endpoint (default: http://localhost:11434)"
+            if provider_id == "ollama"
+            else "Enter your API key..."
+        )
+        self.provider_link_btn.setToolTip(
             f"Open {provider_meta.get('name', provider_id)} to "
             f"{'install the local engine' if provider_id == 'ollama' else 'create or copy an API key'}."
         )
-        self.provider_link.adjustSize()
+
+    def _open_provider_link(self):
+        url = self.provider_link_btn.property("provider_url") or ""
+        if url:
+            QDesktopServices.openUrl(QUrl(str(url)))
 
     def _update_summary(self):
         """Refresh summary labels from in-memory wizard_state with safety guards."""
@@ -754,8 +876,13 @@ class OnboardingWizard(QWidget):
             key = self.wizard_state["api_keys"].get(prov_id, "")
             
             # Mask key: first 4 and last 4
+            test_result = self.wizard_state.get("provider_test_results", {}).get(prov_id, {})
+            verified = bool(test_result.get("success"))
             key_masked = f"{key[:4]}...{key[-4:]}" if key and len(key) > 8 else "Active" if key else "No Key Found"
-            if prov_id == "ollama": key_masked = "Local Engine Ready"
+            if prov_id == "ollama":
+                key_masked = "Local Engine Ready" if verified else "Local Engine Not Tested"
+            elif verified:
+                key_masked = f"{key_masked}  |  Verified"
             
             self.summary_provider.setText(f"{prov_names.get(prov_id, prov_id)}: {key_masked}")
 
@@ -782,3 +909,159 @@ class OnboardingWizard(QWidget):
         except (RuntimeError, AttributeError):
             # Widget might be deleted during step transitions, safe to ignore
             pass
+
+    def _on_provider_key_changed(self, text: str):
+        provider_id = self.wizard_state.get("provider", "groq")
+        self.wizard_state["api_keys"][provider_id] = (text or "").strip()
+        if provider_id != "ollama":
+            self.provider_test_btn.setEnabled(bool((text or "").strip()))
+        self._set_provider_test_idle(provider_id, clear_previous_result=True)
+
+    def _set_provider_test_idle(self, provider_id: str, clear_previous_result: bool = False):
+        if not hasattr(self, "provider_test_btn"):
+            return
+        if provider_id == "ollama":
+            self.provider_test_btn.setEnabled(True)
+        else:
+            self.provider_test_btn.setEnabled(bool(self.api_key_input.text().strip()))
+        self.provider_test_btn.setText("TEST")
+        if clear_previous_result:
+            self.provider_status_icon.setText("\u26aa")
+            self.provider_status_icon.setStyleSheet(
+                "background: transparent; font-size: 11px; color: #64748b;"
+            )
+            if provider_id in self.wizard_state.get("provider_test_results", {}):
+                self.wizard_state["provider_test_results"].pop(provider_id, None)
+                self._provider_preview_statuses.pop(provider_id, None)
+                self._push_provider_preview_statuses()
+            if hasattr(self, "provider_detail"):
+                self.provider_detail.setStyleSheet(
+                    "color: #64748b; font-size: 10px; background: transparent;"
+                )
+                self.provider_detail.setText(
+                    "Test the connection before continuing for a more reliable setup."
+                    if provider_id != "ollama"
+                    else "Check the local Ollama server and discover installed models."
+                )
+
+    def _apply_provider_test_state(self, provider_id: str):
+        if not hasattr(self, "provider_detail"):
+            return
+        result = self.wizard_state.get("provider_test_results", {}).get(provider_id)
+        if not result:
+            self._set_provider_test_idle(provider_id, clear_previous_result=False)
+            return
+
+        success = bool(result.get("success"))
+        detail = str(result.get("message", "Not tested"))
+        self.provider_status_icon.setText("\u2705" if success else "\u274c")
+        self.provider_status_icon.setStyleSheet(
+            f"background: transparent; font-size: 11px; color: {'#4ade80' if success else '#fda4af'};"
+        )
+        self.provider_detail.setStyleSheet(
+            f"color: {'#4ade80' if success else '#fda4af'}; font-size: 10px; background: transparent;"
+        )
+        self.provider_detail.setText(detail)
+        self.provider_test_btn.setText("RETEST")
+        self.provider_test_btn.setEnabled(True if provider_id == "ollama" else bool(self.api_key_input.text().strip()))
+
+    def _test_selected_provider(self):
+        provider_id = self.wizard_state.get("provider", "groq")
+        if self._provider_test_cooldowns.get(provider_id, False):
+            return
+
+        key_override = ""
+        if provider_id != "ollama":
+            key_override = self.api_key_input.text().strip()
+            if not key_override:
+                self._set_provider_test_idle(provider_id, clear_previous_result=False)
+                self.provider_detail.setStyleSheet(
+                    "color: #fda4af; font-size: 10px; background: transparent;"
+                )
+                self.provider_detail.setText("Enter an API key before testing.")
+                self.provider_status_icon.setText("\u274c")
+                self.provider_status_icon.setStyleSheet(
+                    "background: transparent; font-size: 11px; color: #fda4af;"
+                )
+                return
+
+        self._provider_test_cooldowns[provider_id] = True
+        QTimer.singleShot(
+            3000,
+            lambda p=provider_id: self._provider_test_cooldowns.update({p: False}),
+        )
+
+        self.provider_status_icon.setText("\u23f3")
+        self.provider_status_icon.setStyleSheet(
+            "background: transparent; font-size: 11px; color: #7dd3fc;"
+        )
+        self.provider_detail.setStyleSheet(
+            "color: #7dd3fc; font-size: 10px; background: transparent;"
+        )
+        self.provider_detail.setText(
+            "Checking local Ollama server..."
+            if provider_id == "ollama"
+            else "Checking API key and provider connection..."
+        )
+        self.provider_test_btn.setEnabled(False)
+        self.provider_test_btn.setText("TESTING")
+
+        self._provider_test_worker = ProviderTestWorker(
+            provider_id,
+            self.config,
+            self,
+            key_override=key_override,
+        )
+        self._provider_test_worker.result_ready.connect(self._on_provider_test_result)
+        self._provider_test_worker.finished.connect(self._clear_provider_test_worker)
+        self._provider_test_worker.start()
+
+    def _clear_provider_test_worker(self):
+        self._provider_test_worker = None
+
+    def _on_provider_test_result(self, provider_id: str, success: bool, message: str, details):
+        provider_meta = PROVIDERS.get(provider_id, {})
+        label = provider_meta.get("name", provider_id)
+        detail_text = message
+
+        if provider_id == "ollama" and isinstance(details, dict):
+            models = details.get("models", []) or []
+            if success and models:
+                preview = ", ".join(models[:2])
+                extra = "" if len(models) <= 2 else f" +{len(models) - 2} more"
+                detail_text = f"{message} | {preview}{extra}"
+
+        self.wizard_state.setdefault("provider_test_results", {})[provider_id] = {
+            "success": success,
+            "message": detail_text,
+            "details": details,
+        }
+
+        if self.wizard_state.get("provider") == provider_id:
+            self._apply_provider_test_state(provider_id)
+
+        if success:
+            self._provider_preview_statuses[provider_id] = {
+                "state": "active",
+                "selected": True,
+                "usable": True,
+                "label": label,
+            }
+        else:
+            self._provider_preview_statuses.pop(provider_id, None)
+
+        self._push_provider_preview_statuses()
+        self._update_summary()
+
+    def _push_provider_preview_statuses(self):
+        if not self.app or not hasattr(self.app, "overlay") or not hasattr(self.app.overlay, "standby_view"):
+            return
+        statuses = {}
+        selected_provider = self.wizard_state.get("provider", "")
+        for pid, info in self._provider_preview_statuses.items():
+            statuses[pid] = {
+                "state": info.get("state", "active"),
+                "selected": pid == selected_provider,
+                "usable": bool(info.get("usable", True)),
+            }
+        self.app.overlay.standby_view.set_provider_statuses(statuses)

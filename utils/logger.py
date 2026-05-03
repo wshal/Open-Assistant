@@ -8,6 +8,7 @@ import logging
 import io
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from core.constants import LOG_DIR
 
 _initialized = False
 
@@ -24,48 +25,59 @@ def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
 
 
 def _setup_root_logger(level: int):
+    # Never let logging internals crash the application, especially in
+    # windowed/frozen builds where stdout/stderr may not behave like a console.
+    logging.raiseExceptions = False
+
     root = logging.getLogger()
     root.setLevel(level)
     root.handlers.clear()
 
-    # Console handler with Rich
+    # Console handler with Rich for interactive source runs only.
+    # In the packaged Windows .exe there is no real console, and RichHandler
+    # can fail while trying to report its own emit errors.
     try:
-        from rich.logging import RichHandler
-        from rich.console import Console
+        use_console = not getattr(sys, "frozen", False) and sys.stdout is not None
+        if use_console:
+            from rich.logging import RichHandler
+            from rich.console import Console
 
-        _file = None
-        if sys.platform == "win32":
-            try:
-                _file = io.TextIOWrapper(
-                    sys.stdout.buffer, encoding="utf-8", errors="replace"
-                )
-            except Exception:
-                _file = None
+            _file = None
+            if sys.platform == "win32":
+                try:
+                    _file = io.TextIOWrapper(
+                        sys.stdout.buffer, encoding="utf-8", errors="replace"
+                    )
+                except Exception:
+                    _file = None
 
-        _console = Console(file=_file, highlight=False, markup=False, soft_wrap=True)
-        console_handler = RichHandler(
-            console=_console,
-            rich_tracebacks=False,
-            markup=False,
-            show_time=True,
-            show_path=False,
-        )
-        console_handler.setLevel(level)
-        console_handler.setFormatter(logging.Formatter("%(message)s"))
-        root.addHandler(console_handler)
-    except Exception:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(level)
-        console_handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S"
+            _console = Console(
+                file=_file, highlight=False, markup=False, soft_wrap=True
             )
-        )
-        root.addHandler(console_handler)
+            console_handler = RichHandler(
+                console=_console,
+                rich_tracebacks=False,
+                markup=False,
+                show_time=True,
+                show_path=False,
+            )
+            console_handler.setLevel(level)
+            console_handler.setFormatter(logging.Formatter("%(message)s"))
+            root.addHandler(console_handler)
+    except Exception:
+        if sys.stdout is not None and not getattr(sys, "frozen", False):
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(level)
+            console_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S"
+                )
+            )
+            root.addHandler(console_handler)
 
     # File handler
     try:
-        log_dir = Path("logs")
+        log_dir = Path(LOG_DIR)
         log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = RotatingFileHandler(
             filename=log_dir / "openassist.log",
@@ -103,4 +115,4 @@ def _setup_root_logger(level: int):
 
 
 def get_log_file_path() -> str:
-    return str(Path("logs") / "openassist.log")
+    return str(Path(LOG_DIR) / "openassist.log")

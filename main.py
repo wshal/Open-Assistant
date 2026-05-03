@@ -16,12 +16,13 @@ load_dotenv()
 
 from core.config import Config
 from core.app import OpenAssistApp
+from core.constants import CONFIG_FILE
 from utils.logger import setup_logger
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="OpenAssist AI v4.0")
-    p.add_argument("--config", default="config.yaml")
+    p.add_argument("--config", default=CONFIG_FILE)
     p.add_argument(
         "--mode",
         choices=["general", "interview", "meeting", "coding", "writing", "exam"],
@@ -42,11 +43,18 @@ def parse_args():
 def global_exception_handler(exctype, value, tb):
     """Crash hook to capture and log ALL unhandled exceptions."""
     logger = setup_logger("openassist")
-    err_str = "".join(traceback.format_exception(exctype, value, tb))
+    try:
+        err_str = "".join(traceback.format_exception(exctype, value, tb))
+    except Exception:
+        err_str = f"Exception: {exctype.__name__}: {value} (Traceback unavailable)"
     logger.critical("❌ FATAL CRASH DETECTED!")
     logger.critical(err_str)
-    # Also print to stderr just in case
-    print(err_str, file=sys.stderr)
+    # Also print to stderr just in case (safe-guarded if sys.stderr is None)
+    if sys.stderr is not None:
+        try:
+            print(err_str, file=sys.stderr)
+        except Exception:
+            pass
     sys.exit(1)
 
 

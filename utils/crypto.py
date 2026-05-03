@@ -3,11 +3,13 @@
 import os
 import json
 import base64
+import shutil
 from pathlib import Path
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from utils.logger import setup_logger
+from core.constants import SETTINGS_FILE
 
 logger = setup_logger(__name__)
 
@@ -15,11 +17,50 @@ logger = setup_logger(__name__)
 class SecureStorage:
     """Encrypt API keys at rest using machine-specific key."""
 
-    def __init__(self, filepath: str = "data/settings.enc"):
+    def __init__(self, filepath: str = SETTINGS_FILE):
         self.filepath = Path(filepath)
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
+        self._maybe_import_legacy_storage()
         self._fernet = self._create_fernet()
         self._data = self._load()
+        logger.info("SecureStorage: using file %s", self.filepath)
+
+    def _maybe_import_legacy_storage(self) -> None:
+        """Migrate legacy side-by-side encrypted settings into persistent storage."""
+        default_target = Path(SETTINGS_FILE)
+        try:
+            if self.filepath.resolve() != default_target.resolve():
+                return
+        except Exception:
+            if str(self.filepath) != str(default_target):
+                return
+
+        if self.filepath.exists():
+            return
+
+        legacy_path = Path("data") / "settings.enc"
+        try:
+            if legacy_path.resolve() == self.filepath.resolve():
+                return
+        except Exception:
+            pass
+        if not legacy_path.exists():
+            return
+
+        try:
+            self.filepath.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(legacy_path, self.filepath)
+            logger.info(
+                "SecureStorage: imported legacy settings from %s -> %s",
+                legacy_path,
+                self.filepath,
+            )
+        except Exception as e:
+            logger.warning(
+                "SecureStorage: could not import legacy settings from %s: %s",
+                legacy_path,
+                e,
+            )
 
     def _create_fernet(self) -> Fernet:
         """Derive encryption key from machine-specific data."""

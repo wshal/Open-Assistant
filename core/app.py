@@ -554,7 +554,7 @@ class OpenAssistApp(QObject):
         if self.config.get("app.start_minimized", False):
             self.overlay.hide()
             self.mini_overlay.hide()
-            logger.info("Startup minimized to system tray.")
+            logger.info("Launching in background (system tray).")
             return
 
         self._show_active_overlay()

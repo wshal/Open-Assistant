@@ -2,6 +2,7 @@ import asyncio
 import shutil
 import sys
 import unittest
+import os
 from pathlib import Path
 from unittest.mock import Mock, patch
 import numpy as np
@@ -21,11 +22,13 @@ from utils.platform_utils import WindowUtils
 from ai.providers.ollama_provider import OllamaProvider
 from ai.prompts import PromptBuilder
 from ui.settings_view import ProviderTestWorker, SettingsView
+from PyQt6.QtWidgets import QApplication
 
 
 class ConfigStub:
     def __init__(self, settings=None):
         self.settings = settings or {}
+        self.saved = 0
 
     def get(self, path, default=None):
         return self.settings.get(path, default)
@@ -33,8 +36,14 @@ class ConfigStub:
     def set(self, path, value):
         self.settings[path] = value
 
+    def save(self):
+        self.saved += 1
+
     def get_api_key(self, provider):
         return self.settings.get(f"api_key.{provider}", "")
+
+    def set_api_key(self, provider, value):
+        self.settings[f"api_key.{provider}"] = value
 
     def validate_key_for_ui(self, provider, key):
         if provider == "ollama":
@@ -904,6 +913,80 @@ class ProviderTestWorkerTests(unittest.TestCase):
         picked = SettingsView._recommended_ollama_model(models, "coding")
 
         self.assertEqual(picked, "qwen2.5-coder:7b")
+
+
+class SettingsViewSyncTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.qt_app = QApplication.instance() or QApplication([])
+
+    def test_display_and_system_widgets_resync_from_config_on_reopen(self):
+        config = ConfigStub(
+            {
+                "app.opacity": 0.91,
+                "stealth.low_opacity": 0.73,
+                "app.gaze_fade.enabled": True,
+                "app.gaze_fade.margin": 40,
+                "app.gaze_fade.target_opacity": 0.20,
+                "app.start_minimized": False,
+                "app.focus_on_show": False,
+                "capture.audio.mode": "system",
+                "ai.mode": "general",
+            }
+        )
+
+        settings = SettingsView(config, app=None)
+        self.addCleanup(settings.deleteLater)
+
+        config.set("app.opacity", 0.88)
+        config.set("stealth.low_opacity", 0.79)
+        config.set("app.gaze_fade.enabled", False)
+        config.set("app.gaze_fade.margin", 80)
+        config.set("app.gaze_fade.target_opacity", 0.25)
+        config.set("app.start_minimized", True)
+        config.set("app.focus_on_show", True)
+
+        settings._sync_ui_from_config()
+
+        self.assertEqual(settings.hud_opacity_slider.value(), 88)
+        self.assertEqual(settings.hud_opacity_value.text(), "88%")
+        self.assertEqual(settings.stealth_opacity_slider.value(), 79)
+        self.assertEqual(settings.stealth_opacity_value.text(), "79%")
+        self.assertFalse(settings.chk_gaze.isChecked())
+        self.assertEqual(settings.margin_slider.currentIndex(), 5)
+        self.assertEqual(settings.opacity_slider.currentIndex(), 4)
+        self.assertTrue(settings.chk_start_minimized.isChecked())
+        self.assertTrue(settings.chk_focus_on_show.isChecked())
+
+    def test_system_tab_is_after_ghost(self):
+        settings = SettingsView(ConfigStub({"capture.audio.mode": "system"}), app=None)
+        self.addCleanup(settings.deleteLater)
+
+        labels = [settings.tabs.tabText(i) for i in range(settings.tabs.count())]
+
+        self.assertEqual(labels[-2:], ["GHOST", "SYSTEM"])
+
+    def test_system_tab_settings_are_saved_after_move(self):
+        config = ConfigStub(
+            {
+                "capture.audio.mode": "system",
+                "ai.mode": "general",
+                "app.start_minimized": False,
+                "app.focus_on_show": False,
+            }
+        )
+        settings = SettingsView(config, app=None)
+        self.addCleanup(settings.deleteLater)
+
+        settings.chk_start_minimized.setChecked(True)
+        settings.chk_focus_on_show.setChecked(True)
+
+        settings._save_all()
+
+        self.assertTrue(config.get("app.start_minimized"))
+        self.assertTrue(config.get("app.focus_on_show"))
+        self.assertEqual(config.saved, 1)
 
 
 class WindowUtilsTests(unittest.TestCase):

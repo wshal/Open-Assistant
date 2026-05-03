@@ -16,6 +16,26 @@ QLineEdit, QComboBox {
     padding: 6px 10px;
     font-size: 11px;
 }
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 25px;
+    border-left: 1px solid rgba(80,85,255,20);
+}
+QComboBox::down-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #e0e0f5;
+    width: 0;
+    height: 0;
+}
+QComboBox QAbstractItemView {
+    background: rgba(20,20,40,240);
+    color: #e0e0f5;
+    selection-background-color: rgba(80,85,255,100);
+    border: 1px solid rgba(80,85,255,40);
+}
 """
 
 STYLE_BTN_PRIMARY = """

@@ -6,6 +6,7 @@ FIXED: Checkbox tick visibility with URL-encoded SVG (Safe Mode).
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 import os
+import traceback
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -33,7 +34,10 @@ from ui.settings._tab_api import ApiTabMixin
 from ui.settings._tab_capture import CaptureTabMixin
 from ui.settings._tab_context import ContextTabMixin
 from ui.settings._tab_hotkeys import HotkeysTabMixin
+from ui.settings._tab_knowledge import KnowledgeTabMixin
+from ui.settings._tab_routing import RoutingTabMixin
 from ui.settings._tab_stealth import StealthTabMixin
+from ui.settings._tab_system import SystemTabMixin
 from ui.settings._tab_ui import UiTabMixin
 
 from utils.context_store import get_store as get_context_store
@@ -299,7 +303,7 @@ class ProviderTestWorker(QThread):
             self.result_ready.emit(self.provider_id, False, str(e)[:120], None)
 
 
-class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, HotkeysTabMixin, StealthTabMixin, UiTabMixin):
+class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, HotkeysTabMixin, KnowledgeTabMixin, RoutingTabMixin, StealthTabMixin, SystemTabMixin, UiTabMixin):
     closed = pyqtSignal()
     mode_changed = pyqtSignal(str)
     audio_source_changed = pyqtSignal(str)
@@ -402,11 +406,24 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
         )
         return chosen or model_names[0]
 
+    @staticmethod
+    def _looks_like_local_ollama_model(model_name: str) -> bool:
+        name = (model_name or "").strip().lower()
+        if not name:
+            return False
+        if "cloud" in name:
+            return False
+        if name.startswith("test ollama") or name.startswith("no local models"):
+            return False
+        if name.startswith("ollama test failed"):
+            return False
+        return True
+
     def _build(self):
         self.setStyleSheet(BG_DARK + SS_INPUT)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
+        layout.setContentsMargins(12, 14, 12, 14)
+        layout.setSpacing(12)
 
         # Header
         hdr = QHBoxLayout()
@@ -429,17 +446,20 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
 
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet("""
-            QTabWidget::pane { border: 1px solid rgba(80,85,255,10); background: transparent; border-radius: 8px; }
-            QTabBar::tab { background: rgba(0,0,0,76); color: #778; padding: 10px 20px; font-size: 10px; font-weight: bold; border-top-left-radius: 8px; border-top-right-radius: 8px; margin-right: 2px; }
+            QTabWidget::pane { border: 1px solid rgba(80,85,255,10); background: transparent; border-radius: 8px; top: -1px; }
+            QTabBar::tab { background: rgba(0,0,0,76); color: #778; padding: 9px 16px; font-size: 10px; font-weight: bold; border-top-left-radius: 8px; border-top-right-radius: 8px; margin-right: 2px; }
             QTabBar::tab:selected { background: rgba(80,85,255,20); color: #c0c0ff; border-bottom: 2px solid #6366f1; }
         """)
 
         self.tabs.addTab(self._tab_api(),      "AI ENGINES")
         self.tabs.addTab(self._tab_hotkeys(),   "SHORTCUTS")
         self.tabs.addTab(self._tab_context(),   "CONTEXT")
-        self.tabs.addTab(self._tab_capture(),   "HARDWARE")
+        self.tabs.addTab(self._tab_capture(),   "CAPTURE")
+        self.tabs.addTab(self._tab_knowledge(), "KNOWLEDGE")
+        self.tabs.addTab(self._tab_routing(),   "ROUTING")
         self.tabs.addTab(self._tab_ui(),        "DISPLAY")
         self.tabs.addTab(self._tab_stealth(),   "GHOST")
+        self.tabs.addTab(self._tab_system(),    "SYSTEM")
         layout.addWidget(self.tabs)
 
         self.btn_save = QPushButton("APPLY SETTINGS")
@@ -510,6 +530,12 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
     def _on_provider_test_result(self, provider_id, success, message, details):
         import datetime as _dt
         self.status_labels[provider_id].setText("\u2705" if success else "\u274c")
+        logger.info(
+            "[Settings] Provider test finished pid=%s success=%s message=%s",
+            provider_id,
+            success,
+            message,
+        )
 
         if provider_id in self.provider_detail_labels:
             color = "#4ade80" if success else "#fda4af"
@@ -536,6 +562,7 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
 
         self.ollama_model_combo.blockSignals(True)
         self.ollama_model_combo.clear()
+        self.ollama_model_combo.setMaxVisibleItems(max(8, min(len(models) or 8, 12)))
 
         if not success:
             self.ollama_model_combo.addItem("Ollama test failed")
@@ -561,11 +588,19 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
         self.ollama_model_combo.setCurrentIndex(target_index)
         self.ollama_model_combo.setEnabled(True)
         self.ollama_model_combo.blockSignals(False)
+        logger.info(
+            "[Settings] Ollama models loaded count=%d selected=%s",
+            len(models),
+            self.ollama_model_combo.currentText(),
+        )
 
     def showEvent(self, event):
         """Reset UI state and sync from current config when settings are opened."""
         super().showEvent(event)
         self._sync_ui_from_config()
+        if hasattr(self, "_apply_local_only_lockouts"):
+            self._apply_local_only_lockouts()
+        self._prime_ollama_models()
         self.btn_save.setText("APPLY SETTINGS")
         self.btn_save.setEnabled(True)
         self.btn_save.setStyleSheet("""
@@ -609,8 +644,83 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             if btn is not None:
                 btn.setEnabled(bool(stored_key))
 
+        if hasattr(self, "ollama_model_combo"):
+            saved_model = self.config.get("ai.providers.ollama.model", "").strip()
+            self.ollama_model_combo.blockSignals(True)
+            self.ollama_model_combo.clear()
+            if self._looks_like_local_ollama_model(saved_model):
+                self.ollama_model_combo.addItem(saved_model)
+                self.ollama_model_combo.setEnabled(True)
+            else:
+                self.ollama_model_combo.addItem("Test Ollama to load local models")
+                self.ollama_model_combo.setEnabled(False)
+            self.ollama_model_combo.blockSignals(False)
+
+        if hasattr(self, "stealth_opacity_slider"):
+            stealth_value = self._slider_percent(
+                self.config.get("stealth.low_opacity", 0.75)
+            )
+            self.stealth_opacity_slider.blockSignals(True)
+            self.stealth_opacity_slider.setValue(stealth_value)
+            self.stealth_opacity_slider.blockSignals(False)
+            if hasattr(self, "stealth_opacity_value"):
+                self._set_opacity_label(self.stealth_opacity_value, stealth_value)
+
+        if hasattr(self, "hud_opacity_slider"):
+            hud_value = self._slider_percent(self.config.get("app.opacity", 0.94))
+            self.hud_opacity_slider.blockSignals(True)
+            self.hud_opacity_slider.setValue(hud_value)
+            self.hud_opacity_slider.blockSignals(False)
+            if hasattr(self, "hud_opacity_value"):
+                self._set_opacity_label(self.hud_opacity_value, hud_value)
+
+        if hasattr(self, "chk_gaze"):
+            self.chk_gaze.setChecked(
+                bool(self.config.get("app.gaze_fade.enabled", False))
+            )
+
+        if hasattr(self, "margin_slider"):
+            current_margin = self.config.get("app.gaze_fade.margin", 60)
+            margin_map = {20: 0, 30: 1, 40: 2, 50: 3, 60: 4, 80: 5}
+            self.margin_slider.setCurrentIndex(margin_map.get(current_margin, 4))
+
+        if hasattr(self, "opacity_slider"):
+            current_opacity = int(
+                self.config.get("app.gaze_fade.target_opacity", 0.12) * 100
+            )
+            opacity_map = {5: 0, 10: 1, 15: 2, 20: 3, 25: 4}
+            self.opacity_slider.setCurrentIndex(opacity_map.get(current_opacity, 1))
+
+        if hasattr(self, "chk_start_minimized"):
+            self.chk_start_minimized.setChecked(
+                bool(self.config.get("app.start_minimized", False))
+            )
+
+        if hasattr(self, "chk_focus_on_show"):
+            self.chk_focus_on_show.setChecked(
+                bool(self.config.get("app.focus_on_show", False))
+            )
+
+    def _prime_ollama_models(self):
+        """Try to keep the Ollama model dropdown useful on reopen."""
+        if not hasattr(self, "ollama_model_combo"):
+            return
+        if self._test_workers.get("ollama"):
+            return
+
+        current_text = self.ollama_model_combo.currentText().strip().lower()
+        saved_model = self.config.get("ai.providers.ollama.model", "").strip()
+        if self._looks_like_local_ollama_model(saved_model) and current_text == saved_model.lower():
+            logger.info("[Settings] Preserving saved Ollama model in dropdown: %s", saved_model)
+            return
+
+        if "test ollama" in current_text or "load local models" in current_text:
+            logger.info("[Settings] Priming Ollama model list on settings open")
+            self._test_pid("ollama")
+
     def _save_all(self):
         try:
+            logger.info("[Settings] Save requested")
             self.btn_save.setText("APPLYING...")
             self.btn_save.setEnabled(False)
             self.btn_save.setStyleSheet(
@@ -763,6 +873,7 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
                 selected_model = self.ollama_model_combo.currentText().strip()
                 if selected_model and "load local models" not in selected_model.lower():
                     self.config.set("ai.providers.ollama.model", selected_model)
+                    logger.info("[Settings] Saving Ollama model selection: %s", selected_model)
 
             if hasattr(self, "hud_opacity_slider"):
                 self.config.set(
@@ -802,6 +913,7 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
                 )
 
             self.config.save()
+            logger.info("[Settings] Config save completed")
 
             # Save and apply session context
             if hasattr(self, "_ctx_edit"):
@@ -819,6 +931,11 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             if self.app:
                 self.app.state.mode = selected_mode
                 self.app.state.audio_source = selected_audio
+                logger.info(
+                    "[Settings] Applying runtime settings mode=%s audio=%s",
+                    selected_mode,
+                    selected_audio,
+                )
                 self.app._apply_settings()
                 # Also emit our own signals for any other listeners
                 self.mode_changed.emit(selected_mode)
@@ -829,12 +946,14 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
 
             # Transition back to Standby
             QTimer.singleShot(800, self.closed.emit)
+            logger.info("[Settings] Close scheduled after apply")
 
             # Safety reset in case view doesn't close or is re-opened
             QTimer.singleShot(2000, lambda: self.btn_save.setText("APPLY SETTINGS"))
             QTimer.singleShot(2000, lambda: self.btn_save.setEnabled(True))
         except Exception as e:
-            logger.error(f"Save Fail: {e}")
+            logger.error("Save Fail: %s", e)
+            logger.error(traceback.format_exc())
             self.btn_save.setText("APPLY SETTINGS")
             self.btn_save.setEnabled(True)
 

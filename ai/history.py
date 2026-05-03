@@ -10,6 +10,7 @@ from typing import List, Optional
 from dataclasses import dataclass, field, asdict
 from utils.crypto import SecureStorage
 from utils.logger import setup_logger
+from core.constants import HISTORY_DIR
 
 logger = setup_logger(__name__)
 
@@ -30,7 +31,7 @@ class ResponseHistory:
         self,
         max_entries: int = 500,
         max_sessions: int = 15,
-        history_dir: str = "data/history",
+        history_dir: str = HISTORY_DIR,
     ):
         self.entries: List[HistoryEntry] = []
         self.max = max_entries

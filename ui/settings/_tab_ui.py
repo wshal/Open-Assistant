@@ -1,16 +1,7 @@
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QTabWidget, QCheckBox, QComboBox, QSlider,
-    QScrollArea, QFrame, QGridLayout, QSizePolicy, QMessageBox,
-    QTextEdit, QInputDialog
-)
-from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtGui import QDesktopServices
-from core.constants import PROVIDERS
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QSlider, QScrollArea
+from PyQt6.QtCore import Qt
 from ui.custom_widgets import PremiumCheckBox
-from ui.settings.constants import (
-    BG_DARK, TEXT_PRIMARY, TEXT_MUTED, SS_INPUT, STYLE_BTN_PRIMARY, STYLE_BTN_SECONDARY
-)
+from ui.settings.constants import TEXT_PRIMARY, TEXT_MUTED, SS_INPUT
 
 
 class UiTabMixin:
@@ -163,35 +154,6 @@ class UiTabMixin:
         )
         l.addWidget(desc_gaze)
 
-        self.chk_start_minimized = PremiumCheckBox("Start minimized to system tray")
-        self.chk_start_minimized.setChecked(
-            self.config.get("app.start_minimized", False)
-        )
-        l.addWidget(self.chk_start_minimized)
-        desc_tray = QLabel(
-            "Keep OpenAssist running in the tray on launch instead of opening the HUD immediately."
-        )
-        desc_tray.setWordWrap(True)
-        desc_tray.setStyleSheet(
-            f"{TEXT_MUTED} font-size: 10px; background: transparent;"
-        )
-        l.addWidget(desc_tray)
-
-        self.chk_focus_on_show = PremiumCheckBox("Focus HUD when showing it")
-        self.chk_focus_on_show.setChecked(
-            self.config.get("app.focus_on_show", False)
-        )
-        l.addWidget(self.chk_focus_on_show)
-        desc_focus_on_show = QLabel(
-            "When enabled, showing the HUD brings it to the front and gives it keyboard focus. "
-            "When disabled, the HUD stays floating on top without interrupting the app underneath."
-        )
-        desc_focus_on_show.setWordWrap(True)
-        desc_focus_on_show.setStyleSheet(
-            f"{TEXT_MUTED} font-size: 10px; background: transparent;"
-        )
-        l.addWidget(desc_focus_on_show)
-
         # Detection Margin
         margin_layout = QHBoxLayout()
         lbl_margin = QLabel("Detection margin:")
@@ -238,44 +200,6 @@ class UiTabMixin:
         opacity_layout.addWidget(self.opacity_slider)
         opacity_layout.addStretch()
         l.addLayout(opacity_layout)
-
-        # Reset section (Factory Reset below performs a full first-run reset)
-        sep = QFrame()
-        sep.setStyleSheet(
-            "background: rgba(255,255,255,12); height: 1px; margin: 20px 0;"
-        )
-        l.addWidget(sep)
-
-        btn_factory_reset = QPushButton("FACTORY RESET")
-        btn_factory_reset.setStyleSheet(
-            """
-            QPushButton {
-                background: rgba(220,38,38,35);
-                color: #fecaca;
-                border-radius: 12px;
-                font-weight: 800;
-                font-size: 11px;
-                padding: 12px 24px;
-                border: 1px solid rgba(248,113,113,89);
-            }
-            QPushButton:hover {
-                background: rgba(220,38,38,56);
-                color: white;
-            }
-            """
-        )
-        btn_factory_reset.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_factory_reset.clicked.connect(self._factory_reset)
-        l.addWidget(btn_factory_reset)
-
-        desc_factory_reset = QLabel(
-            "Wipes settings, encrypted API keys, history, caches, logs, and sends the app back to first-run onboarding."
-        )
-        desc_factory_reset.setWordWrap(True)
-        desc_factory_reset.setStyleSheet(
-            "color: #fca5a5; font-size: 10px; background: transparent;"
-        )
-        l.addWidget(desc_factory_reset)
 
         l.addStretch()
         c.setLayout(l)

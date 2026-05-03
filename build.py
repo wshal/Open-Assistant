@@ -36,12 +36,12 @@ def build():
             "--hidden-import", "rapidocr_onnxruntime",
             "--hidden-import", "sounddevice",
             "--hidden-import", "pynput",
+            "--hidden-import", "scipy",
             "--collect-all", "rapidocr_onnxruntime",
             "--collect-all", "faster_whisper",
             "--collect-all", "chromadb",
             "--exclude-module", "tkinter",
             "--exclude-module", "matplotlib",
-            "--exclude-module", "scipy",
             "--noconfirm",
             "--clean",
             "main.py"
