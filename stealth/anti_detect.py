@@ -85,6 +85,25 @@ class StealthManager:
     def _set_affinity(self, hwnd: int, affinity: int) -> bool:
         return bool(ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, affinity))
 
+    def apply_app_stealth(self):
+        """Apply app-level stealth policies (e.g., hiding from Dock/Taskbar)."""
+        if sys.platform == "darwin":
+            # Native AppKit behavior (Dynamic loading to prevent IDE errors on Windows)
+            try:
+                import importlib
+
+                objc = importlib.import_module("objc")
+                appkit = importlib.import_module("AppKit")
+                NSApp = appkit.NSApplication.sharedApplication()
+                # NSApplicationActivationPolicyAccessory = 1
+                if NSApp.activationPolicy() != 1:
+                    NSApp.setActivationPolicy_(1)
+                    logger.info(
+                        "Stealth: macOS app hidden from Dock (Accessory policy applied)."
+                    )
+            except Exception as e:
+                logger.debug(f"Stealth: Failed to apply macOS app-level stealth: {e}")
+
     def _win32_anti_capture(self, window, enabled):
         """Windows: prefer WDA_EXCLUDEFROMCAPTURE, fallback to WDA_MONITOR."""
         try:
@@ -176,14 +195,11 @@ class StealthManager:
         try:
             window.setWindowFlag(Qt.WindowType.WindowTransparentForInput, enabled)
 
-            # Native AppKit behavior
+            # Native AppKit behavior (Dynamic loading to prevent IDE errors on Windows)
             try:
-                import objc
-                from AppKit import (
-                    NSWindowCollectionBehaviorCanJoinAllSpaces,
-                    NSWindowCollectionBehaviorMoveToActiveSpace,
-                    NSWindowCollectionBehaviorTransient,
-                )
+                import importlib
+                objc = importlib.import_module('objc')
+                appkit = importlib.import_module('AppKit')
 
                 hwnd = int(window.winId())
                 if hwnd != 0:
@@ -191,12 +207,13 @@ class StealthManager:
                     ns_view = objc.objc_object(c_void_p=hwnd)
                     ns_window = ns_view.window()
                     if ns_window is not None:
-                        behavior = (
-                            NSWindowCollectionBehaviorCanJoinAllSpaces
-                            | NSWindowCollectionBehaviorMoveToActiveSpace
-                        )
+                        can_join = appkit.NSWindowCollectionBehaviorCanJoinAllSpaces
+                        move_to_active = appkit.NSWindowCollectionBehaviorMoveToActiveSpace
+                        transient = appkit.NSWindowCollectionBehaviorTransient
+
+                        behavior = can_join | move_to_active
                         if enabled:
-                            behavior |= NSWindowCollectionBehaviorTransient
+                            behavior |= transient
 
                         ns_window.setCollectionBehavior_(behavior)
                         logger.info("Stealth: macOS AppKit NSWindow behaviors applied.")

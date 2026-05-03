@@ -65,6 +65,7 @@ class OpenAssistApp(QObject):
         self.audio = AudioCapture(config, state=self.state)
         self.nexus = ContextNexus(config)
         self.stealth = StealthManager(config)
+        self.stealth.apply_app_stealth()
         self.simulator = InputSimulator(config)
 
         # P2.4: Long-term semantic memory (ChromaDB, local, offline)

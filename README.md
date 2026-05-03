@@ -60,6 +60,15 @@ All actions are hotkey-driven so the HUD stays invisible:
 | Ghost Stealth | `Ctrl+Shift+Z` |
 | Show / Hide HUD | `Ctrl+\` |
 
+## 🍏 macOS Setup
+
+OpenAssist now supports native macOS features with full parity to the Windows version.
+
+1. **Permissions**: Grant **Screen Recording** and **Accessibility** permissions when prompted. These are required for the vision loop and global hotkeys.
+2. **Advanced Stealth**: To enable Mission Control evasion (HUD disappears from Mission Control) and Dock hiding:
+   ```bash
+   pip install pyobjc-framework-Cocoa
+   ```
 ---
 
 ## 🛠️ Tech Stack

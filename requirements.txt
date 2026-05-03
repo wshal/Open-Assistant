@@ -83,6 +83,9 @@ psutil>=6.0.0
 # -- Caching --------------------------------------------------------------
 cachetools>=5.5.0
 
+# -- macOS Native ---------------------------------------------------------
+pyobjc-framework-Cocoa; sys_platform == 'darwin'
+
 # -- Token Counting (optional but improves accuracy) -------------------
 tiktoken>=0.7.0
 
