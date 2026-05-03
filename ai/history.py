@@ -91,19 +91,6 @@ class ResponseHistory:
         except Exception as exc:
             logger.debug("[GAP4] Could not preload prior session: %s", exc)
 
-    def start_new_session(self):
-        """Starts a fresh session and archives the current one."""
-        self.save()  # Ensure current is saved
-
-        self.current_session_id = self._new_session_id()
-        self.current_storage = SecureStorage(
-            str(self.history_dir / f"{self.current_session_id}.enc")
-        )
-        self.entries = []
-        self.current_index = -1
-        self.screen_analyses = []
-        logger.info(f"🆕 Started new session: {self.current_session_id}")
-
     def _ensure_current_session_meta(self):
         for session in self.sessions:
             if session["id"] == self.current_session_id:

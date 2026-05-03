@@ -20,7 +20,7 @@ class StealthManager:
 
     def __init__(self, config):
         self.config = config
-        self.enabled = config.get("stealth.enabled", False)
+        self.enabled = config.get("stealth.enabled", True)
         self._last_affinity_state = {}
         self._status = {
             "state": "limited",
@@ -101,8 +101,8 @@ class StealthManager:
                 if self._set_affinity(root_hwnd, WDA_NONE):
                     self._log_affinity_state(root_hwnd, False, WDA_NONE)
                     self._set_status(
-                        "protected",
-                        "Stealth guard refreshed",
+                        "unprotected",
+                        "Stealth guard removed",
                         last_affinity=WDA_NONE,
                     )
                 else:

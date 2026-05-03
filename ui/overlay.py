@@ -454,8 +454,14 @@ class OverlayWindow(QMainWindow):
             if self._current_query
             else ""
         )
+        
+        # P3.2: Include navigation header if viewing history (set by update_history_state)
+        nav_header = getattr(self, "_history_navigation_header", "")
+        
         rendered = self.md.render(content)
-        self.response_area.setHtml(q_html + rendered)
+        # Combine query header + navigation header + rendered content
+        full_html = q_html + nav_header + rendered
+        self.response_area.setHtml(full_html)
 
         if not self._user_is_scrolling:
             self.response_area.moveCursor(QTextCursor.MoveOperation.End)
@@ -895,12 +901,41 @@ class OverlayWindow(QMainWindow):
         self.update_status(capture_screen=capturing)
 
     def update_history_state(self, i, t, e=None):
+        """P3.2: Update full-screen overlay to show navigated history entry.
+        
+        Args:
+            i: current index (int)
+            t: total entries (int)
+            e: entry dict with 'query', 'response', 'provider', etc. (dict or None)
+        """
         if not e:
             return
+        
         self._current_query = e.get("query", "")
         self._raw_buffer = e.get("response", "")
         self._is_streaming = False
+        
+        # P3.2: Show chat view to display the navigated response
+        self.show_chat_view()
+        
+        # P3.2: Add mode-aware response display with index indicator
         self._render_markdown_now()
+        
+        # P3.2: Update response header to show navigation indicator
+        query = e.get("query", "")
+        provider = e.get("provider", "")
+        indicator = f"Response {i + 1} of {t}"  # Display 1-based index
+        
+        header_html = (
+            f"<div style='color: #64748b; font-size: 10px; margin-bottom: 5px;'>"
+            f"<b>QUERY:</b> {query}</div>"
+            f"<div style='color: #8888bb; font-size: 9px; margin-bottom: 10px; font-style: italic;'>"
+            f"← {indicator} →"
+            f"{f' ({provider.upper()})' if provider else ''}</div>"
+        )
+        
+        # Store header for rendering after markdown (will be prepended in the response area)
+        self._history_navigation_header = header_html
 
     def show_standby_view(self):
         self.stack.setCurrentWidget(self.standby_view)
@@ -984,6 +1019,12 @@ class OverlayWindow(QMainWindow):
         if q:
             self.input.clear()
             self._user_is_scrolling = False
+            
+            # P1.1: If no session is active, start one (first question trigger)
+            if not self.app.session_active:
+                self.app.start_new_session()
+                logger.info("🎬 Full-HUD: Auto-starting session on first question")
+            
             # ── Immediately reflect the query in the response area ──────────────
             # The user typed this — show it instantly without waiting for the
             # first streaming chunk or on_complete to set _current_query.

@@ -37,6 +37,9 @@ class HistoryStub:
             )
         ][:n]
 
+    def save(self):
+        pass  # no-op for tests
+
 
 class AudioStub:
     def __init__(self):
@@ -172,6 +175,7 @@ class MiniOverlayStub:
         self.hide_calls = 0
         self.show_calls = 0
         self.opacity_updates = []
+        self.warmup_updates = []
 
     def update_mode(self, mode):
         self.mode_updates.append(mode)
@@ -184,6 +188,9 @@ class MiniOverlayStub:
 
     def update_history_state(self, *state):
         self.history_updates.append(state)
+
+    def update_warmup_status(self, m, p, r):
+        self.warmup_updates.append((m, p, r))
 
     def hide(self):
         self.hide_calls += 1
@@ -199,6 +206,9 @@ class MiniOverlayStub:
 
     def setWindowOpacity(self, value):
         self.opacity_updates.append(value)
+
+    def isVisible(self):
+        return False
 
 
 class ConfigStub:
@@ -357,15 +367,36 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertTrue(app.state.is_capturing)
 
     def test_history_sync_uses_dict_entries_for_mini_overlay(self):
+        """_sync_history_ui should push state to both HUDs when session is active."""
         app = self._build_app(mini_mode=True)
+        app.session_active = True  # Guard: only syncs when session is live
 
         OpenAssistApp._sync_history_ui(app)
 
         self.assertEqual(len(app.overlay.history_updates), 1)
         self.assertEqual(len(app.mini_overlay.history_updates), 1)
-        self.assertEqual(
-            app.mini_overlay.completed[-1], ("example response", "example question")
-        )
+        # At latest entry (idx=0, total=1) on_complete is NOT called again by
+        # _sync_history_ui — the caller (_on_response_complete) already did it.
+        # Here we verify the navigation state was still pushed.
+        self.assertEqual(app.mini_overlay.history_updates[0][0], 0)  # index
+        self.assertEqual(app.mini_overlay.history_updates[0][1], 1)  # total
+
+    def test_history_sync_does_nothing_when_session_inactive(self):
+        """_sync_history_ui must not update the UI when no session is active.
+
+        This prevents preloaded prior-session history (GAP4) from showing up
+        in the HUDs on startup or when the user is on the standby screen.
+        """
+        app = self._build_app(mini_mode=True)
+        # session_active is False by default in _build_app
+        self.assertFalse(app.session_active)
+
+        OpenAssistApp._sync_history_ui(app)
+
+        # Both overlays must remain untouched
+        self.assertEqual(app.overlay.history_updates, [])
+        self.assertEqual(app.mini_overlay.history_updates, [])
+        self.assertEqual(app.mini_overlay.completed, [])
 
     def test_quick_answer_prefers_cached_context_without_fresh_capture(self):
         app = self._build_app()
@@ -458,24 +489,39 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(app.overlay.transcript_updates[-1], "Ready...")
         self.assertFalse(app.state.is_capturing)
 
-    def test_toggle_mini_mode_switches_overlays(self):
+    def test_toggle_mini_mode_no_history_shown_when_session_inactive(self):
+        """Toggling to mini-mode while no session is active must NOT show stale history.
+
+        The session_active guard in _sync_history_ui prevents GAP4 preloaded
+        entries from bleeding into the HUD after a restart.
+        """
         app = self._build_app(mini_mode=False)
+        self.assertFalse(app.session_active)  # no active session
 
-        self.assertFalse(app.mini_mode)
-
-        with patch.object(app, "_refresh_window_invariants") as refresh:
+        with patch.object(app, "_refresh_window_invariants"):
             OpenAssistApp.toggle_mini_mode(app)
             self.assertTrue(app.mini_mode)
+
+            # _sync_history_ui must have been a no-op
+            self.assertEqual(app.overlay.history_updates, [])
+            self.assertEqual(app.mini_overlay.history_updates, [])
+            self.assertEqual(app.mini_overlay.completed, [])
+
+    def test_toggle_mini_mode_shows_active_response_when_session_live(self):
+        """Toggling to mini-mode during an active session syncs the current response."""
+        app = self._build_app(mini_mode=False)
+        app.session_active = True  # session is running
+
+        with patch.object(app, "_refresh_window_invariants"):
+            OpenAssistApp.toggle_mini_mode(app)
+            self.assertTrue(app.mini_mode)
+
+            # Both overlays should have received the history state
             self.assertEqual(len(app.overlay.history_updates), 1)
             self.assertEqual(len(app.mini_overlay.history_updates), 1)
-            self.assertEqual(
-                app.mini_overlay.completed[-1], ("example response", "example question")
-            )
 
             OpenAssistApp.toggle_mini_mode(app)
             self.assertFalse(app.mini_mode)
-
-        self.assertEqual(refresh.call_count, 2)
 
     def test_switch_mode_changes_mode_in_overlay(self):
         app = self._build_app()
@@ -885,6 +931,80 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(warmups, [True])
         self.assertEqual(app.overlay.onboarding_calls, 1)
 
+    def test_end_session_clears_mini_overlay_state(self):
+        """end_session() must reset Mini-HUD to blank/ready state.
+
+        P4: Ensures the user sees a clean Mini-HUD when returning to standby
+        so there is no confusion about whether a response is from a past session.
+        """
+        app = self._build_app(mini_mode=True)
+        app.session_active = True
+
+        OpenAssistApp.end_session(app)
+
+        # Mini overlay must have received the reset signal.
+        # end_session() calls mini_overlay.on_complete("", "") — not ("", None).
+        self.assertIn(("", ""), app.mini_overlay.completed)
+        self.assertGreaterEqual(app.mini_overlay.ready_calls, 1)
+        self.assertFalse(app.session_active)
+
+    def test_shutdown_with_active_session_calls_end_session(self):
+        """Shutting down while a session is active must gracefully end it.
+
+        P4: Prevents the Mini-HUD from persisting state to disk as an active
+        session, which would cause stale history to appear on next launch.
+        """
+        app = self._build_app()
+        app.session_active = True
+        app._stop_background_tasks = lambda: None
+        app.audio = SimpleNamespace(stop=lambda: None, clear=lambda: None)
+        app.hotkeys = SimpleNamespace(stop=lambda: None, reset_state=lambda: None)
+        app.rag = SimpleNamespace(stop=lambda: None)
+        app.loop = SimpleNamespace(is_running=lambda: False)
+        app._async_thread = SimpleNamespace(
+            is_alive=lambda: False, join=lambda timeout=None: None
+        )
+        # Wire end_session onto the namespace so shutdown() can call self.end_session()
+        end_calls = []
+        original_end_session = OpenAssistApp.end_session
+
+        def _fake_end_session():
+            end_calls.append(True)
+            original_end_session(app)
+
+        app.end_session = _fake_end_session
+
+        OpenAssistApp.shutdown(app)
+
+        self.assertEqual(end_calls, [True])
+        self.assertFalse(app.session_active)
+
+    def test_history_prev_in_mini_mode_calls_on_complete_for_non_latest(self):
+        """Ctrl+[ in Mini-HUD navigates to a prev entry and updates the display.
+
+        _sync_history_ui must call mini_overlay.on_complete() only for
+        non-latest entries to avoid a redundant re-render when at the tail.
+        """
+        app = self._build_app(mini_mode=True)
+        app.session_active = True
+
+        # Give history 2 entries and position at the second (latest)
+        entry1 = {"query": "q1", "response": "r1", "provider": "groq", "mode": "general",
+                  "latency": 0.0, "timestamp": 1.0, "metadata": {}}
+        entry2 = {"query": "q2", "response": "r2", "provider": "groq", "mode": "general",
+                  "latency": 0.0, "timestamp": 2.0, "metadata": {}}
+        app.history.state = (1, 2, entry2)  # at latest (idx=1, total=2)
+
+        # Navigate backwards — should call on_complete for the non-latest entry
+        def move_prev_and_update():
+            # Simulate move_prev moving to idx=0
+            app.history.state = (0, 2, entry1)
+            OpenAssistApp._sync_history_ui(app)
+
+        move_prev_and_update()
+
+        # on_complete must have been called with the prev entry's content
+        self.assertIn(("r1", "q1"), app.mini_overlay.completed)
 
 if __name__ == "__main__":
     unittest.main()

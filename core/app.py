@@ -175,6 +175,7 @@ class OpenAssistApp(QObject):
             self.audio.interim_transcription_ready.connect(self._on_interim_transcription)
         self.screen.text_captured.connect(self._on_screen_text)
         self.warmup_status_update.connect(self.overlay.update_warmup_status)
+        self.warmup_status_update.connect(self.mini_overlay.update_warmup_status)
         self.ai.provider_status.connect(self.overlay.standby_view.set_provider_statuses)
         self.overlay.standby_view.start_clicked.connect(self.start_new_session)
         self.overlay.standby_view.mode_selected.connect(self.switch_mode)
@@ -323,6 +324,9 @@ class OpenAssistApp(QObject):
                 )
             else:
                 self.overlay.update_transcript("Ready...", state="idle")
+        
+        # P1.2: Sync history UI after response completes to update navigation state
+        self._sync_history_ui()
 
     def _on_ai_error(self, error_text: str):
         if hasattr(self.ai, "_current_gen_kwargs"):
@@ -543,6 +547,10 @@ class OpenAssistApp(QObject):
             return
 
         logger.info("Screen sharing ended - restoring normal stealth posture")
+        # Revert stealth to the baseline configuration (defaults to True as an invariant)
+        self.state.is_stealth = self.config.get("stealth.enabled", True)
+        self._refresh_window_invariants()
+
         if self._screen_share_hidden_window:
             view = (
                 self.mini_overlay
@@ -1248,12 +1256,30 @@ class OpenAssistApp(QObject):
         self._sync_history_ui()
 
     def _sync_history_ui(self):
+        """Sync history navigation state to both HUDs.
+
+        Guards:
+        - Only pushes state when session is active so preloaded prior-session
+          entries (GAP4) don't bleed into the UI on restart or when on standby.
+        - Only calls mini_overlay.on_complete() when the user has navigated to a
+          non-latest entry; for the latest entry _on_response_complete already
+          called on_complete directly, so calling it again would be redundant.
+        """
+        if not getattr(self, "session_active", False):
+            return
+
         st = self.history.get_state()
+        idx, total, entry = st
         self.overlay.update_history_state(*st)
         self.mini_overlay.update_history_state(*st)
-        # Auto-expand mini HUD when navigating history
-        if self.mini_mode and st[2]:
-            self.mini_overlay.on_complete(st[2]["response"], st[2]["query"])
+
+        # Auto-expand mini HUD when navigating to a previous history entry.
+        # For the *latest* entry (idx == total - 1) _on_response_complete already
+        # called mini_overlay.on_complete() — skip to avoid a double render.
+        if self.mini_mode and entry:
+            at_latest = (total > 0 and idx == total - 1)
+            if not at_latest:
+                self.mini_overlay.on_complete(entry["response"], entry["query"])
 
     def emergency_erase(self):
         """Action: Nukes all data and kills all hardware loops immediately."""
@@ -1501,8 +1527,8 @@ class OpenAssistApp(QObject):
         self.mini_mode = not self.mini_mode
         self.state.is_mini = self.mini_mode
         self._refresh_window_invariants()
-        if self.mini_mode:
-            self._sync_history_ui()
+        # P3.1: Sync history UI when switching modes to preserve navigation state
+        self._sync_history_ui()
 
     def ensure_stealth(self):
         self.state.is_stealth = True
@@ -1833,6 +1859,12 @@ class OpenAssistApp(QObject):
     def shutdown(self):
         """Proper shutdown: stops health monitor, event loop, and joins thread."""
         logger.info("🛑 Shutting down OpenAssist...")
+        
+        # P4: If a session is active (especially in mini_mode), end it gracefully
+        if getattr(self, "session_active", False):
+            logger.info("🛑 Session active during shutdown, ending it now...")
+            self.end_session()
+        
         self.is_running = False  # Signal all loops to break immediately
 
         self._stop_background_tasks()
@@ -1853,3 +1885,5 @@ class OpenAssistApp(QObject):
         # Save history
         self.history.save()
         logger.info("✅ OpenAssist shutdown complete")
+
+

@@ -42,6 +42,7 @@ class MiniOverlay(QMainWindow):
         self._drag = False
         self._expanded = False
         self._nano_mode = False  # P2.6: ultra-compact nano state
+        self._warmup_done = False  # Guard: input locked until AI engines are ready
 
         # NEURAL UX: Gaze-based transparency
         self._gaze_timer = QTimer(self)
@@ -62,7 +63,11 @@ class MiniOverlay(QMainWindow):
 
     def _on_hud_mode_changed(self, is_mini):
         if is_mini:
-            self._sync_existing_response()
+            # P4: Only sync existing response if session is currently active.
+            # Without this guard, history preloaded from prior sessions (GAP4)
+            # would be shown in the Mini-HUD even after a restart.
+            if getattr(self.app, 'session_active', False):
+                self._sync_existing_response()
             self.show()
             self.raise_()
         else:
@@ -73,8 +78,10 @@ class MiniOverlay(QMainWindow):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
+            | Qt.WindowType.NoDropShadowWindowHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setWindowOpacity(self.config.get("app.opacity", 0.94))
         self.setFixedWidth(280)
@@ -82,7 +89,12 @@ class MiniOverlay(QMainWindow):
 
         c = QWidget()
         c.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        c.setStyleSheet("background: transparent; border: none;")
+        
+        # Apply transparency to the main window itself to hide the rectangular background/border
+        self.setObjectName("MiniHUD")
+        self.setStyleSheet("#MiniHUD { background: transparent; border: none; }")
+        c.setObjectName("MiniHUDCentral")
+        c.setStyleSheet("#MiniHUDCentral { background: transparent; border: none; }")
         self.setCentralWidget(c)
         self.ml = QVBoxLayout(c)
         self.ml.setContentsMargins(0, 0, 0, 0)
@@ -104,11 +116,17 @@ class MiniOverlay(QMainWindow):
         bl.addWidget(self.mode_icon)
 
         self.input = QLineEdit()
-        self.input.setPlaceholderText("Ask anything...")
+        # Start disabled until warmup completes — same safety gate as full-HUD START SESSION.
+        self.input.setEnabled(False)
+        self.input.setPlaceholderText("⏳ Initializing...")
         self.input.returnPressed.connect(self._send)
-        self.input.setStyleSheet(
+        self._input_style_ready = (
             "background: transparent; color: #c0c0dd; border: none; font-size: 12px; padding: 2px;"
         )
+        self._input_style_loading = (
+            "background: transparent; color: #475569; border: none; font-size: 12px; padding: 2px;"
+        )
+        self.input.setStyleSheet(self._input_style_loading)
         bl.addWidget(self.input, 1)
 
         self.dot = QLabel("●")
@@ -152,6 +170,11 @@ class MiniOverlay(QMainWindow):
         self.ml.addWidget(self.response_area)
 
     def _sync_existing_response(self):
+        """Sync the current history entry into the Mini-HUD.
+
+        Only called when a session is active (guarded by _on_hud_mode_changed)
+        so preloaded prior-session entries don't bleed into the UI on startup.
+        """
         if self._raw_buffer.strip():
             self._toggle_expand(True)
             self._render_markdown_now()
@@ -166,21 +189,37 @@ class MiniOverlay(QMainWindow):
 
     def _send(self):
         q = self.input.text().strip()
-        if q:
-            self.input.clear()
-            # Immediately show query + thinking state before any AI response
-            self._raw_buffer = ""
-            self.response_area.clear()
-            race_hint = ""
-            if bool(self.config.get("ai.text.race_enabled", False)):
-                race_hint = " (race mode — no streaming)"
-            self.response_area.setHtml(
-                f"<div style='color:#64748b;font-size:10px;'><b>Q:</b> {q}</div>"
-                f"<div style='color:#f59e0b;font-size:11px;font-style:italic;'>⏳ Thinking{race_hint}...</div>"
-            )
-            self._toggle_expand(True)
-            self.set_thinking()
-            self.user_query.emit(q)
+        if not q:
+            return
+
+        # Hard guard: never fire a query before AI engines have finished loading.
+        # This mirrors the full-HUD's disabled START SESSION button.
+        if not self._warmup_done:
+            logger.warning("Mini-HUD: query attempted before warmup — ignoring.")
+            self.input.setPlaceholderText("⏳ Still loading, please wait...")
+            QTimer.singleShot(2000, lambda: self.input.setPlaceholderText("⏳ Initializing..."))
+            return
+
+        self.input.clear()
+
+        # P1.1: If no session is active, start one (first question trigger)
+        if not self.app.session_active:
+            self.app.start_new_session()
+            logger.info("🎬 Mini-HUD: Auto-starting session on first question")
+
+        # Immediately show query + thinking state before any AI response
+        self._raw_buffer = ""
+        self.response_area.clear()
+        race_hint = ""
+        if bool(self.config.get("ai.text.race_enabled", False)):
+            race_hint = " (race mode — no streaming)"
+        self.response_area.setHtml(
+            f"<div style='color:#64748b;font-size:10px;'><b>Q:</b> {q}</div>"
+            f"<div style='color:#f59e0b;font-size:11px;font-style:italic;'>⏳ Thinking{race_hint}...</div>"
+        )
+        self._toggle_expand(True)
+        self.set_thinking()
+        self.user_query.emit(q)
 
     def _render_markdown_now(self):
         text = self._raw_buffer
@@ -229,9 +268,19 @@ class MiniOverlay(QMainWindow):
         )
 
     def on_complete(self, full_text: str, query: str = None):
-        """Streaming finished — stop timer, do final markdown render, update dot."""
+        """Streaming finished — stop timer, do final markdown render, update dot.
+        
+        When called with empty strings, signals session end (clear input + reset).
+        """
         self._render_timer.stop()
         self._raw_buffer = full_text or ""
+        
+        # P4: If both full_text and query are empty, session has ended
+        if not full_text and not query:
+            # Clear input field when session ends
+            self.input.clear()
+            self.input.setPlaceholderText("Ask anything...")
+        
         self._render_markdown_now()
         self.set_ready()
         # P1.1: Show type button once there's a response to inject
@@ -301,11 +350,6 @@ class MiniOverlay(QMainWindow):
         self._raw_buffer = text or ""
         self._render_markdown_now()
 
-    def show_error(self, err: str):
-        self.set_error()
-        self.response_area.setPlainText(f"❌ {err}")
-        self._toggle_expand(True)
-
     def _adjust_height(self):
         """ADAPTIVE: Calculate required height up to 300px max."""
         if not self._expanded:
@@ -335,7 +379,27 @@ class MiniOverlay(QMainWindow):
         self._adjust_height()
 
     def update_warmup_status(self, m, p, r):
-        self.setToolTip(f"{m} ({p}%)")
+        """Mirror of StandbyView.set_warmup_status — locks/unlocks the input field.
+
+        Args:
+            m: status message string
+            p: progress 0-100
+            r: ready flag (True = all engines online, input unlocks)
+        """
+        if r and not self._warmup_done:
+            # Latch: once ready, never re-lock on late/deferred warmup signals
+            self._warmup_done = True
+            self.input.setEnabled(True)
+            self.input.setStyleSheet(self._input_style_ready)
+            self.input.setPlaceholderText("Ask anything...")
+            # Flash the dot green briefly to signal readiness
+            self.dot.setStyleSheet("color: #4ade80; font-size: 10px;")
+            self.setToolTip("Ready")
+            logger.debug("Mini-HUD: warmup complete — input unlocked")
+        elif not self._warmup_done:
+            # Still loading: update tooltip with progress
+            self.setToolTip(f"{m} ({p}%)")
+            self.input.setPlaceholderText(f"⏳ {m[:28]}..." if len(m) > 28 else f"⏳ {m}")
 
     def update_mode(self, mode):
         icons = {
@@ -354,8 +418,43 @@ class MiniOverlay(QMainWindow):
         )
 
     def update_history_state(self, i, t, e=None):
-        if e and self._expanded:
-            self.set_response(e.get("response", ""))
+        """P1.2: Update Mini-HUD to show navigated history entry.
+        
+        Args:
+            i: current index (int)
+            t: total entries (int)
+            e: entry dict with 'query', 'response', 'provider', etc. (dict or None)
+        """
+        if not e:
+            # No entry available at this index
+            return
+        
+        response = e.get("response", "")
+        query = e.get("query", "")
+        
+        if not response and not query:
+            return
+        
+        # P1.2: Show the query + response with index indicator
+        self.set_response(response)
+        
+        # Auto-expand to show the navigated response
+        if not self._expanded:
+            self._toggle_expand(True)
+        
+        # P1.2: Update the response area to include query + index indicator
+        indicator = f"Response {i + 1} of {t}"  # Display 1-based index
+        html_response = self.md.render(response or "No response")
+        
+        # Prepend query and indicator to the response
+        full_html = (
+            f"<div style='color:#64748b;font-size:9px;margin-bottom:8px;'>"
+            f"<b>Q:</b> {query}</div>"
+            f"<div style='color:#8888bb;font-size:9px;margin-bottom:10px;font-style:italic;'>"
+            f"← {indicator} →</div>"
+            f"{html_response}"
+        )
+        self.response_area.setHtml(full_html)
 
     def set_thinking(self):
         self.dot.setStyleSheet("color: #f59e0b; font-size: 10px;")
