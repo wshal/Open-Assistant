@@ -11,7 +11,7 @@ import threading
 import time
 import shutil
 from pathlib import Path
-from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
+from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal, QProcess
 
 from core.config import Config
@@ -28,7 +28,6 @@ from modes import ModeManager
 from utils.platform_utils import ProcessUtils, WindowUtils
 from ui.overlay import OverlayWindow
 from ui.mini_overlay import MiniOverlay
-from core.tray import SystemTray
 from stealth.anti_detect import StealthManager
 from stealth.input_simulator import InputSimulator
 from utils.logger import setup_logger
@@ -89,6 +88,8 @@ class OpenAssistApp(QObject):
         self._generation_epoch = 0
         self._screen_analysis_pending = False
         self._pending_request_metadata = None
+        self._screen_share_active = False
+        self._screen_share_hidden_window = None
         # Tracks whether the current session_context was auto-suggested by a mode
         # switch (True) or typed/loaded manually (False). Auto-suggested context
         # can be silently replaced when the mode changes; manual context cannot.
@@ -103,7 +104,7 @@ class OpenAssistApp(QObject):
         self.overlay = OverlayWindow(config, self)
         self.mini_overlay = MiniOverlay(config, self)
         self.hotkeys = HotkeyManager(config, self)
-        self.tray = self._create_system_tray()
+        self.tray = None
 
         self._wire_signals()
         self.qt_app.aboutToQuit.connect(self.shutdown)
@@ -135,6 +136,10 @@ class OpenAssistApp(QObject):
         self._topmost_timer = QTimer(self)
         self._topmost_timer.timeout.connect(self._refresh_topmost_window)
         # Do NOT start here — started in start_session(), stopped in end_session()
+
+        self._screen_share_timer = QTimer(self)
+        self._screen_share_timer.timeout.connect(self._check_screen_share_protection)
+        self._screen_share_timer.start(5000)
 
     def _run_master_loop(self):
         asyncio.set_event_loop(self.loop)
@@ -416,6 +421,7 @@ class OpenAssistApp(QObject):
         self.mini_overlay.set_click_through(self._click_through)
         if was_visible and hasattr(view, "show"):
             view.show()
+        self._refresh_window_invariants()
         if hasattr(self.overlay, "update_transcript"):
             self.overlay.update_transcript(
                 "Click-through enabled. Press Ctrl+M to restore interaction."
@@ -471,6 +477,13 @@ class OpenAssistApp(QObject):
         t.start()
 
     def _apply_ui_only(self):
+        self._refresh_window_invariants()
+
+    def _refresh_window_invariants(self, window=None):
+        """Reinforce shell/topmost/stealth invariants after lifecycle changes."""
+        if window is not None:
+            self._apply_window_effects(window)
+            return
         self._apply_window_effects(self.overlay)
         self._apply_window_effects(self.mini_overlay)
 
@@ -496,19 +509,48 @@ class OpenAssistApp(QObject):
         for window in (self.overlay, self.mini_overlay):
             try:
                 if hasattr(window, "isVisible") and window.isVisible():
-                    WindowUtils.ensure_topmost(window)
+                    self._refresh_window_invariants(window)
             except Exception as e:
                 logger.debug(f"Topmost refresh skipped: {e}")
 
-    def _create_system_tray(self):
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            logger.info("System tray unavailable; tray controls disabled.")
-            return None
+    def _check_screen_share_protection(self):
+        """Continuously enforce the app's screen-share stealth policy."""
         try:
-            return SystemTray(self)
+            sharing = bool(ProcessUtils.is_screen_sharing_active())
         except Exception as e:
-            logger.warning(f"System tray initialization failed: {e}")
-            return None
+            logger.debug("Screen share detection skipped: %s", e)
+            return
+
+        if sharing:
+            self.ensure_stealth()
+
+        if sharing != self._screen_share_active:
+            self._set_screen_share_state(sharing)
+
+    def _set_screen_share_state(self, sharing: bool):
+        self._screen_share_active = sharing
+
+        if sharing:
+            logger.info("Screen sharing detected - reinforcing stealth protections")
+            if getattr(self.stealth, "should_hide_for_screen_share", lambda: False)():
+                view = self._active_view()
+                if view and hasattr(view, "isVisible") and view.isVisible():
+                    self._screen_share_hidden_window = "mini" if self.mini_mode else "overlay"
+                    view.hide()
+                    logger.info(
+                        "Screen sharing active on limited stealth platform - HUD hidden"
+                    )
+            return
+
+        logger.info("Screen sharing ended - restoring normal stealth posture")
+        if self._screen_share_hidden_window:
+            view = (
+                self.mini_overlay
+                if self._screen_share_hidden_window == "mini"
+                else self.overlay
+            )
+            self._screen_share_hidden_window = None
+            self._present_window(view, focus=False)
 
     def _active_view(self):
         return self.mini_overlay if self.mini_mode else self.overlay
@@ -521,7 +563,7 @@ class OpenAssistApp(QObject):
             return None
 
         window.show()
-        WindowUtils.ensure_topmost(window)
+        self._refresh_window_invariants(window)
         if hasattr(window, "raise_"):
             window.raise_()
         if focus and hasattr(window, "activateWindow"):
@@ -549,12 +591,6 @@ class OpenAssistApp(QObject):
         if not self.config.get("onboarding.completed", False):
             self._present_window(self.overlay, focus=True)
             self.overlay.show_onboarding()
-            return
-
-        if self.config.get("app.start_minimized", False):
-            self.overlay.hide()
-            self.mini_overlay.hide()
-            logger.info("Launching in background (system tray).")
             return
 
         self._show_active_overlay()
@@ -1464,17 +1500,17 @@ class OpenAssistApp(QObject):
     def toggle_mini_mode(self):
         self.mini_mode = not self.mini_mode
         self.state.is_mini = self.mini_mode
+        self._refresh_window_invariants()
         if self.mini_mode:
             self._sync_history_ui()
 
-    def toggle_stealth_mode(self):
+    def ensure_stealth(self):
         self.state.is_stealth = True
-        if hasattr(self.config, "save"):
-            try:
-                self.config.save()
-            except Exception as e:
-                logger.debug(f"Stealth config save skipped: {e}")
         self._apply_ui_only()
+
+    def toggle_stealth_mode(self):
+        """Compatibility alias for older callers; stealth is always enforced."""
+        self.ensure_stealth()
 
     def type_last_response(self):
         """Action: Type the latest AI response into the Snap-Locked window."""

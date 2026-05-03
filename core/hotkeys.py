@@ -40,7 +40,11 @@ class NativeHotkeyThread(threading.Thread):
 
         current_id = 100
         for action, key_str in self.manager.config.get("hotkeys", {}).items():
-            if action.startswith("move_") or action.startswith("scroll_"):
+            if (
+                action.startswith("move_")
+                or action.startswith("scroll_")
+                or action == "stealth"
+            ):
                 continue
             mods, vk = self.manager._parse_key_native(key_str)
             if action == "toggle":
@@ -109,7 +113,7 @@ class HotkeyManager:
         self.cleanup_timer.timeout.connect(self._cleanup_stuck_keys)
         self.cleanup_timer.start(5000)
 
-        # GHOST GUARD: Reset state if application loses focus (Alt-Tab prevention)
+        # Reset transient hotkey state if the application loses focus.
         QApplication.instance().focusChanged.connect(self._on_focus_changed)
 
     def _on_focus_changed(self, old, new):
@@ -155,7 +159,6 @@ class HotkeyManager:
             "emergency_erase": self.app.emergency_erase,
             "mini_mode": self.app.toggle_mini_mode,
             "switch_mode": self.app.switch_mode,
-            "stealth": self.app.toggle_stealth_mode,
             "toggle_click_through": self.app.toggle_click_through,
         }
         if action in bridges:

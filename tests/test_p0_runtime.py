@@ -5,6 +5,7 @@ import unittest
 import os
 from pathlib import Path
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 import numpy as np
 import json
 from itertools import count
@@ -18,9 +19,10 @@ from capture.screen import ScreenCapture
 from core.config import Config
 from core.hotkeys import HotkeyManager, NativeHotkeyThread
 from core.state import AppState
-from utils.platform_utils import WindowUtils
+from utils.platform_utils import WindowUtils, ProcessUtils
 from ai.providers.ollama_provider import OllamaProvider
 from ai.prompts import PromptBuilder
+from stealth.anti_detect import StealthManager
 from ui.settings_view import ProviderTestWorker, SettingsView
 from PyQt6.QtWidgets import QApplication
 
@@ -929,7 +931,6 @@ class SettingsViewSyncTests(unittest.TestCase):
                 "app.gaze_fade.enabled": True,
                 "app.gaze_fade.margin": 40,
                 "app.gaze_fade.target_opacity": 0.20,
-                "app.start_minimized": False,
                 "app.focus_on_show": False,
                 "capture.audio.mode": "system",
                 "ai.mode": "general",
@@ -944,7 +945,6 @@ class SettingsViewSyncTests(unittest.TestCase):
         config.set("app.gaze_fade.enabled", False)
         config.set("app.gaze_fade.margin", 80)
         config.set("app.gaze_fade.target_opacity", 0.25)
-        config.set("app.start_minimized", True)
         config.set("app.focus_on_show", True)
 
         settings._sync_ui_from_config()
@@ -956,37 +956,57 @@ class SettingsViewSyncTests(unittest.TestCase):
         self.assertFalse(settings.chk_gaze.isChecked())
         self.assertEqual(settings.margin_slider.currentIndex(), 5)
         self.assertEqual(settings.opacity_slider.currentIndex(), 4)
-        self.assertTrue(settings.chk_start_minimized.isChecked())
         self.assertTrue(settings.chk_focus_on_show.isChecked())
 
-    def test_system_tab_is_after_ghost(self):
+    def test_system_tab_is_last_and_removed_tabs_do_not_reappear(self):
         settings = SettingsView(ConfigStub({"capture.audio.mode": "system"}), app=None)
         self.addCleanup(settings.deleteLater)
 
         labels = [settings.tabs.tabText(i) for i in range(settings.tabs.count())]
 
-        self.assertEqual(labels[-2:], ["GHOST", "SYSTEM"])
+        self.assertNotIn("GHOST", labels)
+        self.assertEqual(labels[-1], "SYSTEM")
 
     def test_system_tab_settings_are_saved_after_move(self):
         config = ConfigStub(
             {
                 "capture.audio.mode": "system",
                 "ai.mode": "general",
-                "app.start_minimized": False,
                 "app.focus_on_show": False,
             }
         )
         settings = SettingsView(config, app=None)
         self.addCleanup(settings.deleteLater)
 
-        settings.chk_start_minimized.setChecked(True)
         settings.chk_focus_on_show.setChecked(True)
 
         settings._save_all()
 
-        self.assertTrue(config.get("app.start_minimized"))
         self.assertTrue(config.get("app.focus_on_show"))
         self.assertEqual(config.saved, 1)
+
+    def test_system_tab_shows_stealth_status_from_app_manager(self):
+        app = SimpleNamespace(
+            stealth=SimpleNamespace(
+                get_status=lambda: {
+                    "state": "fallback",
+                    "platform": "strong",
+                    "message": "Monitor-only capture fallback active",
+                    "last_error": 87,
+                    "last_affinity": 0x00000001,
+                }
+            )
+        )
+        settings = SettingsView(
+            ConfigStub({"capture.audio.mode": "system", "ai.mode": "general"}),
+            app=app,
+        )
+        self.addCleanup(settings.deleteLater)
+
+        settings._sync_stealth_status()
+
+        self.assertIn("Fallback protection on Strong", settings._stealth_status_lbl.text())
+        self.assertIn("error 87", settings._stealth_status_detail.text())
 
 
 class WindowUtilsTests(unittest.TestCase):
@@ -1055,6 +1075,126 @@ class WindowUtilsTests(unittest.TestCase):
             self.assertTrue(WindowUtils.hide_from_taskbar(fake_window))
             self.assertEqual(fake_user32.set_window_long_calls, 1)
             self.assertEqual(fake_user32.set_window_pos_calls, 1)
+
+
+class ProcessUtilsTests(unittest.TestCase):
+    def test_linux_screen_share_detection_uses_process_list(self):
+        fake_proc = SimpleNamespace(
+            info={"name": "obs", "cmdline": ["obs"]}
+        )
+
+        with patch("utils.platform_utils.PlatformInfo.IS_WINDOWS", False), patch(
+            "utils.platform_utils.PlatformInfo.IS_MAC", False
+        ), patch("utils.platform_utils.PlatformInfo.IS_LINUX", True), patch(
+            "psutil.process_iter", return_value=[fake_proc]
+        ):
+            self.assertTrue(ProcessUtils.is_screen_sharing_active())
+
+    def test_linux_browser_without_share_markers_is_ignored(self):
+        fake_proc = SimpleNamespace(
+            info={"name": "google-chrome", "cmdline": ["chrome", "https://example.com"]}
+        )
+
+        with patch("utils.platform_utils.PlatformInfo.IS_WINDOWS", False), patch(
+            "utils.platform_utils.PlatformInfo.IS_MAC", False
+        ), patch("utils.platform_utils.PlatformInfo.IS_LINUX", True), patch(
+            "psutil.process_iter", return_value=[fake_proc]
+        ), patch("subprocess.run", return_value=SimpleNamespace(returncode=1)):
+            self.assertFalse(ProcessUtils.is_screen_sharing_active())
+
+
+class StealthManagerTests(unittest.TestCase):
+    def test_windows_prefers_exclude_from_capture(self):
+        class FakeWindow:
+            def winId(self):
+                return 101
+
+        class FakeUser32:
+            def __init__(self):
+                self.calls = []
+
+            @staticmethod
+            def GetAncestor(hwnd, flag):
+                return hwnd
+
+            def SetWindowDisplayAffinity(self, hwnd, affinity):
+                self.calls.append((hwnd, affinity))
+                return 1 if affinity == 0x00000011 else 0
+
+        fake_user32 = FakeUser32()
+        manager = StealthManager(ConfigStub({"stealth.enabled": True}))
+
+        with patch("ctypes.windll", Mock(user32=fake_user32), create=True):
+            manager.apply_to_window(FakeWindow(), True)
+
+        self.assertEqual(fake_user32.calls, [(101, 0x00000011)])
+        self.assertEqual(manager._last_affinity_state[101], (True, 0x00000011))
+        self.assertEqual(manager.get_status()["state"], "protected")
+
+    def test_windows_falls_back_to_monitor_affinity(self):
+        class FakeWindow:
+            def winId(self):
+                return 101
+
+        class FakeUser32:
+            def __init__(self):
+                self.calls = []
+
+            @staticmethod
+            def GetAncestor(hwnd, flag):
+                return hwnd
+
+            def SetWindowDisplayAffinity(self, hwnd, affinity):
+                self.calls.append((hwnd, affinity))
+                return 1 if affinity == 0x00000001 else 0
+
+        fake_user32 = FakeUser32()
+        fake_kernel32 = Mock(GetLastError=Mock(return_value=87))
+        manager = StealthManager(ConfigStub({"stealth.enabled": True}))
+
+        with patch(
+            "ctypes.windll",
+            Mock(user32=fake_user32, kernel32=fake_kernel32),
+            create=True,
+        ):
+            manager.apply_to_window(FakeWindow(), True)
+
+        self.assertEqual(
+            fake_user32.calls,
+            [(101, 0x00000011), (101, 0x00000001)],
+        )
+        self.assertEqual(manager._last_affinity_state[101], (True, 0x00000001))
+        self.assertEqual(manager.get_status()["state"], "fallback")
+
+    def test_windows_can_clear_affinity(self):
+        class FakeWindow:
+            def winId(self):
+                return 101
+
+        class FakeUser32:
+            @staticmethod
+            def GetAncestor(hwnd, flag):
+                return hwnd
+
+            def SetWindowDisplayAffinity(self, hwnd, affinity):
+                return 1 if affinity == 0x00000000 else 0
+
+        manager = StealthManager(ConfigStub({"stealth.enabled": True}))
+
+        with patch("ctypes.windll", Mock(user32=FakeUser32()), create=True):
+            manager.apply_to_window(FakeWindow(), False)
+
+        self.assertEqual(manager._last_affinity_state[101], (False, 0x00000000))
+        self.assertEqual(manager.get_status()["state"], "protected")
+
+    def test_linux_status_reports_limited_protection(self):
+        manager = StealthManager(ConfigStub({"stealth.enabled": True}))
+
+        with patch("sys.platform", "linux"):
+            manager.apply_to_window(Mock(), True)
+
+        self.assertEqual(manager.get_status()["state"], "limited")
+        self.assertEqual(manager.get_status()["platform"], "limited")
 
 
 if __name__ == "__main__":

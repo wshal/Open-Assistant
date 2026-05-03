@@ -404,17 +404,85 @@ class ProcessUtils:
             if PlatformInfo.IS_WINDOWS:
                 import psutil
                 sharing_apps = {
-                    "zoom.exe", "teams.exe", "slack.exe", "discord.exe",
-                    "obs64.exe", "obs32.exe", "webex.exe", "gotomeeting.exe",
-                    "screencastomatic.exe", "loom.exe"
+                    "zoom.exe",
+                    "teams.exe",
+                    "ms-teams.exe",
+                    "slack.exe",
+                    "discord.exe",
+                    "obs64.exe",
+                    "obs32.exe",
+                    "webex.exe",
+                    "gotomeeting.exe",
+                    "screencastomatic.exe",
+                    "loom.exe",
+                    "screenrec.exe",
+                    "screenrecorder.exe",
+                    "bandicam.exe",
+                    "streamlabs obs.exe",
+                    "streamlabsobs.exe",
+                    "xsplit.core.exe",
+                    "anydesk.exe",
+                    "teamviewer.exe",
                 }
                 for proc in psutil.process_iter(['name']):
                     if proc.info['name'] and proc.info['name'].lower() in sharing_apps:
                         return True
             elif PlatformInfo.IS_MAC:
                 result = subprocess.run(
-                    ["pgrep", "-f", "screencapturekit|zoom|teams|slack|obs"],
+                    [
+                        "pgrep",
+                        "-f",
+                        "screencapturekit|zoom|teams|slack|discord|obs|loom|screenflick|cleanShot|teamviewer|anydesk",
+                    ],
                     capture_output=True, timeout=2
+                )
+                return result.returncode == 0
+            elif PlatformInfo.IS_LINUX:
+                try:
+                    import psutil
+
+                    sharing_apps = {
+                        "zoom",
+                        "teams",
+                        "slack",
+                        "discord",
+                        "obs",
+                        "obsidian",
+                        "webex",
+                        "skypeforlinux",
+                        "anydesk",
+                        "teamviewer",
+                        "google-chrome",
+                        "chrome",
+                        "chromium",
+                        "microsoft-edge",
+                        "firefox",
+                    }
+                    browser_titles = {
+                        "meet",
+                        "zoom",
+                        "teams",
+                        "webex",
+                        "screen share",
+                        "screenshare",
+                        "sharing this tab",
+                    }
+                    for proc in psutil.process_iter(["name", "cmdline"]):
+                        name = (proc.info.get("name") or "").lower()
+                        if name in sharing_apps:
+                            if name in {"google-chrome", "chrome", "chromium", "microsoft-edge", "firefox"}:
+                                cmdline = " ".join(proc.info.get("cmdline") or []).lower()
+                                if any(token in cmdline for token in browser_titles):
+                                    return True
+                            else:
+                                return True
+                except Exception:
+                    pass
+
+                result = subprocess.run(
+                    ["pgrep", "-f", "zoom|teams|slack|discord|obs|webex|anydesk|teamviewer"],
+                    capture_output=True,
+                    timeout=2,
                 )
                 return result.returncode == 0
         except Exception:

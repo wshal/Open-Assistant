@@ -17,23 +17,25 @@ class SystemTabMixin:
         l.setSpacing(20)
         w.setStyleSheet("background: transparent;")
 
-        lbl_launch = self._make_section_label("LAUNCH BEHAVIOR")
+        lbl_launch = self._make_section_label("WINDOW BEHAVIOR")
         l.addWidget(lbl_launch)
 
-        self.chk_start_minimized = PremiumCheckBox("Launch in background (system tray)")
-        self.chk_start_minimized.setChecked(
-            self.config.get("app.start_minimized", False)
-        )
-        l.addWidget(self.chk_start_minimized)
+        lbl_protection = self._make_section_label("PROTECTION STATUS")
+        l.addWidget(lbl_protection)
 
-        desc_tray = QLabel(
-            "Keeps OpenAssist in the system tray on launch instead of opening the HUD immediately."
+        self._stealth_status_lbl = QLabel("Checking stealth protection...")
+        self._stealth_status_lbl.setStyleSheet(
+            "color: #c0c0ff; font-size: 11px; font-weight: 700; background: transparent;"
         )
-        desc_tray.setWordWrap(True)
-        desc_tray.setStyleSheet(
+        self._stealth_status_lbl.setWordWrap(True)
+        l.addWidget(self._stealth_status_lbl)
+
+        self._stealth_status_detail = QLabel("")
+        self._stealth_status_detail.setStyleSheet(
             f"{TEXT_MUTED} font-size: 10px; background: transparent;"
         )
-        l.addWidget(desc_tray)
+        self._stealth_status_detail.setWordWrap(True)
+        l.addWidget(self._stealth_status_detail)
 
         self.chk_focus_on_show = PremiumCheckBox("Focus HUD when showing it")
         self.chk_focus_on_show.setChecked(

@@ -2,7 +2,7 @@ import unittest
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -122,6 +122,9 @@ class OverlayStub:
     def update_audio_state(self, muted):
         pass
 
+    def set_click_through(self, enabled):
+        self.click_through = enabled
+
     def update_status(self, **kwargs):
         self.status_updates.append(kwargs)
 
@@ -190,6 +193,9 @@ class MiniOverlayStub:
 
     def update_audio_state(self, muted):
         pass
+
+    def set_click_through(self, enabled):
+        self.click_through = enabled
 
     def setWindowOpacity(self, value):
         self.opacity_updates.append(value)
@@ -281,6 +287,8 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             _generation_epoch=0,
             _screen_analysis_pending=False,
             _click_through=False,
+            _screen_share_active=False,
+            _screen_share_hidden_window=None,
             loop=SimpleNamespace(is_running=lambda: True),
             _do_analyze_screen=lambda: __import__("asyncio").sleep(0),
             modes=ModeManagerStub(),
@@ -301,7 +309,10 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             hotkeys=SimpleNamespace(stop=lambda: None, reset_state=lambda: None),
             screen=SimpleNamespace(),
             qt_app=SimpleNamespace(quit=lambda: None),
-            stealth=SimpleNamespace(apply_to_window=lambda window, enabled: None),
+            stealth=SimpleNamespace(
+                apply_to_window=lambda window, enabled: None,
+                should_hide_for_screen_share=lambda: False,
+            ),
         )
         app.state = StateStub(app.config)
         app._context_auto_suggested = False  # auto-suggest flag
@@ -313,7 +324,11 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             app, window
         )
         app._apply_ui_only = lambda: OpenAssistApp._apply_ui_only(app)
+        app._refresh_window_invariants = lambda window=None: OpenAssistApp._refresh_window_invariants(
+            app, window
+        )
         app._active_view = lambda: OpenAssistApp._active_view(app)
+        app._show_active_overlay = lambda: OpenAssistApp._show_active_overlay(app)
         app._hud_focus_enabled = lambda: OpenAssistApp._hud_focus_enabled(app)
         app._present_window = lambda window, focus=False: OpenAssistApp._present_window(
             app, window, focus
@@ -448,16 +463,19 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertFalse(app.mini_mode)
 
-        OpenAssistApp.toggle_mini_mode(app)
-        self.assertTrue(app.mini_mode)
-        self.assertEqual(len(app.overlay.history_updates), 1)
-        self.assertEqual(len(app.mini_overlay.history_updates), 1)
-        self.assertEqual(
-            app.mini_overlay.completed[-1], ("example response", "example question")
-        )
+        with patch.object(app, "_refresh_window_invariants") as refresh:
+            OpenAssistApp.toggle_mini_mode(app)
+            self.assertTrue(app.mini_mode)
+            self.assertEqual(len(app.overlay.history_updates), 1)
+            self.assertEqual(len(app.mini_overlay.history_updates), 1)
+            self.assertEqual(
+                app.mini_overlay.completed[-1], ("example response", "example question")
+            )
 
-        OpenAssistApp.toggle_mini_mode(app)
-        self.assertFalse(app.mini_mode)
+            OpenAssistApp.toggle_mini_mode(app)
+            self.assertFalse(app.mini_mode)
+
+        self.assertEqual(refresh.call_count, 2)
 
     def test_switch_mode_changes_mode_in_overlay(self):
         app = self._build_app()
@@ -563,21 +581,18 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(detector_calls, [("Why?", "audio")])
         self.assertEqual(len(generated), 1)
 
-    def test_show_initial_window_respects_start_minimized(self):
+    def test_show_initial_window_always_shows_hud_when_onboarding_is_complete(self):
         app = self._build_app()
         app.config.set("onboarding.completed", True)
-        app.config.set("app.start_minimized", True)
 
         OpenAssistApp._show_initial_window(app)
 
-        self.assertEqual(app.overlay.hide_calls, 1)
-        self.assertEqual(app.mini_overlay.hide_calls, 1)
-        self.assertEqual(app.overlay.show_calls, 0)
+        self.assertEqual(app.overlay.show_calls, 1)
+        self.assertEqual(app.overlay.raise_calls, 1)
 
     def test_show_initial_window_forces_onboarding(self):
         app = self._build_app()
         app.config.set("onboarding.completed", False)
-        app.config.set("app.start_minimized", True)
 
         OpenAssistApp._show_initial_window(app)
 
@@ -600,11 +615,11 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
     def test_show_active_overlay_reasserts_topmost_before_raising(self):
         app = self._build_app(mini_mode=False)
 
-        with patch("core.app.WindowUtils.ensure_topmost") as ensure_topmost:
+        with patch.object(app, "_refresh_window_invariants") as refresh:
             result = OpenAssistApp._show_active_overlay(app)
 
         self.assertIs(result, app.overlay)
-        ensure_topmost.assert_called_once_with(app.overlay)
+        refresh.assert_called_once_with(app.overlay)
         self.assertEqual(app.overlay.show_calls, 1)
         self.assertEqual(app.overlay.raise_calls, 1)
         self.assertEqual(app.overlay.activate_calls, 0)
@@ -612,14 +627,83 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
     def test_present_window_only_focuses_when_requested(self):
         app = self._build_app()
 
-        with patch("core.app.WindowUtils.ensure_topmost") as ensure_topmost:
+        with patch.object(app, "_refresh_window_invariants") as refresh:
             OpenAssistApp._present_window(app, app.overlay, focus=False)
             OpenAssistApp._present_window(app, app.overlay, focus=True)
 
-        self.assertEqual(ensure_topmost.call_count, 2)
+        self.assertEqual(refresh.call_count, 2)
         self.assertEqual(app.overlay.show_calls, 2)
         self.assertEqual(app.overlay.raise_calls, 2)
         self.assertEqual(app.overlay.activate_calls, 1)
+
+    def test_toggle_click_through_reapplies_window_invariants(self):
+        app = self._build_app()
+
+        with patch.object(app, "_refresh_window_invariants") as refresh:
+            OpenAssistApp.toggle_click_through(app)
+
+        refresh.assert_called_once_with()
+
+    def test_refresh_window_invariants_reapplies_both_windows(self):
+        app = self._build_app()
+
+        with patch.object(app, "_apply_window_effects") as apply_effects:
+            OpenAssistApp._refresh_window_invariants(app)
+
+        self.assertEqual(apply_effects.call_args_list, [unittest.mock.call(app.overlay), unittest.mock.call(app.mini_overlay)])
+
+    def test_apply_window_effects_hides_from_taskbar_and_reapplies_stealth(self):
+        app = self._build_app()
+        app.state.is_stealth = True
+        app.config.set("app.opacity", 0.94)
+        app.config.set("stealth.low_opacity", 0.75)
+        app.stealth = SimpleNamespace(apply_to_window=Mock())
+
+        with patch("core.app.WindowUtils.hide_from_taskbar") as hide_from_taskbar, patch(
+            "core.app.WindowUtils.ensure_topmost"
+        ) as ensure_topmost:
+            OpenAssistApp._apply_window_effects(app, app.overlay)
+
+        hide_from_taskbar.assert_called_once_with(app.overlay)
+        ensure_topmost.assert_called_once_with(app.overlay)
+        app.stealth.apply_to_window.assert_called_once_with(app.overlay, True)
+
+    def test_check_screen_share_protection_reinforces_stealth_and_updates_state(self):
+        app = self._build_app()
+        app.ensure_stealth = Mock()
+        app._set_screen_share_state = Mock()
+        app._screen_share_active = False
+
+        with patch("core.app.ProcessUtils.is_screen_sharing_active", return_value=True):
+            OpenAssistApp._check_screen_share_protection(app)
+
+        app.ensure_stealth.assert_called_once_with()
+        app._set_screen_share_state.assert_called_once_with(True)
+
+    def test_check_screen_share_protection_no_state_change_when_detection_is_same(self):
+        app = self._build_app()
+        app.ensure_stealth = Mock()
+        app._set_screen_share_state = Mock()
+        app._screen_share_active = False
+
+        with patch("core.app.ProcessUtils.is_screen_sharing_active", return_value=False):
+            OpenAssistApp._check_screen_share_protection(app)
+
+        app.ensure_stealth.assert_not_called()
+        app._set_screen_share_state.assert_not_called()
+
+    def test_refresh_topmost_window_reapplies_full_invariants_for_visible_windows(self):
+        app = self._build_app()
+        app.overlay.visible = True
+        app.mini_overlay.show_calls = 0
+
+        with patch.object(app, "_refresh_window_invariants") as refresh:
+            OpenAssistApp._refresh_topmost_window(app)
+
+        self.assertEqual(
+            refresh.call_args_list,
+            [unittest.mock.call(app.overlay)],
+        )
 
     def test_show_active_overlay_respects_focus_on_show_config(self):
         app = self._build_app(mini_mode=False)
@@ -695,19 +779,45 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertEqual(scrolls, ["up", "down"])
 
-    def test_toggle_stealth_mode_enforces_stealth_state_and_window_opacity(self):
+    def test_ensure_stealth_enforces_stealth_state_and_window_opacity(self):
         app = self._build_app()
         app.state.is_stealth = False
         app.config.set("stealth.low_opacity", 0.75)
         app.config.set("app.opacity", 0.94)
 
-        OpenAssistApp.toggle_stealth_mode(app)
+        OpenAssistApp.ensure_stealth(app)
 
         self.assertTrue(app.state.is_stealth)
         self.assertEqual(app.overlay.opacity_updates[-1], 0.75)
         self.assertEqual(app.mini_overlay.opacity_updates[-1], 0.75)
 
-        OpenAssistApp.toggle_stealth_mode(app)
+    def test_screen_share_reinforces_stealth_without_hiding_on_strong_platform(self):
+        app = self._build_app(mini_mode=False)
+        app.overlay.visible = True
+        app.state.is_stealth = False
+        app.ensure_stealth = lambda: OpenAssistApp.ensure_stealth(app)
+
+        OpenAssistApp._set_screen_share_state(app, True)
+
+        self.assertTrue(app._screen_share_active)
+        self.assertTrue(app.overlay.isVisible())
+        self.assertIsNone(app._screen_share_hidden_window)
+
+    def test_screen_share_hides_and_restores_hud_on_limited_platform(self):
+        app = self._build_app(mini_mode=False)
+        app.overlay.visible = True
+        app.ensure_stealth = lambda: OpenAssistApp.ensure_stealth(app)
+        app.stealth.should_hide_for_screen_share = lambda: True
+
+        OpenAssistApp._set_screen_share_state(app, True)
+        self.assertFalse(app.overlay.isVisible())
+        self.assertEqual(app._screen_share_hidden_window, "overlay")
+
+        OpenAssistApp._set_screen_share_state(app, False)
+        self.assertTrue(app.overlay.isVisible())
+        self.assertIsNone(app._screen_share_hidden_window)
+
+        OpenAssistApp.ensure_stealth(app)
 
         self.assertTrue(app.state.is_stealth)
         self.assertEqual(app.overlay.opacity_updates[-1], 0.75)

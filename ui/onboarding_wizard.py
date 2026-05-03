@@ -179,7 +179,6 @@ class OnboardingWizard(QWidget):
             "ai_mode": self.config.get("ai.mode", "general"),
             "audio_mode": self.config.get("capture.audio.mode", "system"),
             "gaze_enabled": self.config.get("app.gaze_fade.enabled", False),
-            "start_minimized": self.config.get("app.start_minimized", False),
         }
 
     def reset(self):
@@ -627,22 +626,6 @@ class OnboardingWizard(QWidget):
 
         self.content_layout.addSpacing(18)
 
-        self.chk_start_minimized = PremiumCheckBox("Launch in background (system tray)")
-        self.chk_start_minimized.setChecked(
-            self.wizard_state.get("start_minimized", False)
-        )
-        self.content_layout.addWidget(
-            self.chk_start_minimized, 0, Qt.AlignmentFlag.AlignCenter
-        )
-
-        desc_tray = QLabel(
-            "Keeps OpenAssist in the system tray on launch instead of opening the HUD immediately."
-        )
-        desc_tray.setStyleSheet("color: #64748b; font-size: 9px; text-align: center;")
-        desc_tray.setWordWrap(True)
-        desc_tray.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.content_layout.addWidget(desc_tray)
-        
         self.content_layout.addStretch(2) # Balanced Spacing
 
 
@@ -723,9 +706,6 @@ class OnboardingWizard(QWidget):
             self.config.set("ai.mode", self.wizard_state["ai_mode"])
             self.config.set("capture.audio.mode", self.wizard_state["audio_mode"])
             self.config.set("app.gaze_fade.enabled", self.wizard_state["gaze_enabled"])
-            self.config.set(
-                "app.start_minimized", self.wizard_state["start_minimized"]
-            )
 
             # 3. Mark Completed
             self.config.set("onboarding.completed", True)
@@ -808,10 +788,6 @@ class OnboardingWizard(QWidget):
 
             if hasattr(self, "chk_gaze"):
                 self.wizard_state["gaze_enabled"] = self.chk_gaze.isChecked()
-            if hasattr(self, "chk_start_minimized"):
-                self.wizard_state["start_minimized"] = (
-                    self.chk_start_minimized.isChecked()
-                )
 
         # Update summary UI if we are entering or in the summary step
         self._update_summary()

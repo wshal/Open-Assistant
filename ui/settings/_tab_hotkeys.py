@@ -48,7 +48,6 @@ class HotkeysTabMixin:
             "scroll_down": "Scroll Response Down",
             "switch_mode": "Rotate AI Modes",
             "toggle_audio": "Mute/Unmute Mic",
-            "stealth": "Reapply Ghost Stealth",
             "mini_mode": "Switch to Mini-HUD",
             "toggle_click_through": "Focus Click-Through",
             "emergency_erase": "Emergency System Wipe",

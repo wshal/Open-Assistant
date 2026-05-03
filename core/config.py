@@ -316,7 +316,6 @@ class Config:
         hotkeys.setdefault("history_prev", "ctrl+[")
         hotkeys.setdefault("history_next", "ctrl+]")
         hotkeys.setdefault("toggle_audio", "ctrl+shift+a")
-        hotkeys.setdefault("stealth", "ctrl+shift+z")
         hotkeys.setdefault("mini_mode", "ctrl+alt+n")
         hotkeys.setdefault("emergency_erase", "ctrl+shift+e")
 

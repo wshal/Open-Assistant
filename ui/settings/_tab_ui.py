@@ -17,7 +17,7 @@ class UiTabMixin:
         l.setContentsMargins(20, 20, 20, 20)
         l.setSpacing(20)
 
-        lbl_opacity_main = QLabel("STEALTH VISIBILITY")
+        lbl_opacity_main = QLabel("PROTECTED HUD VISIBILITY")
         lbl_opacity_main.setStyleSheet(
             f"{TEXT_PRIMARY} font-size: 11px; font-weight: 800; background: transparent;"
         )
@@ -68,7 +68,7 @@ class UiTabMixin:
         l.addLayout(stealth_opacity_row)
 
         desc_hud_opacity = QLabel(
-            "Primary control for how visible the HUD remains while stealth mode is enabled."
+            "Primary control for how visible the HUD remains while capture protection is active."
         )
         desc_hud_opacity.setWordWrap(True)
         desc_hud_opacity.setStyleSheet(
@@ -125,7 +125,7 @@ class UiTabMixin:
         l.addLayout(hud_opacity_row)
 
         desc_stealth_opacity = QLabel(
-            "Optional fallback for non-stealth use, setup, or when you want the regular HUD more readable."
+            "Fallback visibility for setup and normal interaction when you want the regular HUD more readable."
         )
         desc_stealth_opacity.setWordWrap(True)
         desc_stealth_opacity.setStyleSheet(
@@ -146,7 +146,7 @@ class UiTabMixin:
         desc_gaze = QLabel(
             "When enabled, the window fades to low opacity when your mouse is near it. "
             "Only active during active sessions — not on standby or settings screens. "
-            "Works alongside Stealth Mode; stealth anti-capture remains active."
+            "Capture protection stays enforced while gaze fade is active."
         )
         desc_gaze.setWordWrap(True)
         desc_gaze.setStyleSheet(

@@ -36,7 +36,6 @@ from ui.settings._tab_context import ContextTabMixin
 from ui.settings._tab_hotkeys import HotkeysTabMixin
 from ui.settings._tab_knowledge import KnowledgeTabMixin
 from ui.settings._tab_routing import RoutingTabMixin
-from ui.settings._tab_stealth import StealthTabMixin
 from ui.settings._tab_system import SystemTabMixin
 from ui.settings._tab_ui import UiTabMixin
 
@@ -303,7 +302,7 @@ class ProviderTestWorker(QThread):
             self.result_ready.emit(self.provider_id, False, str(e)[:120], None)
 
 
-class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, HotkeysTabMixin, KnowledgeTabMixin, RoutingTabMixin, StealthTabMixin, SystemTabMixin, UiTabMixin):
+class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, HotkeysTabMixin, KnowledgeTabMixin, RoutingTabMixin, SystemTabMixin, UiTabMixin):
     closed = pyqtSignal()
     mode_changed = pyqtSignal(str)
     audio_source_changed = pyqtSignal(str)
@@ -458,7 +457,6 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
         self.tabs.addTab(self._tab_knowledge(), "KNOWLEDGE")
         self.tabs.addTab(self._tab_routing(),   "ROUTING")
         self.tabs.addTab(self._tab_ui(),        "DISPLAY")
-        self.tabs.addTab(self._tab_stealth(),   "GHOST")
         self.tabs.addTab(self._tab_system(),    "SYSTEM")
         layout.addWidget(self.tabs)
 
@@ -691,15 +689,50 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             opacity_map = {5: 0, 10: 1, 15: 2, 20: 3, 25: 4}
             self.opacity_slider.setCurrentIndex(opacity_map.get(current_opacity, 1))
 
-        if hasattr(self, "chk_start_minimized"):
-            self.chk_start_minimized.setChecked(
-                bool(self.config.get("app.start_minimized", False))
-            )
-
         if hasattr(self, "chk_focus_on_show"):
             self.chk_focus_on_show.setChecked(
                 bool(self.config.get("app.focus_on_show", False))
             )
+
+        self._sync_stealth_status()
+
+    def _sync_stealth_status(self):
+        if not hasattr(self, "_stealth_status_lbl"):
+            return
+
+        status = None
+        if self.app and hasattr(self.app, "stealth") and hasattr(self.app.stealth, "get_status"):
+            status = self.app.stealth.get_status()
+
+        if not status:
+            self._stealth_status_lbl.setText("Protection status unavailable")
+            self._stealth_status_detail.setText("Stealth manager is not attached to this settings view.")
+            return
+
+        state = str(status.get("state", "limited")).strip().lower()
+        platform = str(status.get("platform", "limited")).strip().lower()
+        message = str(status.get("message", "")).strip()
+        last_error = int(status.get("last_error", 0) or 0)
+
+        state_map = {
+            "protected": ("Protected", "#4ade80"),
+            "fallback": ("Fallback", "#f59e0b"),
+            "limited": ("Limited", "#f59e0b"),
+            "unsupported": ("Unsupported", "#f87171"),
+            "error": ("Error", "#f87171"),
+        }
+        title, color = state_map.get(state, ("Limited", "#f59e0b"))
+        platform_title = platform.capitalize()
+
+        self._stealth_status_lbl.setStyleSheet(
+            f"color: {color}; font-size: 11px; font-weight: 700; background: transparent;"
+        )
+        self._stealth_status_lbl.setText(f"{title} protection on {platform_title}")
+
+        detail = message or "No additional diagnostics available."
+        if last_error:
+            detail = f"{detail} (error {last_error})"
+        self._stealth_status_detail.setText(detail)
 
     def _prime_ollama_models(self):
         """Try to keep the Ollama model dropdown useful on reopen."""
@@ -889,11 +922,6 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             # Save gaze fade settings
             if hasattr(self, "chk_gaze"):
                 self.config.set("app.gaze_fade.enabled", self.chk_gaze.isChecked())
-            if hasattr(self, "chk_start_minimized"):
-                self.config.set(
-                    "app.start_minimized",
-                    self.chk_start_minimized.isChecked(),
-                )
             if hasattr(self, "chk_focus_on_show"):
                 self.config.set(
                     "app.focus_on_show",
