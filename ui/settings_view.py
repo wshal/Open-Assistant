@@ -627,6 +627,10 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             self.audio_mode.blockSignals(True)
             self.audio_mode.setCurrentIndex(0 if curr == "system" else 1 if curr == "mic" else 2)
             self.audio_mode.blockSignals(False)
+        if hasattr(self, "chk_live_mode"):
+            self.chk_live_mode.setChecked(
+                bool(self.config.get("ai.live_mode.enabled", False))
+            )
 
         # 3. Always refresh API key fields from encrypted storage.
         # Bug fix: previous code only repopulated when the field was empty, so
@@ -791,6 +795,8 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
                 self.config.set("capture.audio.transcription_provider", tp)
             if hasattr(self, "chk_chunking"):
                 self.config.set("capture.audio.chunking.enabled", self.chk_chunking.isChecked())
+            if hasattr(self, "chk_live_mode"):
+                self.config.set("ai.live_mode.enabled", self.chk_live_mode.isChecked())
             if hasattr(self, "chk_paid_vision_fallback"):
                 self.config.set(
                     "ai.vision.allow_paid_fallback",

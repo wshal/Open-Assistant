@@ -97,6 +97,7 @@ class OverlayWindow(QMainWindow):
         self._session_start_time = time.time()
         self.session_timer.setVisible(True)
         self.audio_status.setVisible(True)
+        self.live_status.setVisible(True)
         self.vision_status.setVisible(True)
         self.update_vision_state(reset_to_master=True)
         self.btn_end_session.setVisible(True)
@@ -107,6 +108,10 @@ class OverlayWindow(QMainWindow):
             self.btn_timeline.setVisible(False)
         self.set_analysis_provider_badge()
         self.update_audio_state(self.app.state.is_muted)
+        self.update_live_mode_state(
+            bool(self.config.get("ai.live_mode.enabled", False)),
+            bool(getattr(self.app, "_live_mode_connected", lambda: False)()),
+        )
         self._session_timer.start(1000)
 
     def end_session_ui(self):
@@ -114,6 +119,7 @@ class OverlayWindow(QMainWindow):
         self._session_start_time = None
         self.session_timer.setVisible(False)
         self.audio_status.setVisible(False)
+        self.live_status.setVisible(False)
         self.vision_status.setVisible(False)
         self.btn_end_session.setVisible(False)
         self.btn_history.setVisible(True)
@@ -221,6 +227,16 @@ class OverlayWindow(QMainWindow):
         hl.addWidget(self.session_timer)
 
         hl.addStretch()
+        
+        # Live Mode button
+        self.live_status = QPushButton("LIVE")
+        self.live_status.setToolTip("Toggle Gemini Live audio mode")
+        self.live_status.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.live_status.setFixedHeight(24)
+        self.live_status.setMinimumWidth(42)
+        self.live_status.clicked.connect(self.app.toggle_live_mode)
+        self.live_status.setVisible(False)
+        hl.addWidget(self.live_status)
 
         # PHASE 1: Interactive Vision Kill Switch (Placed BEFORE mic)
         self.vision_status = QPushButton("👁️")
@@ -767,18 +783,26 @@ class OverlayWindow(QMainWindow):
             self._error_toast.setStyleSheet(
                 "background: rgba(239,68,68,45); color: #ef4444;"
                 " border: 1px solid rgba(239,68,68,127); border-radius: 8px;"
-                " padding: 6px 10px; font-size: 10px;"
+                " padding: 8px 10px; font-size: 10px;"
             )
-            self._error_toast.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._error_toast.setAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+            self._error_toast.setTextFormat(Qt.TextFormat.PlainText)
+            self._error_toast.setMargin(2)
             self._error_toast.hide()
             self._error_toast_timer = QTimer(self)
             self._error_toast_timer.setSingleShot(True)
             self._error_toast_timer.timeout.connect(self._error_toast.hide)
 
-        self._error_toast.setText(f"⚠ {message}")
+        self._error_toast.setText(f"Warning: {message}")
         # Position above the transcript area — top of the chat view
-        self._error_toast.setFixedWidth(self.width() - 24)
-        self._error_toast.move(12, 48)
+        toast_width = max(220, self.container.width() - 28)
+        self._error_toast.setFixedWidth(toast_width)
+        self._error_toast.adjustSize()
+        toast_height = max(34, self._error_toast.sizeHint().height() + 4)
+        self._error_toast.resize(toast_width, toast_height)
+        self._error_toast.move(14, 48)
         self._error_toast.raise_()
         self._error_toast.show()
         self._error_toast_timer.start(duration_ms)
@@ -807,6 +831,53 @@ class OverlayWindow(QMainWindow):
         )
 
         self.refresh_standby_state()
+
+    def update_live_mode_state(
+        self,
+        enabled: bool,
+        connected: bool,
+        reconnecting: bool = False,
+        fallback: bool = False,
+    ):
+        if not hasattr(self, "live_status"):
+            return
+        self.live_status.setVisible(bool(getattr(self.app, "session_active", False)))
+        if connected and enabled:
+            color = "#4ade80"
+            bg = "rgba(74,222,128,28)"
+            border = "rgba(74,222,128,64)"
+            label = "LIVE ON"
+            tip = "Gemini Live audio mode is connected for low-latency spoken replies"
+        elif reconnecting and enabled:
+            color = "#f59e0b"
+            bg = "rgba(245,158,11,24)"
+            border = "rgba(245,158,11,56)"
+            label = "RETRY"
+            tip = "Gemini Live is reconnecting. Standard mode will take over if reconnect fails."
+        elif fallback:
+            color = "#f97316"
+            bg = "rgba(249,115,22,24)"
+            border = "rgba(249,115,22,60)"
+            label = "STD"
+            tip = "Standard mode is active because Gemini Live is unavailable for this session right now."
+        else:
+            color = "#f59e0b" if enabled else "#64748b"
+            bg = "rgba(245,158,11,24)" if enabled else "rgba(100,116,139,18)"
+            border = "rgba(245,158,11,56)" if enabled else "rgba(100,116,139,36)"
+            label = "LIVE" if enabled else "OFF"
+            tip = (
+                "Toggle Gemini Live audio mode. Use it for faster voice back-and-forth with Gemini."
+                if enabled
+                else "Live mode is turned off. Click to switch back to Gemini Live."
+            )
+        self.live_status.setText(label)
+        self.live_status.setToolTip(tip)
+        self.live_status.setStyleSheet(
+            "QPushButton { "
+            f"color: {color}; background: {bg}; border: 1px solid {border}; "
+            "border-radius: 10px; font-size: 10px; font-weight: 800; padding: 0 8px; } "
+            "QPushButton:hover { background: rgba(255,255,255,12); }"
+        )
 
     def _toggle_vision(self):
         """Full vision kill switch — toggles screen capture + OCR as a unit.

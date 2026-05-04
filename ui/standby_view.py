@@ -75,7 +75,7 @@ class StandbyView(QWidget):
             border-radius: 10px;
             padding: 9px 14px;
             font-size: 10px;
-            font-weight: 800;
+            font-weight: bold;
         }
     """
 
@@ -89,7 +89,7 @@ class StandbyView(QWidget):
             );
             color: white;
             border-radius: 26px;
-            font-weight: 900;
+            font-weight: bold;
             font-size: 13px;
             border: 1px solid rgba(255,255,255,18);
         }
@@ -117,7 +117,7 @@ class StandbyView(QWidget):
             );
             color: white;
             border-radius: 26px;
-            font-weight: 900;
+            font-weight: bold;
             font-size: 13px;
             border: 1px solid rgba(255,255,255,18);
         }
@@ -295,6 +295,18 @@ class StandbyView(QWidget):
             audio_row.addWidget(btn)
             self.audio_btns[name] = btn
         layout.addLayout(audio_row)
+
+        layout.addSpacing(12)
+
+        self.live_mode_hint = QLabel()
+        self.live_mode_hint.setWordWrap(True)
+        self.live_mode_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.live_mode_hint.setStyleSheet(
+            "color: #64748b; font-size: 10px; line-height: 1.35; "
+            "background: rgba(255,255,255,4); border: 1px solid rgba(255,255,255,10); "
+            "border-radius: 10px; padding: 8px 12px;"
+        )
+        layout.addWidget(self.live_mode_hint)
 
         layout.addSpacing(25)
 
@@ -612,6 +624,40 @@ class StandbyView(QWidget):
             btn.setChecked(active)
             btn.setStyleSheet(self.STYLE_ACTIVE if active else self.STYLE_INACTIVE)
 
+    def _resolve_app(self):
+        p = self.parent()
+        while p:
+            if hasattr(p, "app"):
+                return p.app
+            p = p.parent()
+        return None
+
+    def refresh_live_mode_hint(self):
+        if not hasattr(self, "live_mode_hint"):
+            return
+
+        app = self._resolve_app()
+        config = getattr(app, "config", None)
+        enabled = bool(config.get("ai.live_mode.enabled", False)) if config else False
+        gemini_key = ""
+        try:
+            gemini_key = str(config.get_api_key("gemini") or "").strip() if config else ""
+        except Exception:
+            gemini_key = ""
+
+        if enabled and gemini_key:
+            text = "Live Mode: fastest voice back-and-forth with Gemini."
+        elif enabled:
+            text = "Live Mode is on, but needs a Gemini API key or it falls back to standard mode."
+        else:
+            text = "Standard Mode: transcript-first flow for normal routing and non-Gemini providers."
+
+        self.live_mode_hint.setText(text)
+        self.live_mode_hint.setToolTip(
+            "Live Mode: fastest audio back-and-forth through Gemini Live.\n"
+            "Standard mode: transcribe first, then route the request through the normal provider pipeline."
+        )
+
     def show_context_chip(self, preset_name: str | None, applied: bool = True):
         """Update the context chip below the mode grid.
 
@@ -681,6 +727,7 @@ class StandbyView(QWidget):
             self._boot_sync_logged = True
         self.set_current_mode(mode)
         self.set_current_audio_source(audio)
+        self.refresh_live_mode_hint()
 
     def refresh_highlights(self, mode=None, audio=None):
         """Force refresh selection states from explicit values or resolved state."""
@@ -691,6 +738,7 @@ class StandbyView(QWidget):
         # 2. State-resolved value
         self.set_current_mode(mode or resolved_mode)
         self.set_current_audio_source(audio or resolved_audio)
+        self.refresh_live_mode_hint()
 
     def _resolve_initial_selection(self):
         """State-first resolution of active selections. Robustly traverses parent tree to find app."""

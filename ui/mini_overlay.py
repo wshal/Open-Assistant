@@ -267,7 +267,13 @@ class MiniOverlay(QMainWindow):
             self.response_area.verticalScrollBar().maximum()
         )
 
-    def on_complete(self, full_text: str, query: str = None):
+    def on_complete(
+        self,
+        full_text: str,
+        query: str = None,
+        cache_tier: int = 0,
+        provider: str = "",
+    ):
         """Streaming finished — stop timer, do final markdown render, update dot.
         
         When called with empty strings, signals session end (clear input + reset).
