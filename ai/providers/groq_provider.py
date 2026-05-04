@@ -19,7 +19,10 @@ class GroqProvider(BaseProvider):
             self.pcfg["model"] = "llama-3.1-8b-instant"
         try:
             from groq import AsyncGroq
-            self.client = AsyncGroq(api_key=key)
+            # max_retries=0: surface 429 rate-limit errors immediately so
+            # the engine fallback chain switches to Gemini in <1 ms instead
+            # of blocking on the SDK’s server-specified retry backoff (17-35 s).
+            self.client = AsyncGroq(api_key=key, max_retries=0)
             logger.info("  [OK] Groq ready (1300 tok/s)")
         except Exception as e:
             logger.warning(f"  â Groq: {e}")

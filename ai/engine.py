@@ -116,13 +116,39 @@ class AIEngine(QObject):
         # Set by app.py from AppState.session_context each time it changes.
         # Injected as the top block of every system prompt for the session.
         self._session_context: str = ""
+        self._session_failed_providers: set[str] = set()
+
+    def reset_session_failures(self) -> None:
+        self._session_failed_providers.clear()
+
+    def _mark_provider_failed_for_session(self, provider_id: str) -> None:
+        if provider_id:
+            self._session_failed_providers.add(str(provider_id))
+
+    def _filter_provider_preferences(self, providers: List[str]) -> List[str]:
+        filtered = []
+        seen = set()
+        for pid in providers or []:
+            name = str(pid or "").strip()
+            if not name or name in seen or name in self._session_failed_providers:
+                continue
+            provider = self._providers.get(name)
+            if provider and getattr(provider, "enabled", False):
+                filtered.append(name)
+                seen.add(name)
+        return filtered
 
     @staticmethod
     def _cooldown_seconds_for_error(exc: Exception) -> int:
         """
         Best-effort cooldown for transient provider failures so we don't keep
         hammering an overloaded endpoint on the next request.
+
+        For 429 errors, attempts to parse the server's "try again in Xs" hint
+        so the cooldown matches exactly when the provider says it will recover
+        rather than using a hardcoded value that is too long or too short.
         """
+        import re as _re
         msg = str(exc or "").lower()
         if any(
             k in msg
@@ -136,7 +162,17 @@ class AIEngine(QObject):
         ):
             return 60
         if any(k in msg for k in ["429", "rate limit", "ratelimit", "too many requests"]):
-            return 20
+            # Try to extract the server-specified retry-after from the error text.
+            # Groq/OpenAI format: "please try again in 5.8s" or "retry after 12s"
+            m = _re.search(r"(?:try again in|retry.?after)\s+([\d.]+)\s*s", msg)
+            if m:
+                try:
+                    hint_s = float(m.group(1))
+                    # Add 2 s safety padding; clamp to [5, 60].
+                    return max(5, min(60, int(hint_s) + 2))
+                except ValueError:
+                    pass
+            return 20  # fallback when no hint is present
         if any(k in msg for k in ["timeout", "timed out", "connection", "connectorerror"]):
             return 10
         return 0
@@ -393,6 +429,20 @@ class AIEngine(QObject):
                     "[Q14 Cache] Hit tier=%d, provider=%s, latency=%.0fms",
                     cache_tier, cached.provider or 'cache', latency_ms
                 )
+                # Promote non-exact hits to an exact entry for this wording so
+                # future repeats land in Tier 1 instead of reusing a broader match.
+                if cache_tier > 1:
+                    try:
+                        self._short_cache.set(
+                            mode=mode_id,
+                            query=query,
+                            context_fp=context_fp,
+                            history_fp=history_fp,
+                            response=cached.response,
+                            provider=cached.provider or "cache",
+                        )
+                    except Exception:
+                        pass
                 self.history.add(
                     query,
                     cached.response,
@@ -433,16 +483,26 @@ class AIEngine(QObject):
             f"origin='{origin}', query_tokens≈{len(query.split())}"
         )
         preferred_providers = None
-        if origin in {"manual", "speech"}:
+        if origin == "speech":
+            cfg_text = self.config.get(
+                "ai.text.speech_preferred_providers",
+                ["groq", "gemini", "ollama"],
+            )
+            if isinstance(cfg_text, list) and cfg_text:
+                preferred_providers = [p for p in cfg_text if isinstance(p, str) and p.strip()]
+        elif origin == "manual":
             cfg_text = self.config.get("ai.text.preferred_providers", None)
             if isinstance(cfg_text, list) and cfg_text:
-                # Respect explicit user priority order for manual/audio queries.
+                # Respect explicit user priority order for manual queries.
                 preferred_providers = [p for p in cfg_text if isinstance(p, str) and p.strip()]
 
         if not preferred_providers:
             preferred_providers = self._preferred_providers_for_complexity(
                 complexity, mode_obj or mode_id
             )
+        preferred_providers = self._filter_provider_preferences(preferred_providers)
+        if not preferred_providers:
+            preferred_providers = self._filter_provider_preferences(list(self._provider_priority))
 
         # Use parallel inference if enabled
         use_parallel = self._parallel and self.config.get("ai.parallel.enabled", False)
@@ -515,7 +575,12 @@ class AIEngine(QObject):
                     f"Parallel inference failed, falling back to single provider: {e}"
                 )
 
-        provider, tier = self._select_provider(mode_obj or mode_id, complexity, preferred_providers)
+        provider, tier = self._select_provider(
+            mode_obj or mode_id,
+            complexity,
+            preferred_providers,
+            strict_preferred=origin in {"manual", "speech"},
+        )
         
         # --- Tier Downgrading for Background tasks ---
         cloud_bg_fallback = False
@@ -720,6 +785,7 @@ class AIEngine(QObject):
                                     # If a raced provider errors, immediately apply cooldown heuristics
                                     # so we don't keep hammering an overloaded endpoint.
                                     self._maybe_cooldown_provider(p, exc)
+                                    self._mark_provider_failed_for_session(getattr(p, "name", ""))
                                     continue
 
                                 if self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled:
@@ -795,6 +861,7 @@ class AIEngine(QObject):
             full_response = ""
             providers_tried = [provider.name]
             generation_succeeded = False
+            provider_retry_timeouts_ms = {}
 
             # Build a fallback queue: preferred list minus already-selected primary
             fallback_queue = [
@@ -807,7 +874,10 @@ class AIEngine(QObject):
             current_provider = provider
             while True:
                 try:
-                    ft_ms = self._first_token_timeout_ms_for_provider(current_provider.name)
+                    ft_ms = provider_retry_timeouts_ms.get(
+                        current_provider.name,
+                        self._first_token_timeout_ms_for_provider(current_provider.name),
+                    )
                     ft_timeout_s = max(ft_ms / 1000.0, 0.0) if ft_ms > 0 else 0.0
 
                     async for chunk in self._stream_with_first_token_timeout(
@@ -837,8 +907,31 @@ class AIEngine(QObject):
                         f"AI: Provider '{current_provider.name}' failed during stream "
                         f"({stream_err}). Trying fallback..."
                     )
+                    if (
+                        current_provider.name == "ollama"
+                        and current_provider.name not in provider_retry_timeouts_ms
+                        and self._is_first_token_timeout_error(stream_err)
+                    ):
+                        retry_ft_ms = self._retry_first_token_timeout_ms_for_provider(
+                            current_provider.name
+                        )
+                        if retry_ft_ms > ft_ms:
+                            provider_retry_timeouts_ms[current_provider.name] = retry_ft_ms
+                            logger.info(
+                                "AI: Retrying local provider '%s' with extended first-token timeout (%.2fs)",
+                                current_provider.name,
+                                retry_ft_ms / 1000.0,
+                            )
+                            full_response = ""
+                            continue
+
+                    provider_retry_timeouts_ms.pop(current_provider.name, None)
                     self._maybe_cooldown_provider(current_provider, stream_err)
+                    self._mark_provider_failed_for_session(current_provider.name)
                     full_response = ""  # Discard any partial output
+
+                    while fallback_queue and fallback_queue[0] in self._session_failed_providers:
+                        fallback_queue.pop(0)
 
                     if not fallback_queue:
                         logger.error("AI: All providers exhausted — no response generated.")
@@ -1079,6 +1172,26 @@ class AIEngine(QObject):
             return int(self.config.get("ai.text.first_token_timeout_ms", 0) or 0)
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _is_first_token_timeout_error(exc: Exception) -> bool:
+        return "first token timeout" in str(exc or "").lower()
+
+    def _retry_first_token_timeout_ms_for_provider(self, provider_name: str) -> int:
+        """Retry budget for slower local providers before we surface a fatal error."""
+        provider_name = str(provider_name or "").strip().lower()
+        if provider_name == "ollama":
+            try:
+                return int(
+                    self.config.get(
+                        "ai.text.local_first_token_retry_timeout_ms",
+                        15000,
+                    )
+                    or 0
+                )
+            except (TypeError, ValueError):
+                return 15000
+        return self._first_token_timeout_ms_for_provider(provider_name)
 
     async def generate_quick_response(
         self,
@@ -1825,7 +1938,7 @@ class AIEngine(QObject):
             return ["gemini", "groq", "cerebras", "together", "ollama"]
         return list(self._provider_priority)
 
-    def _select_provider(self, mode, complexity: str, preferred: List[str]):
+    def _select_provider(self, mode, complexity: str, preferred: List[str], strict_preferred: bool = False):
         """
         Select a provider through the router when available, otherwise use ranked fallback.
         Accepts a Mode object or a string mode name.
@@ -1860,6 +1973,15 @@ class AIEngine(QObject):
 
         mode_name = mode.name if hasattr(mode, "name") else str(mode or "general")
 
+        if strict_preferred:
+            for provider_id in preferred:
+                provider = self._providers.get(provider_id)
+                if provider and getattr(provider, "enabled", False) and provider.check_rate():
+                    resolved_tier = tier_hint or (self._router._tier_for_task(mode_name) if self._router else "balanced")
+                    if provider.has_model(resolved_tier):
+                        return provider, resolved_tier
+                    return provider, getattr(provider, "default_tier", "balanced")
+
         if self._router:
             provider, tier = self._router.select(
                 task=mode_name,
@@ -1867,18 +1989,29 @@ class AIEngine(QObject):
                 prefer_quality=prefer_quality,
                 preferred=preferred,
                 tier=tier_hint,
+                exclude=list(self._session_failed_providers),
             )
             if provider:
                 return provider, tier
 
         for provider_id in preferred:
             provider = self._providers.get(provider_id)
-            if provider and getattr(provider, "enabled", False):
+            if (
+                provider
+                and getattr(provider, "enabled", False)
+                and provider_id not in self._session_failed_providers
+                and provider.check_rate()
+            ):
                 tier = self._router._tier_for_task(mode_name) if self._router else "balanced"
                 return provider, tier
 
         provider = self._providers.get(self._active_provider_id)
-        if provider and getattr(provider, "enabled", False):
+        if (
+            provider
+            and getattr(provider, "enabled", False)
+            and getattr(provider, "name", "") not in self._session_failed_providers
+            and provider.check_rate()
+        ):
             return provider, tier_hint or "balanced"
         return None, ""
 
