@@ -77,6 +77,16 @@ class QuestionDetector:
                 "are you",
                 "should i",
                 "would you",
+                "difference between",
+                "what's the difference",
+                "walk me through",
+                "walk us through",
+                "talk about",
+                "tell us about",
+                "share an example",
+                "give an example",
+                "help me understand",
+                "clarify",
             ],
         )
 
@@ -236,6 +246,34 @@ class QuestionDetector:
             "could you please",
             "would you mind",
             "i have a question",
+            "difference between ",
+            "what's the difference ",
+            "walk me through ",
+            "walk us through ",
+            "talk about ",
+            "tell us about ",
+            "share an example ",
+            "give an example ",
+            "help me understand ",
+            "clarify ",
+        ]
+        self.intent_phrases = [
+            "difference between",
+            "what's the difference",
+            "compare",
+            "comparison between",
+            "pros and cons",
+            "advantages of",
+            "disadvantages of",
+            "walk me through",
+            "walk us through",
+            "talk about",
+            "tell us about",
+            "share an example",
+            "give an example",
+            "describe a time",
+            "help me understand",
+            "clarify",
         ]
         self.fragment_continuations = [
             "and ",
@@ -404,6 +442,34 @@ class QuestionDetector:
             t = t[:-1].strip()
         return t
 
+    def _looks_like_question_intent(self, lower: str) -> bool:
+        lower = (lower or "").strip()
+        return (
+            any(lower.startswith(prefix) for prefix in self.question_prefixes)
+            or any(pattern in lower for pattern in self.question_patterns)
+            or any(lower.startswith(pattern) for pattern in self.intent_phrases)
+        )
+
+    def _question_clause_score(self, clause_text: str) -> float:
+        lower = (clause_text or "").lower().strip()
+        if not lower:
+            return 0.0
+        words = [w for w in re.split(r"\s+", re.sub(r"[^\w?']+", " ", lower)) if w]
+        score = float(len(words))
+        if lower.endswith("?"):
+            score += 2.0
+        if any(lower.startswith(prefix) for prefix in self.question_prefixes):
+            score += 2.5
+        if any(pattern in lower for pattern in self.question_patterns):
+            score += 2.0
+        if any(lower.startswith(pattern) for pattern in self.intent_phrases):
+            score += 2.0
+        if any(pattern in lower for pattern in self.coding_patterns):
+            score += 1.5
+        if re.search(r"\b(it|this|that|they|them)\b", lower):
+            score -= 1.5
+        return score
+
     def detect_interim_with_guardrails(self, text: str) -> Optional[str]:
         """Return a stable question clause from partial ASR, or None.
 
@@ -430,8 +496,7 @@ class QuestionDetector:
 
         has_signal = (
             candidate.strip().endswith("?")
-            or any(lower.startswith(prefix) for prefix in self.question_prefixes)
-            or any(pattern in lower for pattern in self.question_patterns)
+            or self._looks_like_question_intent(lower)
         )
         if self._interim_require_question_signal and not has_signal:
             return None
@@ -477,22 +542,26 @@ class QuestionDetector:
 
         def _looks_question_like(clause_text: str) -> bool:
             lower = clause_text.lower().strip()
-            return any(lower.startswith(p) for p in self.question_prefixes) or any(
-                pat in lower for pat in self.question_patterns
-            )
+            return self._looks_like_question_intent(lower)
 
         # Priority 1: If we have an explicit question mark anywhere, anchor to the last one.
         if "?" in raw:
-            # Find which clause contains the last question mark
-            for clause in reversed(clauses):
-                if "?" in clause:
-                    # Return this clause (already has ?)
-                    return clause.strip()
-            # Fallback: return last clause with ?
-            return clauses[-1].strip() + "?"
+            punctuated = [
+                part.strip()
+                for part in re.findall(r"[^.?!\n]+[?]", raw)
+                if part and part.strip()
+            ]
+            if punctuated:
+                return max(punctuated, key=self._question_clause_score).strip()
+            qidx = raw.rfind("?")
+            if qidx >= 0:
+                start = max(raw.rfind(sep, 0, qidx) for sep in [".", "!", "\n"])
+                candidate = raw[start + 1 : qidx + 1].strip()
+                if candidate:
+                    return candidate
 
         # Priority 2: No question mark - find best question-like clause
-        for clause in reversed(clauses):
+        for clause in clauses:
             if _looks_question_like(clause):
                 return clause.strip()
 
@@ -578,6 +647,8 @@ class QuestionDetector:
             
         if any(pattern in lower for pattern in self.question_patterns):
             score += 0.3
+        if any(lower.startswith(pattern) for pattern in self.intent_phrases):
+            score += 0.35
 
         # Context signals
         if (
@@ -628,8 +699,7 @@ class QuestionDetector:
 
         looks_question_like = (
             "?" in (query or "")
-            or any(text.startswith(prefix) for prefix in self.question_prefixes)
-            or any(pattern in text for pattern in self.question_patterns)
+            or self._looks_like_question_intent(text)
         )
         if not looks_question_like:
             return
@@ -652,6 +722,15 @@ class QuestionDetector:
         self._fragment_last_seen_at = 0.0
         if reason:
             logger.debug("QuestionDetector: Fragment buffer reset (%s)", reason)
+
+    def reset_turn_state(self, reason: str = "") -> None:
+        """Reset per-turn detector state so one utterance never contaminates the next."""
+        self.reset_fragment_buffer(reason or "turn-reset")
+        self._last_text = ""
+        self._last_trigger_time = 0.0
+        self._interim_last_key = ""
+        self._interim_first_seen_at = 0.0
+        self._interim_last_trigger_at = 0.0
 
     def _classify_trigger(self, text: str) -> str:
         """Classify the type of trigger."""
@@ -771,6 +850,8 @@ class QuestionDetector:
             score += 0.6 * weights["q"]
         if any(pattern in lower for pattern in self.question_patterns):
             score += 0.5 * weights["q"]
+        if any(lower.startswith(pattern) for pattern in self.intent_phrases):
+            score += 0.55 * weights["q"]
 
         # 2. Contextual Triggers
         if (

@@ -18,6 +18,34 @@ ACTION_WORDS = {
     "mean", "means", "work", "works", "help", "helps", "fix", "build",
     "create", "answer", "expand", "compare", "solve", "understand",
 }
+
+# ── Compiled regex constants for is_question_complete ─────────────────────────
+# Compiled once at import; reusing compiled objects avoids repeated re.compile
+# overhead on every transcription event.
+_RE_ACTION_STARTERS = re.compile(
+    r'^(explain|define|describe|tell|show|list|write|create|give|compare|contrast|'
+    r'what is|what are|what was|what were|what does|what do|'
+    r'how does|how do|how is|how are|how to|'
+    r'why does|why do|why is|why are|'
+    r'who is|who are|where is|where are|when is|when does)\b',
+    re.IGNORECASE,
+)
+_RE_QUESTION_STARTERS = re.compile(
+    r'^(what|who|where|when|why|how|which|can|could|would|should|tell|explain|'
+    r'describe|give|show|list|write|create|define|difference|advantages?|'
+    r'disadvantages?|benefits?|pros|cons)\b',
+    re.IGNORECASE,
+)
+_RE_WEAK_QUESTION_WORDS = re.compile(
+    r'^(is|are|do|does|did|have|has|will|shall|meaning)\b', re.IGNORECASE
+)
+_RE_ENDS_INCOMPLETE = re.compile(
+    r' (me|you|him|her|them|it|this|that|what|how|why|and|or|is|are|the|a|an|to|with|for|in|on|at|by|from)$',
+    re.IGNORECASE,
+)
+_RE_INTENT_PHRASES = re.compile(
+    r'^(tell|explain|describe|define|difference|advantage|disadvantage)', re.IGNORECASE
+)
 CONNECTOR_WORDS = {
     "and", "or", "but", "if", "then", "also", "because", "about", "with",
     "without", "from", "into", "onto", "over", "under", "between", "through",
@@ -214,7 +242,13 @@ def normalize_transcript(text: str) -> str:
 
 
 def is_likely_fragment(text: str) -> bool:
-    """Heuristic filter for low-information trailing scraps from speech ASR."""
+    """Heuristic filter for low-information trailing scraps from speech ASR.
+
+    Returns True only for scraps that are definitely NOT actionable questions:
+    - Continuations starting with connectors ("and", "or", "but"…)
+    - Very short utterances with no question signal AND no action verb
+    - Preposition-led phrases under 5 words
+    """
     if not text:
         return True
 
@@ -224,14 +258,28 @@ def is_likely_fragment(text: str) -> bool:
     if not words:
         return True
 
+    # Explicit question mark — never a fragment
     if trimmed.endswith("?"):
         return False
+
+    # Starts with a discourse-level connector — definitely trailing scrap
     if words[0] in CONTINUATION_STARTERS:
         return True
-    if len(words) <= 3 and not any(w in QUESTION_WORDS for w in words):
+
+    # Action / question word at the front gives intent — not a fragment
+    if words[0] in QUESTION_WORDS or words[0] in ACTION_WORDS:
+        return False
+
+    # Very short utterances with no semantic signal
+    if len(words) <= 3 and not any(
+        w in QUESTION_WORDS or w in ACTION_WORDS for w in words
+    ):
         return True
+
+    # Preposition-led short phrases ("about closures", "with async"…)
     if len(words) <= 5 and words[0] in {"for", "to", "with", "about"}:
         return True
+
     return False
 
 
@@ -242,47 +290,52 @@ def is_question_complete(text: str) -> bool:
         
     trimmed = text.strip()
     lower = trimmed.lower()
-    word_count = len(re.split(r'\s+', trimmed))
+    # Strip trailing punctuation noise (commas, semicolons) before word-counting
+    lower_clean = lower.rstrip(",;: ")
+    trimmed_clean = trimmed.rstrip(",;: ")
+    word_count = len(re.split(r'\s+', trimmed_clean.strip()))
     
     # 1. Explicit question mark - most reliable
     if trimmed.endswith('?'):
         return True
-        
-    # 2. Minimum length check
+
+    # 2a. Action/question word + at least one content word = complete command.
+    #     e.g. "explain memoization", "define closure", "describe promises"
+    #     Rule 3 already rejects bare verb stubs ("explain" alone).
+    if _RE_ACTION_STARTERS.match(lower_clean) and word_count >= 2:
+        return True
+
+    # 2. Minimum length check for non-action queries
     if word_count < 5:
         return False
-        
+
     # 3. Ignore common fragments under 3 words
-    if re.match(r'^(what is|tell me|explain|why do|how to|can you)$', lower):
+    if re.match(r'^(what is|tell me|explain|why do|how to|can you)$', lower_clean):
         return False
-        
+
     # 4. Multiple complete sentences (2+)
     sentences = len(re.findall(r'[.!?]+', trimmed))
     if sentences >= 2:
         return True
-        
+
     # 5. Single exclamation - only if followed by question intent
     if sentences == 1 and '?' in lower:
         return True
-        
+
     # 6. Key starter word + minimum word count
-    question_starters = re.compile(r'^(what|who|where|when|why|how|which|can|could|would|should|tell|explain|describe|give|show|list|write|create|define|difference|advantages?|disadvantages?|benefits?|pros|cons)\b', re.IGNORECASE)
-    if question_starters.match(lower) and word_count >= 5:
+    if _RE_QUESTION_STARTERS.match(lower_clean) and word_count >= 5:
         return True
-        
+
     # 7. Ends with weak word but has question marks elsewhere
-    weak_question_words = re.compile(r'^(is|are|do|does|did|have|has|will|shall|meaning)\b', re.IGNORECASE)
-    if weak_question_words.match(lower) and word_count >= 5 and '?' in lower:
+    if _RE_WEAK_QUESTION_WORDS.match(lower_clean) and word_count >= 5 and '?' in lower:
         return True
-        
+
     # 8. Avoid false positives: ends with common nouns/verbs without punctuation
-    ends_with_incomplete = re.compile(r' (me|you|him|her|them|it|this|that|what|how|why|and|or|is|are|the|a|an|to|with|for|in|on|at|by|from)$', re.IGNORECASE)
-    if ends_with_incomplete.search(lower):
+    if _RE_ENDS_INCOMPLETE.search(lower_clean):
         return False
-        
+
     # 9. Contains question intent phrases anywhere
-    intent_phrases = re.compile(r'^(tell|explain|describe|define|difference|advantage|disadvantage)', re.IGNORECASE)
-    if intent_phrases.match(lower) and word_count >= 5:
+    if _RE_INTENT_PHRASES.match(lower_clean) and word_count >= 5:
         return True
-        
+
     return False

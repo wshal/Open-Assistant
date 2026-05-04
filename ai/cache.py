@@ -41,6 +41,16 @@ warnings.filterwarnings("ignore", message="Cannot enable progress bars.*")
 logger = logging.getLogger(__name__)
 
 _WS_RE = re.compile(r"\s+")
+_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9.+#_-]*")
+_SEMANTIC_STOPWORDS: Set[str] = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "being", "been",
+    "what", "how", "why", "when", "where", "who", "whom", "which",
+    "do", "does", "did", "can", "could", "would", "should", "will",
+    "to", "for", "of", "in", "on", "at", "by", "with", "about", "between",
+    "me", "my", "your", "our", "their", "this", "that", "these", "those",
+    "please", "tell", "explain", "describe", "define", "difference", "vs",
+    "versus", "fix", "and", "or", "but", "i", "you", "we", "they",
+}
 
 # ---------------------------------------------------------------------------
 # Embedding persistence paths (inside data/cache/ — already gitignored)
@@ -135,6 +145,26 @@ def _norm_query(query: str) -> str:
     q = (query or "").strip().lower()
     q = _WS_RE.sub(" ", q)
     return q
+
+
+def _topic_tokens(query: str, *, limit: int = 3) -> List[str]:
+    tokens = _TOKEN_RE.findall(_norm_query(query))
+    picked: List[str] = []
+    seen: Set[str] = set()
+    for tok in tokens:
+        if tok in _SEMANTIC_STOPWORDS:
+            continue
+        if tok.isdigit():
+            continue
+        if len(tok) <= 2:
+            continue
+        if tok in seen:
+            continue
+        seen.add(tok)
+        picked.append(tok)
+        if len(picked) >= limit:
+            break
+    return picked
 
 
 def _is_simple_ascii(text: str) -> bool:
@@ -716,7 +746,7 @@ class ShortQueryCache:
         self._lru.append(key)
 
     def _get_semantic_signature(self, query: str) -> str:
-        """P2: Versioned semantic signature = Intent + sorted canonical entities."""
+        """P2: Versioned semantic signature = Intent + canonical entities or topic tokens."""
         lower = (query or "").lower().strip()
 
         # 1. Detect intent using compiled word-boundary patterns
@@ -734,8 +764,14 @@ class ShortQueryCache:
                     found_entities.add(canonical)
                     break
 
-        # 3. Build versioned signature — no trailing colon when no entities
+        # 3. Build versioned signature.
         if found_entities:
             entity_str = ":".join(sorted(found_entities))
-            return f"v1:{intent}:{entity_str}"
-        return f"v1:{intent}"
+            return f"v2:{intent}:{entity_str}"
+
+        # Fallback topic tokens prevent all generic "what is ..." questions from
+        # collapsing into the same Tier-2 bucket when no canonical entities match.
+        topics = _topic_tokens(query)
+        if topics:
+            return f"v2:{intent}:{':'.join(topics)}"
+        return f"v2:{intent}"

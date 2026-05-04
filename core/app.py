@@ -38,6 +38,7 @@ from ai.memory import LongTermMemory
 from ai.context import ContextBuilder, ContextPruner
 from ai.prefetch import PredictivePrefetcher
 from ai.actions import ActionExecutor
+from ai.live_session import LiveSessionManager
 
 logger = setup_logger(__name__)
 
@@ -81,9 +82,16 @@ class OpenAssistApp(QObject):
         )
         # P3.3: Actionable queries executor
         self.actions = ActionExecutor(config)
+        self.live_session = LiveSessionManager(config)
 
         self.session_active = False
         self._last_query = ""
+        self._current_session_id = None
+        self._session_start_time = None
+        self._current_response_start_time = None
+        self._current_turn_id = None
+        self._response_chunk_count = 0
+        self._response_first_chunk_logged = False
         self._last_query_time = 0.0
         self._click_through = False
         self._generation_epoch = 0
@@ -95,6 +103,19 @@ class OpenAssistApp(QObject):
         # switch (True) or typed/loaded manually (False). Auto-suggested context
         # can be silently replaced when the mode changes; manual context cannot.
         self._context_auto_suggested: bool = False
+        self._live_mode_active = False
+        self._last_live_transcript = ""
+        self._live_mode_reconnecting = False
+        self._live_fallback_active = False
+        self._live_turn_pending = False
+        self._pending_live_query = ""
+        self._live_turn_timer = QTimer(self)
+        self._live_turn_timer.setSingleShot(True)
+        self._live_turn_timer.timeout.connect(self._on_live_turn_timeout)
+        self._last_final_transcript_norm = ""
+        self._last_final_transcript_at = 0.0
+        self._pending_incomplete_audio_query = ""
+        self._pending_incomplete_audio_at = 0.0
 
         # Async Loop
         self.loop = asyncio.new_event_loop()
@@ -155,6 +176,7 @@ class OpenAssistApp(QObject):
     def _wire_signals(self):
         self.overlay.user_query.connect(self.generate_response)
         self.mini_overlay.user_query.connect(self.generate_response)
+        self.ai.response_chunk.connect(self._on_response_chunk_trace)
         self.ai.response_chunk.connect(lambda c: self.overlay.append_response(c))
         self.ai.response_chunk.connect(lambda c: self.mini_overlay.append_response(c))
         if hasattr(self.ai, "background_complete"):
@@ -174,6 +196,10 @@ class OpenAssistApp(QObject):
         self.audio.transcription_ready.connect(self._on_transcription)
         if hasattr(self.audio, "interim_transcription_ready"):
             self.audio.interim_transcription_ready.connect(self._on_interim_transcription)
+        if hasattr(self.audio, "live_audio_chunk"):
+            self.audio.live_audio_chunk.connect(self._on_live_audio_chunk)
+        if hasattr(self.audio, "live_audio_turn_end"):
+            self.audio.live_audio_turn_end.connect(self._on_live_audio_turn_end)
         self.screen.text_captured.connect(self._on_screen_text)
         self.warmup_status_update.connect(self.overlay.update_warmup_status)
         self.warmup_status_update.connect(self.mini_overlay.update_warmup_status)
@@ -186,8 +212,35 @@ class OpenAssistApp(QObject):
         self.ai.response_complete.connect(self._on_response_complete)
         self.ai.error_occurred.connect(self._on_ai_error)
         self.state.stealth_changed.connect(lambda _: self._apply_ui_only())
+        self.live_session.turn_complete.connect(self._on_live_turn_complete)
+        self.live_session.turn_empty.connect(self._on_live_turn_empty)
+        self.live_session.transcript_update.connect(self._on_live_transcript_update)
+        self.live_session.status_changed.connect(self._on_live_status_changed)
+        self.live_session.error_occurred.connect(self._on_live_error)
 
     def _on_response_complete(self, full_text: str):
+        """Mark when response generation completes and is ready to display."""
+        session_id = getattr(self, "_current_session_id", "unknown_session")
+        now = time.time()
+        elapsed_ms = (now - getattr(self, "_session_start_time", now)) * 1000
+        response_started_at = getattr(self, "_current_response_start_time", None)
+        response_duration = (
+            max(0.0, (now - response_started_at) * 1000)
+            if response_started_at is not None
+            else 0.0
+        )
+        
+        logger.info(
+            f"[{session_id}] ✅ RESPONSE COMPLETE | total_elapsed={elapsed_ms:.1f}ms | response_generation={response_duration:.1f}ms | text_len={len(full_text)}"
+        )
+        logger.info(
+            "[%s] RESPONSE TRACE COMPLETE | turn=%s | chunks=%d | total_elapsed=%.1fms | response_generation=%.1fms",
+            session_id,
+            getattr(self, "_current_turn_id", "unknown_turn"),
+            int(getattr(self, "_response_chunk_count", 0)),
+            elapsed_ms,
+            response_duration,
+        )
         """Update overlay status bar with latency after each response.
         GAP 5: also passes cache_tier + provider to on_complete for the source badge.
         """
@@ -254,6 +307,11 @@ class OpenAssistApp(QObject):
                     )
                 if summary_parts:
                     logger.info("Latency summary | %s", " | ".join(summary_parts))
+            self._log_turn_waterfall_summary(
+                provider=provider,
+                request_metadata=req_meta,
+                stage_timings=stage_timings,
+            )
 
         # Get available providers
         available = []
@@ -325,13 +383,96 @@ class OpenAssistApp(QObject):
                 )
             else:
                 self.overlay.update_transcript("Ready...", state="idle")
+        self._reset_turn_local_state("response-complete")
         
         # P1.2: Sync history UI after response completes to update navigation state
         self._sync_history_ui()
 
+    def _log_turn_waterfall_summary(self, provider=None, request_metadata=None, stage_timings=None) -> None:
+        """Emit one compact per-turn latency line for quick log scanning."""
+        req_meta = request_metadata or {}
+        st = stage_timings or {}
+        if not req_meta and not st:
+            return
+
+        speech_ms = req_meta.get("audio_duration_ms")
+        asr_ms = req_meta.get("transcribe_only_ms")
+        request_to_first_ms = st.get("request_to_first_token_ms")
+        request_to_complete_ms = st.get("request_to_complete_ms")
+        stream_ms = None
+        if request_to_first_ms is not None and request_to_complete_ms is not None:
+            stream_ms = max(0.0, request_to_complete_ms - request_to_first_ms)
+
+        total_ms = req_meta.get("speech_to_transcript_ms")
+        if total_ms is not None and request_to_complete_ms is not None:
+            total_ms = total_ms + request_to_complete_ms
+        elif request_to_complete_ms is not None:
+            total_ms = request_to_complete_ms
+
+        parts = []
+        if speech_ms is not None:
+            parts.append(f"speech={speech_ms:.0f}ms")
+        if asr_ms is not None:
+            parts.append(f"asr={asr_ms:.0f}ms")
+        if request_to_first_ms is not None:
+            parts.append(f"llm_ttfb={request_to_first_ms:.0f}ms")
+        if stream_ms is not None:
+            parts.append(f"stream={stream_ms:.0f}ms")
+        elif request_to_complete_ms is not None:
+            parts.append(f"llm={request_to_complete_ms:.0f}ms")
+        if total_ms is not None:
+            parts.append(f"total={total_ms:.0f}ms")
+
+        extras = []
+        utterance_id = req_meta.get("utterance_id") or getattr(self, "_current_turn_id", "") or ""
+        if utterance_id:
+            extras.append(f"utterance={utterance_id}")
+        turn_id = getattr(self, "_current_turn_id", "") or req_meta.get("turn_id", "")
+        if turn_id and turn_id != utterance_id:
+            extras.append(f"turn={turn_id}")
+        vad_backend = req_meta.get("vad_backend")
+        if vad_backend:
+            extras.append(f"vad={vad_backend}")
+        chunks = req_meta.get("chunks")
+        if chunks is not None:
+            extras.append(f"chunks={chunks}")
+        if provider:
+            extras.append(f"provider={provider}")
+
+        if not parts:
+            return
+        if extras:
+            parts.extend(extras)
+
+        logger.info("WATERFALL SUMMARY | %s", " | ".join(parts))
+
+    def _on_response_chunk_trace(self, chunk: str) -> None:
+        if not chunk:
+            return
+        self._response_chunk_count = int(getattr(self, "_response_chunk_count", 0)) + 1
+        if getattr(self, "_response_first_chunk_logged", False):
+            return
+        self._response_first_chunk_logged = True
+        session_id = getattr(self, "_current_session_id", "unknown_session")
+        elapsed_ms = (time.time() - getattr(self, "_session_start_time", time.time())) * 1000
+        response_elapsed_ms = (
+            (time.time() - getattr(self, "_current_response_start_time", time.time())) * 1000
+            if getattr(self, "_current_response_start_time", None)
+            else 0.0
+        )
+        logger.info(
+            "[%s] FIRST RESPONSE CHUNK | turn=%s | total_elapsed=%.1fms | response_elapsed=%.1fms | chunk='%s'",
+            session_id,
+            getattr(self, "_current_turn_id", "unknown_turn"),
+            elapsed_ms,
+            response_elapsed_ms,
+            chunk[:60],
+        )
+
     def _on_ai_error(self, error_text: str):
         if hasattr(self.ai, "_current_gen_kwargs"):
             self.ai._current_gen_kwargs = None
+        self._reset_turn_local_state("ai-error")
         
         if self._screen_analysis_pending:
             self.overlay.update_transcript("Screen captured, but analysis failed.")
@@ -350,6 +491,316 @@ class OpenAssistApp(QObject):
             # Trim long stack traces to a readable one-liner
             short = error_text.split("\n")[0][:120]
             self.overlay.show_error_toast(short)
+
+    def _reset_turn_local_state(self, reason: str = "") -> None:
+        """Reset per-turn query/audio state so later utterances start clean."""
+        self._last_query = ""
+        self._last_query_time = 0.0
+        self._pending_request_metadata = None
+        self._current_turn_id = None
+        self._current_response_start_time = None
+        self._response_chunk_count = 0
+        self._response_first_chunk_logged = False
+        self._last_final_transcript_norm = ""
+        self._last_final_transcript_at = 0.0
+        self._pending_incomplete_audio_query = ""
+        self._pending_incomplete_audio_at = 0.0
+        detector = getattr(getattr(self, "ai", None), "detector", None)
+        if detector and hasattr(detector, "reset_turn_state"):
+            detector.reset_turn_state(reason or "turn-reset")
+        elif detector and hasattr(detector, "reset_fragment_buffer"):
+            detector.reset_fragment_buffer(reason or "turn-reset")
+
+    def _live_mode_requested(self) -> bool:
+        return bool(self.config.get("ai.live_mode.enabled", False))
+
+    def _live_mode_connected(self) -> bool:
+        return bool(getattr(self.live_session, "is_connected", False))
+
+    def _live_audio_passthrough_enabled(self) -> bool:
+        return bool(
+            self._live_mode_requested()
+            and self._live_mode_connected()
+        )
+
+    def _live_turn_owns_audio(self) -> bool:
+        return bool(
+            self._live_mode_requested()
+            and (
+                self._live_mode_connected()
+                or getattr(self, "_live_turn_pending", False)
+            )
+        )
+
+    def _start_live_mode(self) -> None:
+        if not self._live_mode_requested():
+            self._live_mode_active = False
+            self._live_mode_reconnecting = False
+            self._live_fallback_active = False
+            self._live_turn_pending = False
+            self._pending_live_query = ""
+            self._live_turn_timer.stop()
+            if hasattr(self.audio, "set_standard_transcription_suspended"):
+                self.audio.set_standard_transcription_suspended(False, "live-disabled")
+            return
+        mode_obj = self.modes.current if hasattr(self, "modes") else None
+        session_context = getattr(self.state, "session_context", "") or ""
+        started = self.live_session.start(self.loop, mode=mode_obj, session_context=session_context)
+        self._live_mode_active = False
+        self._live_mode_reconnecting = False
+        self._live_fallback_active = not bool(started)
+        self._live_turn_pending = False
+        self._pending_live_query = ""
+        self._live_turn_timer.stop()
+        if hasattr(self.overlay, "update_live_mode_state"):
+            self.overlay.update_live_mode_state(
+                self._live_mode_requested(),
+                self._live_mode_connected(),
+                reconnecting=False,
+                fallback=self._live_fallback_active,
+            )
+        if started:
+            self.overlay.update_transcript("Connecting live audio...", state="processing")
+        else:
+            self.overlay.update_transcript(
+                "Live unavailable — using standard audio pipeline.",
+                state="error",
+            )
+
+    def _stop_live_mode(self) -> None:
+        self._live_mode_active = False
+        self._live_mode_reconnecting = False
+        self._live_fallback_active = False
+        # Capture any queued transcript before clearing state so we can
+        # route it through standard mode if nothing else will handle it.
+        leftover_query = (
+            (self._pending_live_query or self._last_live_transcript or "").strip()
+            if not self._live_turn_pending
+            else ""
+        )
+        self._last_live_transcript = ""
+        self._live_turn_pending = False
+        self._pending_live_query = ""
+        timer = getattr(self, "_live_turn_timer", None)
+        if timer is not None:
+            timer.stop()
+        # Resume ASR immediately so standard pipeline is ready before any forwarded query.
+        if hasattr(self.audio, "set_standard_transcription_suspended"):
+            self.audio.set_standard_transcription_suspended(False, "live-stopped")
+        if hasattr(self, "live_session"):
+            self.live_session.stop()
+        # If live had an un-answered query when it was stopped, answer it now
+        # via standard mode so the user gets a fast response.
+        if leftover_query and getattr(self, "session_active", False):
+            logger.info("Live-stop: routing leftover query to standard mode: '%s'", leftover_query[:60])
+            self.generate_response(leftover_query, "speech", {"audio": leftover_query})
+
+    def toggle_live_mode(self) -> None:
+        new_state = not self._live_mode_requested()
+        self.config.set("ai.live_mode.enabled", new_state)
+        try:
+            if hasattr(self.config, "save"):
+                self.config.save()
+        except Exception:
+            pass
+        if getattr(self, "session_active", False):
+            if new_state:
+                self._start_live_mode()
+            else:
+                self._promote_live_turn_to_standard("manual-live-off")
+                self._stop_live_mode()
+                self.overlay.update_transcript(
+                    "Live mode disabled — using standard audio pipeline.",
+                    state="idle",
+                )
+        if hasattr(self, "overlay") and hasattr(self.overlay, "update_live_mode_state"):
+            self.overlay.update_live_mode_state(
+                new_state,
+                self._live_mode_connected(),
+                reconnecting=self._live_mode_reconnecting,
+                fallback=self._live_fallback_active,
+            )
+        if hasattr(self, "overlay") and hasattr(self.overlay, "refresh_standby_state"):
+            self.overlay.refresh_standby_state()
+
+    def _on_live_audio_chunk(self, pcm_bytes: bytes, sample_rate: int) -> None:
+        if not self._live_audio_passthrough_enabled():
+            return
+        self.live_session.send_audio_chunk(pcm_bytes, sample_rate)
+
+    def _on_live_audio_turn_end(self) -> None:
+        if not self._live_audio_passthrough_enabled():
+            return
+        self._live_turn_pending = True
+        self._pending_live_query = (self._last_live_transcript or "").strip()
+        self._live_turn_timer.start(9000)
+        self.live_session.end_audio_turn()
+
+    def _promote_live_turn_to_standard(self, reason: str) -> None:
+        if not getattr(self, "session_active", False):
+            return
+        if not self._live_turn_pending:
+            return
+        query = (self._pending_live_query or self._last_live_transcript or "").strip()
+        self._live_turn_pending = False
+        self._pending_live_query = ""
+        self._last_live_transcript = ""
+        self._live_turn_timer.stop()
+        self._live_fallback_active = True
+        logger.info("Promoting pending live turn to standard mode (%s)", reason)
+        if hasattr(self.overlay, "update_live_mode_state"):
+            self.overlay.update_live_mode_state(
+                self._live_mode_requested(),
+                self._live_mode_connected(),
+                reconnecting=self._live_mode_reconnecting,
+                fallback=True,
+            )
+        if query:
+            self.generate_response(query, "speech", {"audio": query})
+
+    def _on_live_transcript_update(self, text: str) -> None:
+        if not self._live_mode_requested():
+            return
+        if not text:
+            return
+        self._last_live_transcript = text
+        if self._live_turn_pending:
+            self._pending_live_query = text
+        self.overlay.update_transcript(text, state="listening")
+
+    def _on_live_status_changed(self, status: str) -> None:
+        if not getattr(self, "session_active", False):
+            return
+        if not self._live_mode_requested():
+            self._live_mode_active = False
+            self._live_mode_reconnecting = False
+            self._live_fallback_active = False
+            self._live_turn_pending = False
+            self._pending_live_query = ""
+            self._live_turn_timer.stop()
+            if hasattr(self.overlay, "update_live_mode_state"):
+                self.overlay.update_live_mode_state(False, False, reconnecting=False, fallback=False)
+            return
+        status_text = (status or "").lower()
+        self._live_mode_active = any(
+            token in status_text for token in ("connected", "listening", "responding")
+        )
+        self._live_mode_reconnecting = "reconnecting" in status_text
+        # Un-suspend ASR BEFORE promoting any pending turn so the standard
+        # pipeline can immediately accept the forwarded transcript.
+        if "reconnecting" in status_text or "offline" in status_text:
+            if hasattr(self.audio, "set_standard_transcription_suspended"):
+                self.audio.set_standard_transcription_suspended(False, status_text or "live-fallback")
+            self._promote_live_turn_to_standard(status_text)
+        else:
+            if hasattr(self.audio, "set_standard_transcription_suspended"):
+                self.audio.set_standard_transcription_suspended(
+                    self._live_turn_owns_audio(),
+                    status_text or "live-status",
+                )
+        if self._live_mode_active:
+            self._live_fallback_active = False
+        if hasattr(self.overlay, "update_live_mode_state"):
+            self.overlay.update_live_mode_state(
+                self._live_mode_requested(),
+                self._live_mode_connected(),
+                reconnecting=self._live_mode_reconnecting,
+                fallback=self._live_fallback_active,
+            )
+        if status:
+            if "listening" in status_text or "connected" in status_text:
+                state = "listening"
+            elif "offline" in status_text:
+                state = "idle"
+            else:
+                state = "processing"
+            self.overlay.update_transcript(status, state=state)
+
+    def _on_live_error(self, message: str) -> None:
+        self._live_mode_active = False
+        self._live_mode_reconnecting = False
+        # Resume standard ASR FIRST so the forwarded query can be dispatched immediately.
+        if hasattr(self.audio, "set_standard_transcription_suspended"):
+            self.audio.set_standard_transcription_suspended(False, "live-error")
+        self._promote_live_turn_to_standard("live-error")
+        self._live_fallback_active = True
+        self._live_turn_pending = False
+        self._pending_live_query = ""
+        self._live_turn_timer.stop()
+        if hasattr(self.overlay, "update_live_mode_state"):
+            self.overlay.update_live_mode_state(
+                self._live_mode_requested(),
+                False,
+                reconnecting=False,
+                fallback=True,
+            )
+        if getattr(self, "session_active", False):
+            self.overlay.update_transcript("Live mode offline — using standard audio pipeline.", state="error")
+        if hasattr(self.overlay, "show_error_toast"):
+            self.overlay.show_error_toast(message.split("\n")[0][:120])
+
+    def _on_live_turn_complete(self, full_text: str) -> None:
+        if not getattr(self, "session_active", False):
+            return
+        if not self._live_mode_requested():
+            return
+        if not self._live_turn_pending and self._live_fallback_active:
+            logger.info("Ignoring stale live response after standard fallback took over")
+            return
+        query = (self._pending_live_query or self._last_live_transcript or "Live audio").strip()
+        self._live_turn_pending = False
+        self._pending_live_query = ""
+        self._last_live_transcript = ""
+        self._live_turn_timer.stop()
+        mode = self.config.get("ai.mode", "general")
+        self.history.add(
+            query,
+            full_text,
+            provider="gemini-live",
+            mode=mode,
+            latency=0.0,
+            metadata={"live_mode": True},
+        )
+        self.overlay.on_complete(
+            full_text,
+            query=query,
+            provider="gemini-live",
+        )
+        self.mini_overlay.on_complete(full_text, query=query)
+        self.overlay.update_transcript("Live Listening...", state="listening")
+        self._live_mode_reconnecting = False
+        self._live_fallback_active = False
+        if hasattr(self.overlay, "update_live_mode_state"):
+            self.overlay.update_live_mode_state(
+                self._live_mode_requested(),
+                self._live_mode_connected(),
+                reconnecting=False,
+                fallback=False,
+            )
+        self._sync_history_ui()
+
+    def _on_live_turn_empty(self) -> None:
+        if not getattr(self, "session_active", False):
+            return
+        if not self._live_mode_requested():
+            return
+        self.overlay.update_transcript(
+            "Live returned no visible text — answering via standard mode.",
+            state="error",
+        )
+        self._promote_live_turn_to_standard("live-turn-empty")
+
+    def _on_live_turn_timeout(self) -> None:
+        if not getattr(self, "session_active", False):
+            return
+        if not self._live_turn_pending:
+            return
+        self._live_mode_reconnecting = bool(getattr(self, "_live_mode_reconnecting", False))
+        self.overlay.update_transcript(
+            "Live response timed out — answering via standard mode.",
+            state="error",
+        )
+        self._promote_live_turn_to_standard("live-turn-timeout")
 
     def _on_audio_source_ui_change(self, source):
         self.state.audio_source = source
@@ -638,6 +1089,13 @@ class OpenAssistApp(QObject):
             and q == self._last_query
             and (now - self._last_query_time) < 3.0
         ):
+            logger.info(
+                "[%s] REQUEST DEBOUNCED | origin=%s | query='%s' | since_last=%.1fms",
+                getattr(self, "_current_session_id", "unknown_session"),
+                s,
+                q[:80],
+                (now - self._last_query_time) * 1000.0,
+            )
             logger.debug(f"AI: Debouncing duplicate query: {q[:50]}...")
             return
 
@@ -712,9 +1170,29 @@ class OpenAssistApp(QObject):
         # Start timing for instrumentation
         self._current_request_start = time.time()
         self._stage_timings = {"start": self._current_request_start}
+        self._current_response_start_time = self._current_request_start
         request_metadata = dict(self._pending_request_metadata or {})
         request_metadata.setdefault("request_started_at", self._current_request_start)
         request_metadata.setdefault("origin", s)
+        if not request_metadata.get("turn_id"):
+            if s == "speech" and request_metadata.get("utterance_id"):
+                request_metadata["turn_id"] = str(request_metadata.get("utterance_id"))
+            else:
+                request_metadata["turn_id"] = (
+                    f"{getattr(self, '_current_session_id', 'session')}:"
+                    f"{s}_{int(self._current_request_start * 1000) % 100000}"
+                )
+        self._current_turn_id = request_metadata.get("turn_id")
+        self._response_chunk_count = 0
+        self._response_first_chunk_logged = False
+        logger.info(
+            "[%s] REQUEST QUEUED | turn=%s | origin=%s | elapsed=%.1fms | query='%s'",
+            getattr(self, "_current_session_id", "unknown_session"),
+            self._current_turn_id,
+            s,
+            (self._current_request_start - getattr(self, "_session_start_time", self._current_request_start)) * 1000.0,
+            q[:80],
+        )
         # P2: Attach detector hints for routing/logging even in General mode.
         try:
             det = getattr(getattr(self, "ai", None), "detector", None)
@@ -737,6 +1215,15 @@ class OpenAssistApp(QObject):
         async with self._ai_lock:
             if request_epoch != self._generation_epoch:
                 return
+            session_id = getattr(self, "_current_session_id", "unknown_session")
+            turn_id = (request_metadata or {}).get("turn_id", getattr(self, "_current_turn_id", "unknown_turn"))
+            logger.info(
+                "[%s] REQUEST PROCESS START | turn=%s | origin=%s | epoch=%s",
+                session_id,
+                turn_id,
+                s,
+                request_epoch,
+            )
             self._last_query = q
             # Q10: Parallel screen capture + audio transcript when both need live fetch
             if c:
@@ -846,6 +1333,15 @@ class OpenAssistApp(QObject):
             snapshot = self.nexus.get_snapshot()
             if request_epoch != self._generation_epoch:
                 return
+            logger.info(
+                "[%s] AI DISPATCH | turn=%s | screen_len=%d | audio_len=%d | screen_hash=%s | window_id=%s",
+                session_id,
+                turn_id,
+                len(sc or ""),
+                len(au or ""),
+                (sc_hash[:8] if sc_hash else ""),
+                window_id,
+            )
             await self.ai.generate_response(
                 q,
                 snapshot,
@@ -930,6 +1426,7 @@ class OpenAssistApp(QObject):
                 self.ai.cancel()
             except Exception:
                 pass
+        self._reset_turn_local_state("cancel-generation")
         if getattr(self, "session_active", False):
             self.overlay.update_transcript("Cancelled â€” Listening...", state="listening")
         else:
@@ -1208,6 +1705,15 @@ class OpenAssistApp(QObject):
             if standby and hasattr(standby, "show_context_chip"):
                 standby.show_context_chip(None)
 
+        live_requested = bool(self.config.get("ai.live_mode.enabled", False))
+        stop_live = getattr(self, "_stop_live_mode", None)
+        start_live = getattr(self, "_start_live_mode", None)
+        if getattr(self, "session_active", False) and live_requested:
+            if callable(stop_live):
+                stop_live()
+            if callable(start_live):
+                start_live()
+
     def toggle_audio(self):
         muted = self.audio.toggle()
         self.state.is_muted = muted
@@ -1298,6 +1804,9 @@ class OpenAssistApp(QObject):
         self.is_running = False
         self.session_active = False
         self._screen_analysis_pending = False
+        stop_live = getattr(self, "_stop_live_mode", None)
+        if callable(stop_live):
+            stop_live()
 
         if hasattr(self, "_nexus_timer"):
             self._nexus_timer.stop()
@@ -1382,21 +1891,44 @@ class OpenAssistApp(QObject):
 
     def start_new_session(self):
         """Start a clean session: wipe all previous content and begin fresh."""
+        session_start_time = time.time()
         self._generation_epoch += 1
+        self._session_start_time = session_start_time
+        session_id = f"session_{self._generation_epoch}_{int(session_start_time*1000)%100000}"
+        self._current_session_id = session_id
+        
+        logger.info(
+            f"[{session_id}] 🚀 SESSION START | epoch={self._generation_epoch} | time={session_start_time:.3f}"
+        )
+        if hasattr(self.audio, "set_trace_context"):
+            self.audio.set_trace_context(session_id, session_start_time)
+        if hasattr(self.ai, "reset_session_failures"):
+            self.ai.reset_session_failures()
+
         self.ai.cancel()
         self.nexus.clear()
         self.history.start_new_session()
         self.state.is_muted = False
         self._screen_analysis_pending = False
         self.audio.clear()
-        self._last_query = ""
+        audio_ready = True
+        if hasattr(self.audio, "ensure_session_ready"):
+            audio_start = time.time()
+            audio_ready = bool(self.audio.ensure_session_ready())
+            audio_elapsed = (time.time() - audio_start) * 1000
+            logger.info(
+                f"[{session_id}] 🎤 Audio ready check | ready={audio_ready} | elapsed={audio_elapsed:.1f}ms"
+            )
+        elif hasattr(self.audio, "start"):
+            self.audio.start()
+        self._reset_turn_local_state("start-session")
         self.session_active = True
         self.state.is_capturing = True
 
         # P2.1: Reset ContextBuilder so entity tracking starts fresh
         if hasattr(self, "context_builder"):
             self.context_builder.reset()
-            logger.info("[P2.1] ContextBuilder reset for new session")
+            logger.info(f"[{session_id}] [P2.1] ContextBuilder reset for new session")
 
         # P2.4: Log memory store size at session start
         if hasattr(self, "memory") and self.memory.is_ready():
@@ -1420,7 +1952,13 @@ class OpenAssistApp(QObject):
             self.overlay.stack.setCurrentWidget(self.overlay.chat_view)
 
         self.overlay.on_complete("", "")
-        self.overlay.update_transcript("Listening for context...")
+        if audio_ready:
+            self.overlay.update_transcript("Listening for context...")
+        else:
+            self.overlay.update_transcript(
+                "Audio capture unavailable. Check audio source/settings.",
+                state="error",
+            )
         if hasattr(self.overlay, "set_analysis_provider_badge"):
             self.overlay.set_analysis_provider_badge()
         start_session_ui = getattr(self.overlay, "start_session_ui", None)
@@ -1431,6 +1969,21 @@ class OpenAssistApp(QObject):
         m = self.config.get("ai.mode", "general")
         self.overlay.update_mode(m)
         self.mini_overlay.update_mode(m)
+        live_requested = bool(self.config.get("ai.live_mode.enabled", False))
+        live_connected_fn = getattr(self, "_live_mode_connected", None)
+        live_connected = bool(callable(live_connected_fn) and live_connected_fn())
+        live_reconnecting = bool(getattr(self, "_live_mode_reconnecting", False))
+        live_fallback = bool(getattr(self, "_live_fallback_active", False))
+        if hasattr(self.overlay, "update_live_mode_state"):
+            self.overlay.update_live_mode_state(
+                live_requested,
+                live_connected,
+                reconnecting=live_reconnecting,
+                fallback=live_fallback,
+            )
+        start_live = getattr(self, "_start_live_mode", None)
+        if callable(start_live):
+            start_live()
         # P2.10: Pin-to-top is only needed during an active session
         if hasattr(self, "_topmost_timer"):
             self._topmost_timer.start(1500)
@@ -1441,12 +1994,20 @@ class OpenAssistApp(QObject):
         self._generation_epoch += 1
         self.ai.cancel()
         self._screen_analysis_pending = False
+        last_entries = []
+        if hasattr(self, "history") and hasattr(self.history, "get_last"):
+            try:
+                last_entries = self.history.get_last(1)
+            except Exception:
+                last_entries = []
+        stop_live = getattr(self, "_stop_live_mode", None)
+        if callable(stop_live):
+            stop_live()
         self.session_active = False
         self.state.is_capturing = False
         self.state.target_window_id = None
         self.nexus.clear()
-        self.audio.clear()
-        self._last_query = ""
+        self._reset_turn_local_state("end-session")
 
         # P0.5: Reset auto-suggest flag so next session can freely pick presets
         self._context_auto_suggested = False
@@ -1458,7 +2019,6 @@ class OpenAssistApp(QObject):
 
         # P2.4: Persist the last AI exchange to long-term memory
         if hasattr(self, "memory"):
-            last_entries = self.history.get_last(1)
             if last_entries:
                 e = last_entries[0]
                 q = getattr(e, "query", "") or ""
@@ -1503,6 +2063,14 @@ class OpenAssistApp(QObject):
             end_session_ui()
         self.overlay.update_transcript("Ready...")
         self.overlay.on_complete("", "")
+        live_requested = bool(self.config.get("ai.live_mode.enabled", False))
+        if hasattr(self.overlay, "update_live_mode_state"):
+            self.overlay.update_live_mode_state(
+                live_requested,
+                False,
+                reconnecting=False,
+                fallback=False,
+            )
         if hasattr(self.overlay, "set_analysis_provider_badge"):
             self.overlay.set_analysis_provider_badge()
 
@@ -1563,35 +2131,72 @@ class OpenAssistApp(QObject):
         if not self.session_active or not t:
             return
 
+        session_id = getattr(self, "_current_session_id", "unknown_session")
+        elapsed_ms = (time.time() - getattr(self, "_session_start_time", time.time())) * 1000
+        
         # Phase 1: Smart Transcription Repair
         from utils.text_utils import is_question_complete, normalize_transcript
         t = normalize_transcript(t)
         if not t:
             return
+        normalized_final = " ".join(t.lower().split())
+        now = time.time()
+        if (
+            getattr(self.audio, "capture_mode", "") == "system"
+            and normalized_final
+            and normalized_final == getattr(self, "_last_final_transcript_norm", "")
+            and (now - getattr(self, "_last_final_transcript_at", 0.0)) < 4.0
+        ):
+            logger.info(
+                f"[{session_id}] Ignoring duplicate final transcript from system audio: '{t[:60]}'"
+            )
+            return
+        self._last_final_transcript_norm = normalized_final
+        self._last_final_transcript_at = now
+
+        logger.info(
+            f"[{session_id}] 📝 FINAL TRANSCRIPT RECEIVED | elapsed={elapsed_ms:.1f}ms | text='{t[:60]}'"
+        )
+        
+        transcription_metrics = self.audio.get_last_transcription_metrics()
+        if transcription_metrics:
+            vad_backend = transcription_metrics.get("vad_backend", "unknown")
+            audio_duration = transcription_metrics.get("audio_duration_ms", 0)
+            logger.info(
+                f"[{session_id}] 🎙️  Audio metrics | vad={vad_backend} | duration={audio_duration:.0f}ms"
+            )
 
         if self._should_ignore_final_transcript(t):
-            logger.info("Audio: Ignoring short final transcript fragment: %r", t)
-            if hasattr(self.ai, "detector") and hasattr(self.ai.detector, "reset_fragment_buffer"):
-                self.ai.detector.reset_fragment_buffer("ignored-final-fragment")
+            logger.info(f"[{session_id}] 🚫 Ignoring short final transcript fragment: {t!r}")
+            detector = getattr(getattr(self, "ai", None), "detector", None)
+            if detector and hasattr(detector, "reset_turn_state"):
+                detector.reset_turn_state("ignored-final-fragment")
+            elif detector and hasattr(detector, "reset_fragment_buffer"):
+                detector.reset_fragment_buffer("ignored-final-fragment")
             return
 
         self.nexus.push("audio", t)
+
+        if self._live_turn_owns_audio():
+            logger.info(f"[{session_id}] 🎙️ Live mode active — final transcript kept for context only")
+            return
+
+        t = self._carry_forward_incomplete_audio_query(t)
+
         self.overlay.update_transcript(t)
-        transcription_metrics = self.audio.get_last_transcription_metrics()
+        request_metadata = None
         if transcription_metrics:
             speech_to_transcript_ms = transcription_metrics.get("speech_to_transcript_ms")
             transcribe_only_ms = transcription_metrics.get("transcribe_only_ms")
             if speech_to_transcript_ms is not None:
                 logger.info(
-                    "Latency audio->transcript | speech->transcript=%.0fms | transcribe=%.0fms | audio=%.0fms",
-                    speech_to_transcript_ms,
-                    transcribe_only_ms or 0.0,
-                    transcription_metrics.get("audio_duration_ms") or 0.0,
+                    f"[{session_id}] ⏱️  Transcription latency | speech→transcript={speech_to_transcript_ms:.0f}ms | transcribe_only={transcribe_only_ms or 0:.0f}ms"
                 )
-            self._pending_request_metadata = {
+            request_metadata = {
                 **transcription_metrics,
                 "transcript_received_at": time.time(),
             }
+
 
         # ── Background RAG Prefetch ───────────────────────────────────────────
         # Fire-and-forget: build RAG context from latest audio while user is
@@ -1607,19 +2212,53 @@ class OpenAssistApp(QObject):
             )
 
         q = self.ai.detector.detect_with_confidence(t, source="audio")
-        logger.info(f"🎙️ Transcribed: '{t}'")
+        logger.info(f"[{session_id}] 🎙️ Transcribed: '{t}'")
         if q.triggered:
             # Phase 1: Strict Gating for Ultra-Low Latency Auto-Response
             can_auto = q.should_auto_respond() and is_question_complete(q.detected_text)
-            logger.info(f"⚡ Question detected (Auto-respond: {can_auto})")
+            # Fallback: if the detector extracted only a partial stem (e.g. "what are"
+            # from "what are, closures,") check the FULL transcript instead.
+            # Whisper sometimes inserts mid-phrase commas that cause the extractor to
+            # stop at the stem.  When the full transcript passes is_question_complete
+            # we use it as the query so the user gets a response for "what are closures".
+            query_text = q.detected_text
+            if not can_auto and q.should_auto_respond() and is_question_complete(t):
+                can_auto = True
+                query_text = t
+            logger.info(
+                f"[{session_id}] ⚡ QUESTION DETECTED | auto_respond={can_auto} | question='{query_text[:40]}'"
+            )
             if can_auto:
-                self.generate_response(q.detected_text, "speech", {"audio": t})
+                self._pending_incomplete_audio_query = ""
+                self._pending_incomplete_audio_at = 0.0
+                self._pending_request_metadata = dict(request_metadata or {})
+                response_start = time.time()
+                self._current_response_start_time = response_start
+                logger.info(
+                    f"[{session_id}] 🤖 RESPONSE GENERATION START | total_elapsed_so_far={elapsed_ms:.1f}ms"
+                )
+                self.generate_response(query_text, "speech", {"audio": t})
             else:
+                self._pending_incomplete_audio_query = t
+                self._pending_incomplete_audio_at = time.time()
                 # P2.1: Low-confidence or incomplete question — surface hint without auto-firing
                 self.overlay.update_transcript(
                     f"🤔 Possible question detected (tap ⎨ to answer)",
                     state="processing",
                 )
+        elif is_question_complete(t):
+            self._pending_incomplete_audio_query = ""
+            self._pending_incomplete_audio_at = 0.0
+            logger.info(
+                f"[{session_id}] ⚡ QUESTION DETECTED (fallback) | auto_respond=True | question='{t[:40]}'"
+            )
+            self._pending_request_metadata = dict(request_metadata or {})
+            response_start = time.time()
+            self._current_response_start_time = response_start
+            logger.info(
+                f"[{session_id}] 🤖 RESPONSE GENERATION START | total_elapsed_so_far={elapsed_ms:.1f}ms"
+            )
+            self.generate_response(t, "speech", {"audio": t})
 
     def _should_ignore_final_transcript(self, text: str) -> bool:
         """Drop tiny non-question final ASR scraps before they enter context/history."""
@@ -1645,6 +2284,70 @@ class OpenAssistApp(QObject):
             return False
         return not self._looks_question_like_transcript(cleaned)
 
+    def _carry_forward_incomplete_audio_query(self, text: str) -> str:
+        """Merge a generic follow-up with the last incomplete spoken question when helpful."""
+        current = (text or "").strip()
+        pending = (getattr(self, "_pending_incomplete_audio_query", "") or "").strip()
+        pending_at = float(getattr(self, "_pending_incomplete_audio_at", 0.0) or 0.0)
+        if not current or not pending or pending_at <= 0.0:
+            return current
+
+        now = time.time()
+        if (now - pending_at) > 12.0:
+            self._pending_incomplete_audio_query = ""
+            self._pending_incomplete_audio_at = 0.0
+            return current
+
+        lower = current.lower().strip()
+        generic_followup = any(
+            lower.startswith(prefix)
+            for prefix in [
+                "can you explain",
+                "could you explain",
+                "can you elaborate",
+                "could you elaborate",
+                "explain",
+                "elaborate",
+                "tell me more",
+                "help me understand",
+                "what does it do",
+                "how does it work",
+            ]
+        )
+        if not generic_followup:
+            return current
+
+        topic = pending.strip(" ,:;.-")
+        for prefix in [
+            "what is ",
+            "what are ",
+            "who is ",
+            "difference between ",
+            "what is the difference between ",
+        ]:
+            if topic.lower().startswith(prefix):
+                topic = topic[len(prefix):].strip(" ,:;.-")
+                break
+
+        if not topic:
+            return current
+
+        if lower.startswith(("can you explain", "could you explain", "explain")):
+            merged = f"can you explain {topic}?"
+        elif lower.startswith(("can you elaborate", "could you elaborate", "elaborate", "tell me more", "help me understand")):
+            merged = f"help me understand {topic}."
+        elif lower.startswith("what does it do"):
+            merged = f"what does {topic} do?"
+        elif lower.startswith("how does it work"):
+            merged = f"how does {topic} work?"
+        else:
+            merged = current
+
+        self._pending_incomplete_audio_query = ""
+        self._pending_incomplete_audio_at = 0.0
+        logger.info("Audio follow-up merge | pending='%s' | current='%s' | merged='%s'", pending, current, merged)
+        return merged
+
     def _looks_question_like_transcript(self, text: str) -> bool:
         cleaned = (text or "").strip()
         if not cleaned:
@@ -1661,30 +2364,46 @@ class OpenAssistApp(QObject):
         )
 
     def _on_interim_transcription(self, t: str):
-        """Best-effort live (partial) ASR updates while the user is still speaking.
-
-        Conservative by design:
-        - Never pushes interim text into the Nexus history (avoids unstable context)
-        - Only early-triggers when the detector reports a stable question clause
+        """Display live (partial) ASR updates while the user is still speaking.
+        
+        Shows interim text in the overlay for real-time feedback, and also
+        checks for early question detection.
         """
         if not self.session_active or not t:
             return
-            
         from utils.text_utils import normalize_transcript
         t = normalize_transcript(t)
-        if not t or not hasattr(self.ai, "detector"):
+        if not t:
+            return
+        
+        session_id = getattr(self, "_current_session_id", "unknown_session")
+        elapsed_ms = (time.time() - getattr(self, "_session_start_time", time.time())) * 1000
+        logger.info(
+            f"[{session_id}] ⏱️  INTERIM TEXT | elapsed={elapsed_ms:.1f}ms | text='{t[:50]}'"
+        )
+        
+        # Show interim text in the overlay for live feedback
+        try:
+            self.overlay.update_transcript(t, state="interim")
+        except Exception as e:
+            logger.debug(f"Interim overlay update failed: {e}")
+        
+        if self._live_turn_owns_audio():
             return
 
+        # Check for early question detection
         try:
-            det = self.ai.detector
-            if not hasattr(det, "detect_interim_with_guardrails"):
+            det = getattr(self.ai, "detector", None)
+            if not det or not hasattr(det, "detect_interim_with_guardrails"):
                 return
             candidate = det.detect_interim_with_guardrails(t)
             if candidate:
-                logger.info("⚡ Live question detected (interim ASR)")
+                logger.info(
+                    f"[{session_id}] ⚡ QUESTION DETECTED (interim) | candidate='{candidate[:40]}'"
+                )
                 self.generate_response(candidate, "speech", {"audio": t})
         except Exception as e:
-            logger.debug(f"Interim transcription handler error (non-fatal): {e}")
+            logger.debug(f"Interim transcription detector error (non-fatal): {e}")
 
     def _on_screen_text(self, t):
         if not self.session_active:
@@ -1869,6 +2588,9 @@ class OpenAssistApp(QObject):
         self.is_running = False  # Signal all loops to break immediately
 
         self._stop_background_tasks()
+        stop_live = getattr(self, "_stop_live_mode", None)
+        if callable(stop_live):
+            stop_live()
 
         # Stop the event loop
         if self.loop and self.loop.is_running():
@@ -1886,5 +2608,3 @@ class OpenAssistApp(QObject):
         # Save history
         self.history.save()
         logger.info("✅ OpenAssist shutdown complete")
-
-
