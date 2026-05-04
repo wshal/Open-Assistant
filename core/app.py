@@ -647,6 +647,10 @@ class OpenAssistApp(QObject):
         self._last_live_transcript = ""
         self._live_turn_timer.stop()
         self._live_fallback_active = True
+        # Un-suspend standard ASR before dispatching so the fallback query
+        # can be handled AND future utterances are captured without a gap.
+        if hasattr(self.audio, "set_standard_transcription_suspended"):
+            self.audio.set_standard_transcription_suspended(False, f"promote-to-standard:{reason}")
         logger.info("Promoting pending live turn to standard mode (%s)", reason)
         if hasattr(self.overlay, "update_live_mode_state"):
             self.overlay.update_live_mode_state(
@@ -693,9 +697,14 @@ class OpenAssistApp(QObject):
                 self.audio.set_standard_transcription_suspended(False, status_text or "live-fallback")
             self._promote_live_turn_to_standard(status_text)
         else:
+            # Only suspend standard ASR while a turn is actively pending
+            # (user audio sent to live, awaiting its response).  When live is
+            # merely connected-and-idle we must keep standard ASR live so the
+            # next utterance can be picked up without a gap.
+            turn_in_flight = bool(getattr(self, "_live_turn_pending", False))
             if hasattr(self.audio, "set_standard_transcription_suspended"):
                 self.audio.set_standard_transcription_suspended(
-                    self._live_turn_owns_audio(),
+                    turn_in_flight,
                     status_text or "live-status",
                 )
         if self._live_mode_active:
@@ -796,6 +805,10 @@ class OpenAssistApp(QObject):
         if not self._live_turn_pending:
             return
         self._live_mode_reconnecting = bool(getattr(self, "_live_mode_reconnecting", False))
+        # Un-suspend standard ASR BEFORE promoting so the fallback query is
+        # dispatched on a live pipeline and the next utterance isn't blocked.
+        if hasattr(self.audio, "set_standard_transcription_suspended"):
+            self.audio.set_standard_transcription_suspended(False, "live-turn-timeout")
         self.overlay.update_transcript(
             "Live response timed out — answering via standard mode.",
             state="error",
@@ -2472,10 +2485,15 @@ class OpenAssistApp(QObject):
             except Exception as e:
                 logger.error(f"Brain Warmup Fault: {e}")
 
-        def _warm_audio_deferred():
-            """Pre-warm Whisper silently — does NOT block READY signal."""
+        def _warm_audio_critical():
+            """Pre-warm Whisper silently — blocks READY signal until complete."""
             try:
-                self.audio._ensure_whisper_loaded()
+                provider = str(self.config.get("capture.audio.transcription_provider", "local")).strip().lower()
+                if provider in ["local", "auto"]:
+                    self.audio._ensure_whisper_loaded()
+                    self.audio._prime_whisper_decoder(blocking=True)
+                else:
+                    logger.info(f"Skipping local Whisper warmup, using cloud STT: {provider}")
                 self.warmup_status_update.emit("🎙️ Audio Ready", 90, False)
             except Exception as e:
                 logger.error(f"Audio Warmup Fault: {e}")
@@ -2506,13 +2524,13 @@ class OpenAssistApp(QObject):
         # Both complete in ~2-3s (Ollama health + basic AI setup)
         critical = [
             threading.Thread(target=_warm_brain,  daemon=True, name="warmup-brain"),
+            threading.Thread(target=_warm_audio_critical, daemon=True, name="warmup-whisper"),
         ]
         # Tier 2: deferred — run in background, don't delay READY
         # EasyOCR takes ~8s, Whisper takes ~8s — both start immediately
         # but the user can already interact before they finish.
         deferred = [
             threading.Thread(target=_warm_vision,             daemon=True, name="warmup-vision"),
-            threading.Thread(target=_warm_audio_deferred,     daemon=True, name="warmup-whisper"),
             threading.Thread(target=_warm_knowledge_deferred, daemon=True, name="warmup-rag"),
         ]
         for t in critical + deferred:

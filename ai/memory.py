@@ -24,7 +24,9 @@ _DB_DIR = (
     else pathlib.Path("data") / "chroma_db"
 )
 _COLLECTION_NAME = "session_memory"
-_MAX_RESULTS = 3
+_MAX_RESULTS = 1        # Reduced 3→1: each memory ~700 chars; injecting 3 was
+                         # pushing prompts past Groq's 6000 TPM/min free limit.
+                         # 1 memory keeps injection under ~200 tokens.
 _RELEVANCE_THRESHOLD = 0.55   # cosine similarity floor (0=unrelated, 1=identical)
 
 

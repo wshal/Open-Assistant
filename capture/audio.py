@@ -219,7 +219,10 @@ class AudioCapture(QObject):
         )
         self._system_queue_pressure_max_pending = max(
             1,
-            int(config.get("capture.audio.vad.system_queue_pressure_max_pending", 5) or 5),
+            # Reduced 5→2: with a single Whisper thread, 5 pending = ~25-50s backlog.
+            # At 2, noise/followup segments are dropped once 1 job is running + 1 queued,
+            # preventing the late-superseded cascade seen in logs.
+            int(config.get("capture.audio.vad.system_queue_pressure_max_pending", 2) or 2),
         )
         self._system_queue_pressure_max_speech_s = float(
             (config.get("capture.audio.vad.system_queue_pressure_max_speech_ms", 450) or 450) / 1000.0
@@ -229,7 +232,9 @@ class AudioCapture(QObject):
             int(config.get("capture.audio.vad.system_queue_pressure_max_voiced_blocks", 3) or 3),
         )
         self._system_queue_pressure_max_peak_rms = float(
-            config.get("capture.audio.vad.system_queue_pressure_max_peak_rms", 0.02) or 0.02
+            # Raised 0.02 → 0.035: logs show real speech at rms 0.12-0.22,
+            # background audio bleed at 0.01-0.03. 0.02 was too conservative.
+            config.get("capture.audio.vad.system_queue_pressure_max_peak_rms", 0.035) or 0.035
         )
         self._system_followup_guard_enabled = bool(
             config.get("capture.audio.vad.system_followup_guard_enabled", True)
@@ -241,7 +246,9 @@ class AudioCapture(QObject):
             (config.get("capture.audio.vad.system_followup_guard_max_speech_ms", 700) or 700) / 1000.0
         )
         self._system_followup_guard_max_peak_rms = float(
-            config.get("capture.audio.vad.system_followup_guard_max_peak_rms", 0.03) or 0.03
+            # Raised 0.03 → 0.05: rms=0.02897 noise was passing through at 0.03.
+            # Real questions observed at 0.12-0.22; this leaves a clear 2-4x gap.
+            config.get("capture.audio.vad.system_followup_guard_max_peak_rms", 0.05) or 0.05
         )
         self._system_followup_guard_max_voiced_blocks = max(
             1,
@@ -250,6 +257,19 @@ class AudioCapture(QObject):
         self._system_superseded_final_skip_enabled = bool(
             config.get("capture.audio.vad.system_superseded_final_skip_enabled", True)
         )
+        # ── Cold-start session guard ───────────────────────────────────────────
+        # For the first N seconds of a session, both existing guards are
+        # inactive (no pending jobs, no previous submit timestamp). This
+        # allows noise jobs (rms~0.005) through and blocks the Whisper pool
+        # causing real speech to be late-superseded. Apply a stricter
+        # standalone RMS floor during the cold-start window.
+        self._cold_start_guard_window_s = float(
+            config.get("capture.audio.vad.cold_start_guard_window_s", 8.0) or 8.0
+        )
+        self._cold_start_guard_min_rms = float(
+            config.get("capture.audio.vad.cold_start_guard_min_rms", 0.04) or 0.04
+        )
+        self._session_start_time: float = 0.0  # set by set_trace_context
         self._system_superseded_final_skip_max_s = float(
             (config.get("capture.audio.vad.system_superseded_final_skip_max_speech_ms", 1800) or 1800) / 1000.0
         )
@@ -417,6 +437,7 @@ class AudioCapture(QObject):
         self._trace_utterance_counter = 0
         self._cloud_stt_session_blocked = False
         self._last_final_submit_at = 0.0
+        self._session_start_time = time.time()  # used by cold-start RMS guard
         self._rearm_ambient_calibration()
         self._drain_queue()
         with self._session_parts_lock:
@@ -600,31 +621,50 @@ class AudioCapture(QObject):
                 logger.error(f"Whisper Error: {e}")
                 self._model_loaded = False
 
-    def _prime_whisper_decoder(self) -> None:
-        """Run a tiny silent decode once so the first real utterance avoids cold-start cost."""
+    def _prime_whisper_decoder(self, blocking: bool = False) -> None:
+        """Run a tiny silent decode so the first real utterance avoids cold-start cost.
+
+        Uses the exact same parameters as _transcribe_local to guarantee the CTranslate2
+        compute graph is correctly cached.
+        """
         if self._whisper_decode_primed or not self.model:
             return
-        try:
-            warmup_audio = np.zeros(int(self.sr * 0.25), dtype=np.float32)
-            with self._infer_lock:
-                segments, _ = self.model.transcribe(
-                    warmup_audio,
-                    language=self._language,
-                    beam_size=1,
-                    condition_on_previous_text=False,
-                    vad_filter=False,
-                    initial_prompt=None,
-                    no_speech_threshold=0.7,
-                    suppress_blank=False,
-                )
-                # Exhaust the iterator so the backend pays any lazy first-decode setup now.
-                list(segments)
-            self._whisper_decode_primed = True
-            logger.info("Whisper decode warmup primed")
-        except Exception as e:
-            logger.debug(f"Whisper decode warmup skipped: {e}")
+
+        def _warmup() -> None:
+            try:
+                # 1.5s of zeros ensures the pad-to-30s graph executes fully
+                warmup_audio = np.zeros(int(self.sr * 1.5), dtype=np.float32)
+                acquired = self._infer_lock.acquire(timeout=2.0)
+                if not acquired:
+                    logger.debug("Whisper decode warmup skipped — infer lock busy")
+                    return
+                try:
+                    segments, _ = self.model.transcribe(
+                        warmup_audio,
+                        language=self._language,
+                        beam_size=self._effective_final_beam_size(),
+                        condition_on_previous_text=False,
+                        vad_filter=False,
+                        initial_prompt=self._whisper_initial_prompt or None,
+                        no_speech_threshold=0.7,
+                        suppress_blank=False,
+                    )
+                    list(segments)
+                finally:
+                    self._infer_lock.release()
+                self._whisper_decode_primed = True
+                logger.info("Whisper decode warmup primed (graph cached)")
+            except Exception as e:
+                logger.debug(f"Whisper decode warmup skipped: {e}")
+
+        if blocking:
+            _warmup()
+        else:
+            threading.Thread(target=_warmup, daemon=True, name="whisper-warmup").start()
 
     def _ensure_whisper_loaded_async(self) -> None:
+        if self._effective_transcription_provider(is_final=True) != "local":
+            return
         if getattr(self, "_whisper_preload_inflight", False) or self._model_loaded:
             return
         self._whisper_preload_inflight = True
@@ -1278,6 +1318,31 @@ class AudioCapture(QObject):
         voiced_blocks = int((vad_meta or {}).get("voiced_blocks", 0) or 0)
         peak_rms = float((vad_meta or {}).get("peak_rms", 0.0) or 0.0)
         utterance_id = (vad_meta or {}).get("utterance_id", "")
+        # ── Absolute System Noise Floor ────────────────────────────────────────
+        # System audio has constant background hum/noise. Real speech consistently
+        # hits a high average RMS. If we only check peak_rms, a single transient click
+        # during 4 seconds of fan noise will bypass the gate. We calculate the mean RMS
+        # of the entire buffer to accurately drop sustained background noise.
+        mean_rms = 0.0
+        if buffer and len(buffer) > 0:
+            concat_data = np.concatenate(buffer)
+            mean_rms = float(np.sqrt(np.mean(concat_data**2)))
+            
+        if (
+            self.capture_mode == "system"
+            and mean_rms < (self._cold_start_guard_min_rms * 0.4)
+            and not bool((vad_meta or {}).get("chunk_aware_eos", False))
+        ):
+            logger.info(
+                "[%s] FINAL TRANSCRIPTION DROP | utterance=%s | reason=absolute-noise-floor"
+                " | mean_rms=%.5f < %.5f (peak_rms=%.5f)",
+                self._trace_session_id or "audio",
+                utterance_id,
+                mean_rms,
+                self._cold_start_guard_min_rms * 0.4,
+                peak_rms,
+            )
+            return False
         if self._should_drop_burst_followup_system_utterance(
             speech_duration=speech_duration,
             voiced_blocks=voiced_blocks,
@@ -2258,6 +2323,7 @@ class AudioCapture(QObject):
                 headers={
                     "Authorization": f"Bearer {groq_key}",
                     "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "User-Agent": "OpenAssist/1.0",
                 },
                 method="POST",
             )
@@ -2303,7 +2369,9 @@ class AudioCapture(QObject):
     # avg_logprob: how confident Whisper is about the token sequence (lower = less confident).
     # no_speech_prob: how likely the segment contains no real speech.
     # Both are segment-level fields returned by faster-whisper.
-    _LOGPROB_THRESHOLD: float = -1.0
+    # Raised from -1.0 → -1.2 to catch system-audio-bleed segments (lp=-1.21)
+    # while staying above clear-noise values (-1.5 to -1.8) seen in logs.
+    _LOGPROB_THRESHOLD: float = -1.2
     _NO_SPEECH_THRESHOLD: float = 0.6
 
     # Known Whisper hallucination patterns — text generated when there is silence or
@@ -2313,6 +2381,12 @@ class AudioCapture(QObject):
         "subtitles", "transcribed by", "subscribe",
         "www.", ".com", "[silence]", "[blank_audio]",
         "amara.org", "dotsub",
+        # Whisper filler / system-audio-bleed patterns observed in logs:
+        "...",           # Whisper ellipsis — pure noise with no real speech
+        "that's it",    # system audio bleed (video commentary)
+        "let's see",    # system audio bleed
+        "that's it for today",
+        "see what we can do",
     ]
 
     def _is_hall(self, t: str) -> bool:
@@ -2483,12 +2557,46 @@ class AudioCapture(QObject):
             )
 
     def _filter_segments(self, segments) -> str:
-        """Join segments that pass both hallucination and confidence filters."""
-        return " ".join(
-            s.text.strip()
-            for s in segments
-            if not self._is_hall(s.text) and self._segment_passes_confidence(s)
-        ).strip()
+        """Join segments that pass both hallucination and confidence filters.
+
+        Logs at INFO level when all segments are dropped or when Whisper returns
+        zero segments, making silent-failure debugging possible from the log file.
+        """
+        kept = []
+        dropped_hall = []
+        dropped_conf = []
+        n_segments = 0
+        for s in segments:
+            n_segments += 1
+            text = (s.text or "").strip()
+            if self._is_hall(text):
+                dropped_hall.append(text[:30])
+                continue
+            if not self._segment_passes_confidence(s):
+                logprob = getattr(s, "avg_logprob", None)
+                no_sp = getattr(s, "no_speech_prob", None)
+                label = (
+                    f"{text[:25]!r}(lp={logprob:.2f},nsp={no_sp:.2f})"
+                    if logprob is not None and no_sp is not None
+                    else repr(text[:25])
+                )
+                dropped_conf.append(label)
+                continue
+            kept.append(text)
+        result = " ".join(kept).strip()
+        if n_segments == 0:
+            logger.info("[FilterSeg] Whisper returned 0 segments — likely no speech in audio")
+        elif not result:
+            logger.info(
+                "[FilterSeg] All %d segment(s) dropped — hall=%s conf=%s",
+                n_segments, dropped_hall or None, dropped_conf or None,
+            )
+        elif dropped_hall or dropped_conf:
+            logger.debug(
+                "[FilterSeg] Kept %d/%d — dropped hall=%s conf=%s",
+                len(kept), n_segments, dropped_hall or None, dropped_conf or None,
+            )
+        return result
 
 
     # Ordered substitution table: (pattern, replacement).
@@ -2557,6 +2665,13 @@ class AudioCapture(QObject):
             return
         if not self._can_run_interim_with_pending_finals():
             return
+
+        # If the user has configured a cloud STT provider (e.g. Groq), DO NOT load the heavy
+        # local Whisper model just for interim visual feedback. It causes massive CPU spikes
+        # mid-speech and ruins the low-latency cloud experience.
+        if self._effective_transcription_provider(is_final=True) != "local":
+            return
+
         self._ensure_whisper_loaded()
         if not self.model or not buffer:
             return

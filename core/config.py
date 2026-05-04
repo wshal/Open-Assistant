@@ -221,9 +221,12 @@ class Config:
             {
                 "groq": 1800,
                 "cerebras": 1800,
-                "gemini": 2000,
+                "gemini": 2500,
                 "together": 2000,
-                "ollama": 8000,
+                # Raised 8000 → 12000: Ollama cold-start (first load) regularly
+                # takes 5-10s TTFB. 8s was letting it time out then retrying
+                # at 15s, wasting the failed attempt window.
+                "ollama": 12000,
             },
         )
         self._data["ai"]["text"].setdefault("local_first_token_retry_timeout_ms", 15000)
@@ -317,7 +320,11 @@ class Config:
         self._data["capture"]["audio"]["vad"].setdefault("system_queue_pressure_max_pending", 1)
         self._data["capture"]["audio"]["vad"].setdefault("system_queue_pressure_max_speech_ms", 450)
         self._data["capture"]["audio"]["vad"].setdefault("system_queue_pressure_max_voiced_blocks", 3)
-        self._data["capture"]["audio"]["vad"].setdefault("system_queue_pressure_max_peak_rms", 0.02)
+        self._data["capture"]["audio"]["vad"].setdefault(
+            # Raised 0.02 → 0.035 to match audio.py default; background audio bleed
+            # observed at rms 0.01-0.03, real speech at 0.12-0.22.
+            "system_queue_pressure_max_peak_rms", 0.035
+        )
 
         # Final speech transcript gating: ignore tiny non-question scraps like
         # "API." so they do not pollute live context or auto-trigger answers.

@@ -133,9 +133,20 @@ class AIEngine(QObject):
             if not name or name in seen or name in self._session_failed_providers:
                 continue
             provider = self._providers.get(name)
-            if provider and getattr(provider, "enabled", False):
-                filtered.append(name)
-                seen.add(name)
+            if not provider or not getattr(provider, "enabled", False):
+                continue
+            # Skip providers that are in a temporary cooldown window.
+            # Previously only provider.enabled (static flag) was checked here;
+            # is_disabled() reflects the dynamic cooldown set by _maybe_cooldown_provider.
+            if hasattr(provider, "is_disabled") and provider.is_disabled():
+                remaining = getattr(provider, "cooldown_remaining_s", lambda: 0)()
+                logger.debug(
+                    "Skipping %s in provider selection — cooldown active (%ds remaining)",
+                    name, remaining,
+                )
+                continue
+            filtered.append(name)
+            seen.add(name)
         return filtered
 
     @staticmethod
@@ -199,11 +210,30 @@ class AIEngine(QObject):
             return "connection"
         return ""
 
+    # Cloud providers where a 429 means quota is exhausted for the session
+    # (not just a brief burst limit). Matching the cheating repo's
+    # groqFailedForSession pattern: disable for 3600s so they don't get
+    # retried within the same conversation.
+    _SESSION_QUOTA_PROVIDERS = frozenset({"groq", "gemini", "anthropic", "together", "cerebras"})
+
     def _maybe_cooldown_provider(self, provider, exc: Exception) -> None:
         seconds = self._cooldown_seconds_for_error(exc)
         if seconds <= 0:
             return
         reason = self._cooldown_reason_for_error(exc)
+        # For 429 rate-limit errors on cloud quota providers, use a session-length
+        # cooldown (3600s) instead of the server-hinted retry window.
+        # A Groq 6000 TPM limit isn't fixed by waiting 36s if we consumed ~5k tokens
+        # per request — the next request will hit the same wall immediately.
+        if (
+            reason == "429 rate limit"
+            and getattr(provider, "name", "") in self._SESSION_QUOTA_PROVIDERS
+        ):
+            seconds = 3600  # effectively session-length disable
+            logger.info(
+                "AI: %s hit quota limit — disabling for session (3600s) to avoid retry storms",
+                getattr(provider, "name", "?"),
+            )
         try:
             if provider and hasattr(provider, "disable"):
                 try:
