@@ -32,6 +32,29 @@ class TestQuestionDetectorClauseExtraction(unittest.TestCase):
         res = self.detector.detect(text)
         self.assertEqual(res, "how can I fix it")
 
+    def test_extract_question_clause_keeps_real_question_not_trailing_fragment(self):
+        text = "what is this? Hello copy."
+        res = self.detector.detect(text)
+        self.assertEqual(res, "what is this?")
+
+    def test_detect_accepts_natural_compare_question_without_wh_prefix(self):
+        text = "difference between setTimeout and setInterval"
+        res = self.detector.detect(text)
+        self.assertEqual(res, "difference between setTimeout and setInterval")
+
+    def test_detect_accepts_interview_style_prompt(self):
+        text = "walk me through a time you handled conflict in your team"
+        res = self.detector.detect(text)
+        self.assertEqual(res, text)
+
+    def test_detect_prefers_richer_question_clause_over_vague_followup(self):
+        text = "what is the difference between double equals and triple equals? what does it do in JavaScript?"
+        res = self.detector.detect(text)
+        self.assertEqual(
+            res,
+            "what is the difference between double equals and triple equals?",
+        )
+
 
 class TestQuestionDetectorLearning(unittest.TestCase):
     def setUp(self):
@@ -108,6 +131,25 @@ class TestQuestionDetectorFragmentReset(unittest.TestCase):
             self.assertIsNone(self.detector.detect("for cloud helps"))
             self.assertIsNotNone(self.detector.detect("What is React?"))
         self.assertEqual(list(self.detector.fragment_buffer), [])
+
+    def test_reset_turn_state_clears_debounce_and_interim_state(self):
+        self.detector._last_text = "what is react"
+        self.detector._last_trigger_time = 12.0
+        self.detector.fragment_buffer.append("stale fragment")
+        self.detector._fragment_last_seen_at = 9.0
+        self.detector._interim_last_key = "what is react"
+        self.detector._interim_first_seen_at = 8.0
+        self.detector._interim_last_trigger_at = 11.0
+
+        self.detector.reset_turn_state("unit-test")
+
+        self.assertEqual(self.detector._last_text, "")
+        self.assertEqual(self.detector._last_trigger_time, 0.0)
+        self.assertEqual(list(self.detector.fragment_buffer), [])
+        self.assertEqual(self.detector._fragment_last_seen_at, 0.0)
+        self.assertEqual(self.detector._interim_last_key, "")
+        self.assertEqual(self.detector._interim_first_seen_at, 0.0)
+        self.assertEqual(self.detector._interim_last_trigger_at, 0.0)
 
 
 if __name__ == "__main__":

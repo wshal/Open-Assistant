@@ -17,8 +17,8 @@ class TestShortQueryCacheSemantic(unittest.TestCase):
         sig1 = self.cache._get_semantic_signature("What is React?")
         sig2 = self.cache._get_semantic_signature("Could you explain React library?")
         
-        self.assertEqual(sig1, "v1:EXPLAIN:react")
-        self.assertEqual(sig2, "v1:EXPLAIN:react")
+        self.assertEqual(sig1, "v2:EXPLAIN:react")
+        self.assertEqual(sig2, "v2:EXPLAIN:react")
 
     def test_semantic_cache_hit_paraphrased(self):
         # Set cache with one phrasing
@@ -47,8 +47,8 @@ class TestShortQueryCacheSemantic(unittest.TestCase):
         sig1 = self.cache._get_semantic_signature("Tell me about React hooks")
         sig2 = self.cache._get_semantic_signature("How do hooks work in React?")
         
-        self.assertEqual(sig1, "v1:EXPLAIN:hooks:react")
-        self.assertEqual(sig2, "v1:HOW_TO:hooks:react") # Intent differs, but entities are sorted
+        self.assertEqual(sig1, "v2:EXPLAIN:hooks:react")
+        self.assertEqual(sig2, "v2:HOW_TO:hooks:react") # Intent differs, but entities are sorted
         
         # Test exact match on entities if intent is same
         sig3 = self.cache._get_semantic_signature("Explain React hooks")
@@ -117,7 +117,35 @@ class TestShortQueryCacheSemantic(unittest.TestCase):
         """Vague queries without known entities must not produce a trailing colon."""
         sig = self.cache._get_semantic_signature("Fix this bug")
         self.assertFalse(sig.endswith(":"), f"Trailing colon found in: {sig!r}")
-        self.assertEqual(sig, "v1:TROUBLESHOOT")
+        self.assertEqual(sig, "v2:TROUBLESHOOT:bug")
+
+    def test_generic_explain_queries_keep_distinct_topic_signatures(self):
+        sig1 = self.cache._get_semantic_signature("What are closures?")
+        sig2 = self.cache._get_semantic_signature("What is hoisting?")
+
+        self.assertEqual(sig1, "v2:EXPLAIN:closures")
+        self.assertEqual(sig2, "v2:EXPLAIN:hoisting")
+        self.assertNotEqual(sig1, sig2)
+
+    def test_semantic_cache_does_not_cross_hit_unrelated_explain_topics(self):
+        self.cache.set(
+            mode="general",
+            query="What are closures?",
+            context_fp=self.ctx,
+            history_fp=self.hist,
+            response="Closures remember surrounding scope.",
+            provider="test",
+        )
+
+        entry, tier = self.cache.get_with_tier(
+            mode="general",
+            query="What is hoisting?",
+            context_fp=self.ctx,
+            history_fp=self.hist,
+        )
+
+        self.assertIsNone(entry)
+        self.assertEqual(tier, 0)
 
     def test_intent_word_boundary_no_false_positive(self):
         """'fixed' should NOT match the TROUBLESHOOT 'fix' intent pattern."""

@@ -11,6 +11,7 @@ from core.app import OpenAssistApp
 
 class HistoryStub:
     def __init__(self):
+        self.entries = []
         self.started = 0
         self.state = (
             0,
@@ -28,14 +29,38 @@ class HistoryStub:
         return self.state
 
     def get_last(self, n):
+        if self.entries:
+            return [
+                SimpleNamespace(
+                    query=entry["query"],
+                    response=entry["response"],
+                    provider=entry["provider"],
+                    latency=entry.get("latency", 0),
+                    metadata=entry.get("metadata", {}),
+                )
+                for entry in self.entries[-n:]
+            ]
         return [
             SimpleNamespace(
                 query="example question",
                 response="example response",
                 provider="groq",
                 latency=1234,
+                metadata={},
             )
         ][:n]
+
+    def add(self, query, response, provider, mode="general", latency=0.0, metadata=None):
+        self.entries.append(
+            {
+                "query": query,
+                "response": response,
+                "provider": provider,
+                "mode": mode,
+                "latency": latency,
+                "metadata": metadata or {},
+            }
+        )
 
     def save(self):
         pass  # no-op for tests
@@ -47,6 +72,10 @@ class AudioStub:
         self.muted = False
         self.toggle_calls = 0
         self.restart_calls = 0
+        self.start_calls = 0
+        self.ensure_session_ready_calls = 0
+        self.ensure_session_ready_result = True
+        self.trace_context_calls = []
 
     def clear(self):
         self.clear_calls += 1
@@ -58,6 +87,16 @@ class AudioStub:
 
     def restart(self):
         self.restart_calls += 1
+
+    def start(self):
+        self.start_calls += 1
+
+    def ensure_session_ready(self):
+        self.ensure_session_ready_calls += 1
+        return self.ensure_session_ready_result
+
+    def set_trace_context(self, session_id="", session_started_at=0.0):
+        self.trace_context_calls.append((session_id, session_started_at))
 
 
 class OverlayStub:
@@ -82,6 +121,7 @@ class OverlayStub:
         self.opacity_updates = []
         self.analysis_badges = []
         self.refresh_calls = []
+        self.live_mode_updates = []
         self.chat_view = "chat"
         self.settings_view = "settings"
         self.standby_view = "standby"
@@ -164,6 +204,16 @@ class OverlayStub:
 
     def refresh_standby_state(self, mode=None, audio=None):
         self.refresh_calls.append({"mode": mode, "audio": audio})
+
+    def update_live_mode_state(self, enabled, connected, reconnecting=False, fallback=False):
+        self.live_mode_updates.append(
+            {
+                "enabled": enabled,
+                "connected": connected,
+                "reconnecting": reconnecting,
+                "fallback": fallback,
+            }
+        )
 
 
 class MiniOverlayStub:
@@ -302,6 +352,13 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             loop=SimpleNamespace(is_running=lambda: True),
             _do_analyze_screen=lambda: __import__("asyncio").sleep(0),
             modes=ModeManagerStub(),
+            live_session=SimpleNamespace(
+                start=lambda *args, **kwargs: True,
+                stop=lambda: None,
+                end_audio_turn=lambda: None,
+                send_audio_chunk=lambda *args, **kwargs: None,
+                is_connected=False,
+            ),
             ai=SimpleNamespace(
                 _providers={"groq": SimpleNamespace(enabled=True)},
                 cancel=lambda: None,
@@ -348,6 +405,18 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         app._sync_state_from_config = lambda: OpenAssistApp._sync_state_from_config(app)
         app._should_ignore_final_transcript = lambda text: OpenAssistApp._should_ignore_final_transcript(app, text)
         app._looks_question_like_transcript = lambda text: OpenAssistApp._looks_question_like_transcript(app, text)
+        app._carry_forward_incomplete_audio_query = lambda text: OpenAssistApp._carry_forward_incomplete_audio_query(app, text)
+        app._reset_turn_local_state = lambda reason="": OpenAssistApp._reset_turn_local_state(app, reason)
+        app._log_turn_waterfall_summary = lambda provider=None, request_metadata=None, stage_timings=None: OpenAssistApp._log_turn_waterfall_summary(
+            app,
+            provider=provider,
+            request_metadata=request_metadata,
+            stage_timings=stage_timings,
+        )
+        app._live_mode_requested = lambda: OpenAssistApp._live_mode_requested(app)
+        app._live_mode_connected = lambda: OpenAssistApp._live_mode_connected(app)
+        app._live_audio_passthrough_enabled = lambda: OpenAssistApp._live_audio_passthrough_enabled(app)
+        app._live_turn_owns_audio = lambda: OpenAssistApp._live_turn_owns_audio(app)
         return app
 
     def test_start_new_session_resets_state_and_updates_ui(self):
@@ -357,6 +426,8 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertEqual(app.history.started, 1)
         self.assertEqual(app.audio.clear_calls, 1)
+        self.assertEqual(app.audio.ensure_session_ready_calls, 1)
+        self.assertEqual(len(app.audio.trace_context_calls), 1)
         self.assertEqual(app._last_query, "")
         self.assertTrue(app.session_active)
         self.assertEqual(app.overlay.indices, [1])
@@ -365,6 +436,14 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(app.mini_overlay.mode_updates[-1], "general")
         self.assertEqual(app.mini_overlay.ready_calls, 1)
         self.assertTrue(app.state.is_capturing)
+
+    def test_start_new_session_surfaces_audio_unavailable_state(self):
+        app = self._build_app()
+        app.audio.ensure_session_ready_result = False
+
+        OpenAssistApp.start_new_session(app)
+
+        self.assertIn("Audio capture unavailable", app.overlay.transcript_updates[-1])
 
     def test_history_sync_uses_dict_entries_for_mini_overlay(self):
         """_sync_history_ui should push state to both HUDs when session is active."""
@@ -397,6 +476,36 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(app.overlay.history_updates, [])
         self.assertEqual(app.mini_overlay.history_updates, [])
         self.assertEqual(app.mini_overlay.completed, [])
+
+    def test_response_complete_resets_turn_local_query_and_detector_buffer(self):
+        app = self._build_app()
+        app.session_active = True
+        app._last_query = "what is react"
+        app._last_query_time = 123.0
+        app._pending_request_metadata = {"speech_to_transcript_ms": 250}
+        resets = []
+        app.ai = SimpleNamespace(
+            detector=SimpleNamespace(
+                reset_turn_state=lambda reason="": resets.append(reason)
+            ),
+            _providers={},
+        )
+        app.history.entries.append(
+            {
+                "query": "what is react",
+                "response": "React is a UI library.",
+                "provider": "groq",
+                "latency": 250,
+                "metadata": {},
+            }
+        )
+
+        OpenAssistApp._on_response_complete(app, "React is a UI library.")
+
+        self.assertEqual(app._last_query, "")
+        self.assertEqual(app._last_query_time, 0.0)
+        self.assertIsNone(app._pending_request_metadata)
+        self.assertEqual(resets, ["response-complete"])
 
     def test_quick_answer_prefers_cached_context_without_fresh_capture(self):
         app = self._build_app()
@@ -483,7 +592,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         OpenAssistApp.end_session(app)
 
         self.assertFalse(app.session_active)
-        self.assertEqual(app.audio.clear_calls, 1)
+        self.assertEqual(app.audio.clear_calls, 0)
         self.assertEqual(app._last_query, "")
         self.assertEqual(app.overlay.indices, [0])
         self.assertEqual(app.overlay.transcript_updates[-1], "Ready...")
@@ -625,6 +734,193 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertEqual(pushed, [("audio", "Why?")])
         self.assertEqual(detector_calls, [("Why?", "audio")])
+        self.assertEqual(len(generated), 1)
+
+    def test_standard_transcription_still_runs_when_live_is_disabled(self):
+        app = self._build_app()
+        app.session_active = True
+        app.config.set("ai.live_mode.enabled", False)
+        app._live_mode_active = True
+        app._live_turn_pending = True
+        pushed = []
+        generated = []
+        detector_calls = []
+        app.nexus = SimpleNamespace(
+            push=lambda source, value: pushed.append((source, value)),
+            get_snapshot=lambda: {},
+        )
+        app.generate_response = lambda *args, **kwargs: generated.append((args, kwargs))
+        app.audio = SimpleNamespace(get_last_transcription_metrics=lambda: {})
+        app.ai.detector = SimpleNamespace(
+            question_prefixes=["what ", "how ", "why "],
+            question_patterns=["what is", "how do"],
+            detect_with_confidence=lambda text, source="audio": (
+                detector_calls.append((text, source)) or SimpleNamespace(
+                    triggered=True,
+                    confidence=1.0,
+                    detected_text=text,
+                    should_auto_respond=lambda: True,
+                )
+            ),
+        )
+
+        OpenAssistApp._on_transcription(app, "Why?")
+
+        self.assertEqual(pushed, [("audio", "Why?")])
+        self.assertEqual(detector_calls, [("Why?", "audio")])
+        self.assertEqual(len(generated), 1)
+        self.assertEqual(app.overlay.transcript_updates[-1], "Why?")
+
+    def test_standard_transcription_runs_when_live_requested_but_not_connected(self):
+        app = self._build_app()
+        app.session_active = True
+        app.config.set("ai.live_mode.enabled", True)
+        app._live_mode_active = True
+        app._live_turn_pending = False
+        app._live_mode_connected = lambda: False
+        pushed = []
+        generated = []
+        detector_calls = []
+        app.nexus = SimpleNamespace(
+            push=lambda source, value: pushed.append((source, value)),
+            get_snapshot=lambda: {},
+        )
+        app.generate_response = lambda *args, **kwargs: generated.append((args, kwargs))
+        app.audio = SimpleNamespace(get_last_transcription_metrics=lambda: {})
+        app.ai.detector = SimpleNamespace(
+            question_prefixes=["what ", "how ", "why "],
+            question_patterns=["what is", "how do"],
+            detect_with_confidence=lambda text, source="audio": (
+                detector_calls.append((text, source)) or SimpleNamespace(
+                    triggered=True,
+                    confidence=1.0,
+                    detected_text=text,
+                    should_auto_respond=lambda: True,
+                )
+            ),
+        )
+
+        OpenAssistApp._on_transcription(app, "Why?")
+
+        self.assertEqual(pushed, [("audio", "Why?")])
+        self.assertEqual(detector_calls, [("Why?", "audio")])
+        self.assertEqual(len(generated), 1)
+        self.assertEqual(app.overlay.transcript_updates[-1], "Why?")
+
+    def test_non_question_audio_does_not_prime_request_metadata(self):
+        app = self._build_app()
+        app.session_active = True
+        app._pending_request_metadata = None
+        app.audio = SimpleNamespace(
+            get_last_transcription_metrics=lambda: {"speech_to_transcript_ms": 321}
+        )
+        app.ai.detector = SimpleNamespace(
+            question_prefixes=["what ", "how ", "why "],
+            question_patterns=["what is", "how do"],
+            detect_with_confidence=lambda text, source="audio": SimpleNamespace(
+                triggered=False,
+                confidence=0.0,
+                detected_text="",
+                should_auto_respond=lambda: False,
+            ),
+        )
+
+        OpenAssistApp._on_transcription(app, "React context overview")
+
+        self.assertIsNone(app._pending_request_metadata)
+
+    def test_complete_audio_question_falls_back_when_detector_misses(self):
+        app = self._build_app()
+        app.session_active = True
+        generated = []
+        app.generate_response = lambda *args, **kwargs: generated.append((args, kwargs))
+        app.nexus = SimpleNamespace(push=lambda source, value: None, get_snapshot=lambda: {})
+        app.audio = SimpleNamespace(
+            get_last_transcription_metrics=lambda: {"speech_to_transcript_ms": 321}
+        )
+        app.ai.detector = SimpleNamespace(
+            question_prefixes=["what ", "how ", "why "],
+            question_patterns=["what is", "how do"],
+            detect_with_confidence=lambda text, source="audio": SimpleNamespace(
+                triggered=False,
+                confidence=0.0,
+                detected_text="",
+                should_auto_respond=lambda: False,
+            ),
+        )
+
+        OpenAssistApp._on_transcription(app, "difference between setTimeout and setInterval")
+
+        self.assertEqual(len(generated), 1)
+        self.assertEqual(
+            generated[0][0],
+            ("difference between setTimeout and setInterval", "speech", {"audio": "difference between setTimeout and setInterval"}),
+        )
+
+    def test_incomplete_audio_question_carries_forward_into_generic_followup(self):
+        app = self._build_app()
+        app.session_active = True
+        generated = []
+        app.generate_response = lambda *args, **kwargs: generated.append((args, kwargs))
+        app.nexus = SimpleNamespace(push=lambda source, value: None, get_snapshot=lambda: {})
+        app.audio = SimpleNamespace(get_last_transcription_metrics=lambda: {})
+
+        def _detect(text, source="audio"):
+            if text == "what is async, await,":
+                return SimpleNamespace(
+                    triggered=True,
+                    confidence=1.0,
+                    detected_text="what is async",
+                    should_auto_respond=lambda: False,
+                )
+            return SimpleNamespace(
+                triggered=True,
+                confidence=1.0,
+                detected_text=text,
+                should_auto_respond=lambda: True,
+            )
+
+        app.ai.detector = SimpleNamespace(
+            question_prefixes=["what ", "how ", "why ", "can "],
+            question_patterns=["what is", "how do", "can you"],
+            detect_with_confidence=_detect,
+        )
+
+        with patch("core.app.time.time", side_effect=[100.0] * 12 + [103.0] * 12):
+            OpenAssistApp._on_transcription(app, "what is async, await,")
+            OpenAssistApp._on_transcription(app, "can you explain?")
+
+        self.assertEqual(len(generated), 1)
+        self.assertEqual(
+            generated[0][0],
+            ("can you explain async, await?", "speech", {"audio": "can you explain async, await?"}),
+        )
+
+    def test_duplicate_system_audio_final_transcript_is_ignored(self):
+        app = self._build_app()
+        app.session_active = True
+        app.audio = SimpleNamespace(
+            capture_mode="system",
+            get_last_transcription_metrics=lambda: {},
+        )
+        app.nexus = SimpleNamespace(push=lambda source, value: None, get_snapshot=lambda: {})
+        app.ai.detector = SimpleNamespace(
+            question_prefixes=["what ", "how ", "why "],
+            question_patterns=["what is", "how do"],
+            detect_with_confidence=lambda text, source="audio": SimpleNamespace(
+                triggered=True,
+                confidence=1.0,
+                detected_text=text,
+                should_auto_respond=lambda: True,
+            ),
+        )
+        generated = []
+        app.generate_response = lambda *args, **kwargs: generated.append((args, kwargs))
+
+        with patch("core.app.time.time", side_effect=[100.0] * 8 + [101.5] * 8):
+            OpenAssistApp._on_transcription(app, "What is Context API?")
+            OpenAssistApp._on_transcription(app, "What is Context API?")
+
         self.assertEqual(len(generated), 1)
 
     def test_show_initial_window_always_shows_hud_when_onboarding_is_complete(self):
@@ -775,6 +1071,189 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertTrue(update["capture_screen"])
         self.assertEqual(update["provider"], "groq")
         self.assertEqual(update["latency_ms"], 1234)
+
+    def test_response_complete_logs_compact_waterfall_summary(self):
+        app = self._build_app()
+        app.session_active = True
+        app._current_turn_id = "session_1:utt_3"
+        app.history.entries.append(
+            {
+                "query": "what is react",
+                "response": "React is a UI library.",
+                "provider": "groq",
+                "latency": 1234,
+                "metadata": {
+                    "request_metadata": {
+                        "utterance_id": "session_1:utt_3",
+                        "audio_duration_ms": 820.0,
+                        "transcribe_only_ms": 310.0,
+                        "speech_to_transcript_ms": 1130.0,
+                        "vad_backend": "webrtc",
+                        "chunks": 2,
+                    },
+                    "stage_timings": {
+                        "request_to_first_token_ms": 540.0,
+                        "request_to_complete_ms": 1400.0,
+                    },
+                },
+            }
+        )
+
+        with self.assertLogs("core.app", level="INFO") as captured:
+            OpenAssistApp._on_response_complete(app, "React is a UI library.")
+
+        self.assertTrue(
+            any(
+                "WATERFALL SUMMARY | speech=820ms | asr=310ms | llm_ttfb=540ms | stream=860ms | total=2530ms | utterance=session_1:utt_3 | vad=webrtc | chunks=2 | provider=groq"
+                in line
+                for line in captured.output
+            )
+        )
+
+    def test_response_complete_tolerates_missing_response_start_time(self):
+        app = self._build_app()
+        app.session_active = True
+        app._current_response_start_time = None
+
+        OpenAssistApp._on_response_complete(app, "done")
+
+        self.assertEqual(app.overlay.completed[-1][0], "done")
+
+    def test_generate_response_sets_response_start_time_for_manual_turns(self):
+        app = self._build_app()
+        app.session_active = True
+        app._ai_lock_ready = SimpleNamespace(wait=lambda timeout=2: True)
+        app.ai = SimpleNamespace(
+            detector=SimpleNamespace(learn_from_query=lambda q: None),
+            demote_to_background=lambda: None,
+        )
+        app.simulator = SimpleNamespace(get_foreground_window=lambda: None)
+        app.overlay.response_area.setHtml = lambda html: None
+        app._pending_request_metadata = None
+        async def _fake_process_ai(*args, **kwargs):
+            return None
+        app._process_ai = _fake_process_ai
+        app.loop = object()
+        scheduled = []
+
+        with patch("core.app.asyncio.run_coroutine_threadsafe", side_effect=lambda coro, loop: scheduled.append((coro, loop))):
+            OpenAssistApp.generate_response(app, "what is hoisting ?", "manual", {"audio": ""})
+        for coro, _loop in scheduled:
+            try:
+                coro.close()
+            except Exception:
+                pass
+
+        self.assertIsNotNone(app._current_response_start_time)
+
+    def test_live_error_promotes_pending_turn_to_standard_mode(self):
+        app = self._build_app()
+        app.session_active = True
+        app.config.set("ai.live_mode.enabled", True)
+        app._live_mode_active = True
+        app._live_mode_reconnecting = False
+        app._live_fallback_active = False
+        app._live_turn_pending = True
+        app._pending_live_query = "what changed"
+        app._last_live_transcript = "older transcript"
+        timer_stops = []
+        app._live_turn_timer = SimpleNamespace(stop=lambda: timer_stops.append("stop"))
+        generated = []
+        app.generate_response = lambda q, s="manual", c=None: generated.append((q, s, c))
+        app._promote_live_turn_to_standard = lambda reason: OpenAssistApp._promote_live_turn_to_standard(app, reason)
+
+        OpenAssistApp._on_live_error(app, "socket closed")
+
+        self.assertEqual(generated, [("what changed", "speech", {"audio": "what changed"})])
+        self.assertFalse(app._live_turn_pending)
+        self.assertTrue(app._live_fallback_active)
+        self.assertEqual(app.overlay.live_mode_updates[-1]["fallback"], True)
+        self.assertIn("standard audio pipeline", app.overlay.transcript_updates[-1].lower())
+        self.assertTrue(timer_stops)
+
+    def test_live_turn_complete_uses_pending_query_snapshot(self):
+        app = self._build_app()
+        app.session_active = True
+        app.config.set("ai.live_mode.enabled", True)
+        app._live_mode_active = True
+        app._live_mode_reconnecting = False
+        app._live_fallback_active = False
+        app._live_turn_pending = True
+        app._pending_live_query = "current live question"
+        app._last_live_transcript = "previous question"
+        timer_stops = []
+        app._live_turn_timer = SimpleNamespace(stop=lambda: timer_stops.append("stop"))
+
+        OpenAssistApp._on_live_turn_complete(app, "live answer")
+
+        self.assertEqual(app.history.entries[-1]["query"], "current live question")
+        self.assertEqual(app.history.entries[-1]["provider"], "gemini-live")
+        self.assertEqual(app.overlay.completed[-1], ("live answer", "current live question"))
+        self.assertFalse(app._live_turn_pending)
+        self.assertEqual(app._pending_live_query, "")
+        self.assertTrue(timer_stops)
+
+    def test_live_status_connected_suspends_standard_asr(self):
+        app = self._build_app()
+        app.session_active = True
+        app.config.set("ai.live_mode.enabled", True)
+        suspends = []
+        app.audio = SimpleNamespace(
+            set_standard_transcription_suspended=lambda enabled, reason="": suspends.append((enabled, reason))
+        )
+        app.live_session = SimpleNamespace(is_connected=True)
+
+        OpenAssistApp._on_live_status_changed(app, "Live Listening...")
+
+        self.assertEqual(suspends[-1], (True, "live listening..."))
+
+    def test_stop_live_mode_resumes_standard_asr(self):
+        app = self._build_app()
+        resumed = []
+        app.audio = SimpleNamespace(
+            set_standard_transcription_suspended=lambda enabled, reason="": resumed.append((enabled, reason))
+        )
+        app.live_session = SimpleNamespace(stop=lambda: None)
+
+        OpenAssistApp._stop_live_mode(app)
+
+        self.assertEqual(resumed[-1], (False, "live-stopped"))
+
+    def test_live_requested_but_unavailable_marks_standard_fallback(self):
+        app = self._build_app()
+        app.session_active = True
+        app.config.set("ai.live_mode.enabled", True)
+        app.live_session.start = lambda *args, **kwargs: False
+        app._live_turn_timer = SimpleNamespace(stop=lambda: None)
+
+        OpenAssistApp._start_live_mode(app)
+
+        self.assertFalse(app._live_mode_active)
+        self.assertTrue(app._live_fallback_active)
+        self.assertEqual(app.overlay.live_mode_updates[-1]["fallback"], True)
+        self.assertIn("standard audio pipeline", app.overlay.transcript_updates[-1].lower())
+
+    def test_end_session_persists_last_exchange_before_history_rollover(self):
+        app = self._build_app()
+        app.session_active = True
+        app.history.entries.append(
+            {
+                "query": "what changed",
+                "response": "the queue backed up",
+                "provider": "groq",
+                "mode": "general",
+                "latency": 42,
+                "metadata": {},
+            }
+        )
+        stored = []
+        app.memory = SimpleNamespace(
+            store=lambda session_id, q, r, mode="general": stored.append((q, r, mode))
+        )
+
+        OpenAssistApp.end_session(app)
+
+        self.assertEqual(stored, [("what changed", "the queue backed up", "general")])
 
     def test_screen_analysis_badge_updates_during_flow(self):
         app = self._build_app()
