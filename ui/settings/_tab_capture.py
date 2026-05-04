@@ -161,6 +161,17 @@ class CaptureTabMixin:
         chunking_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
         l.addWidget(chunking_desc)
 
+        self.chk_live_mode = PremiumCheckBox("Enable Live Audio Mode (Gemini Live)")
+        self.chk_live_mode.setChecked(bool(self.config.get("ai.live_mode.enabled", False)))
+        l.addWidget(self.chk_live_mode)
+        live_desc = QLabel(
+            "Keeps a live Gemini session open for faster back-and-forth audio replies. "
+            "Requires a Gemini API key and uses streaming cloud audio."
+        )
+        live_desc.setWordWrap(True)
+        live_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+        l.addWidget(live_desc)
+
         sep3 = QFrame()
         sep3.setFixedHeight(1)
         sep3.setStyleSheet("background: rgba(255,255,255,12);")
