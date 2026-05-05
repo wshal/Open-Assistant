@@ -1456,9 +1456,9 @@ class AIEngine(QObject):
         )
 
         preferred = []
-        fixed = self.config.get("ai.fixed_provider", "")
-        if fixed:
-            preferred.append(fixed)
+        # NOTE: ai.fixed_provider is a TEXT-only override. Do NOT inject it into
+        # vision candidates — it's typically a fast LLM (groq) with no vision support.
+        # Vision provider selection always uses ai.vision.preferred_providers.
 
         cfg_order = self.config.get("ai.vision.preferred_providers", None)
         if isinstance(cfg_order, list) and cfg_order:
@@ -1479,17 +1479,21 @@ class AIEngine(QObject):
             preferred = [p for p in preferred if p != "openai"]
 
         candidates = []
+        logger.info(f"[AnalyzeScreen] Starting vision provider selection. preferred_order={preferred}")
         for name in preferred:
             provider = self._providers.get(name)
-            if (
-                provider
-                and provider.enabled
-                and provider.check_rate()
-                and getattr(provider, "supports_vision", lambda: False)()
-            ):
+            if not provider:
+                logger.warning(f"[AnalyzeScreen] Provider {name!r} not found in _providers (keys={list(self._providers.keys())})")
+                continue
+            enabled_ok = provider.enabled
+            rate_ok = provider.check_rate()
+            vision_ok = getattr(provider, "supports_vision", lambda: False)()
+            logger.info(f"[AnalyzeScreen] Provider {name!r}: enabled={enabled_ok}, rate_ok={rate_ok}, supports_vision={vision_ok}")
+            if enabled_ok and rate_ok and vision_ok:
                 candidates.append(provider)
 
         if not candidates:
+            logger.error(f"[AnalyzeScreen] FATAL: No vision-capable provider found! preferred={preferred}, providers={list(self._providers.keys())}")
             raise Exception("No vision-capable provider available for screenshot analysis.")
 
         last_error = None

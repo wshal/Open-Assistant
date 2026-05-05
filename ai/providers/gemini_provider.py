@@ -67,7 +67,7 @@ class GeminiProvider(BaseProvider):
             cfg_kwargs = dict(max_output_tokens=self.max_tokens, temperature=0.7)
             if sys_instr:
                 cfg_kwargs["system_instruction"] = sys_instr
-            r = self.client.models.generate_content(
+            r = await self.client.aio.models.generate_content(
                 model=model, contents=contents,
                 config=types.GenerateContentConfig(**cfg_kwargs)
             )
@@ -90,11 +90,11 @@ class GeminiProvider(BaseProvider):
             cfg_kwargs = dict(max_output_tokens=self.max_tokens, temperature=0.7)
             if sys_instr:
                 cfg_kwargs["system_instruction"] = sys_instr
-            stream = self.client.models.generate_content_stream(
+            stream = await self.client.aio.models.generate_content_stream(
                 model=model, contents=contents,
                 config=types.GenerateContentConfig(**cfg_kwargs)
             )
-            for chunk in stream:
+            async for chunk in stream:
                 if chunk.text:
                     tok += len(chunk.text) // 4
                     yield chunk.text
@@ -132,7 +132,7 @@ class GeminiProvider(BaseProvider):
             else:
                 final_contents = [text_part, image_part]
 
-            r = self.client.models.generate_content(
+            r = await self.client.aio.models.generate_content(
                 model=model,
                 contents=final_contents,
                 config=types.GenerateContentConfig(**cfg_kwargs),
@@ -179,12 +179,12 @@ class GeminiProvider(BaseProvider):
             else:
                 final_contents = [text_part, image_part]
 
-            stream = self.client.models.generate_content_stream(
+            stream = await self.client.aio.models.generate_content_stream(
                 model=model,
                 contents=final_contents,
                 config=types.GenerateContentConfig(**cfg_kwargs),
             )
-            for chunk in stream:
+            async for chunk in stream:
                 if chunk.text:
                     tok += len(chunk.text) // 4
                     yield chunk.text

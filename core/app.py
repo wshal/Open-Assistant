@@ -45,6 +45,7 @@ logger = setup_logger(__name__)
 
 class OpenAssistApp(QObject):
     warmup_status_update = pyqtSignal(str, int, bool)
+    run_on_ui_thread = pyqtSignal(object)
 
     def __init__(self, config: Config, mini_mode: bool = False):
         super().__init__()
@@ -54,6 +55,7 @@ class OpenAssistApp(QObject):
         self.state.is_mini = mini_mode
         self.is_running = True
         self.qt_app = QApplication.instance() or QApplication(sys.argv)
+        self.run_on_ui_thread.connect(self._execute_on_ui_thread)
 
         # Components
         self.history = ResponseHistory()
@@ -173,26 +175,28 @@ class OpenAssistApp(QObject):
             logger.info("[P3.1 Prefetcher] Wired to async loop")
         self.loop.run_forever()
 
+    def _execute_on_ui_thread(self, func):
+        try:
+            func()
+        except Exception as e:
+            logger.error(f"UI Thread Execution Error: {e}")
+
     def _wire_signals(self):
         self.overlay.user_query.connect(self.generate_response)
         self.mini_overlay.user_query.connect(self.generate_response)
         self.ai.response_chunk.connect(self._on_response_chunk_trace)
-        self.ai.response_chunk.connect(lambda c: self.overlay.append_response(c))
-        self.ai.response_chunk.connect(lambda c: self.mini_overlay.append_response(c))
+        self.ai.response_chunk.connect(self.overlay.append_response)
+        self.ai.response_chunk.connect(self.mini_overlay.append_response)
         if hasattr(self.ai, "background_complete"):
-            self.ai.background_complete.connect(
-                lambda q, r: self.overlay._on_bg_complete(q, r)
-            )
-            self.ai.background_complete.connect(
-                lambda q, r: self.mini_overlay._on_bg_complete(q, r)
-            )
+            self.ai.background_complete.connect(self.overlay._on_bg_complete)
+            self.ai.background_complete.connect(self.mini_overlay._on_bg_complete)
         # GAP 5: on_complete is now called by _on_response_complete (below) with
         # cache_tier + provider so the source badge can be rendered in the response area.
         # We keep a direct error→on_complete connection for error text display.
-        self.ai.error_occurred.connect(
-            lambda e: self.overlay.on_complete(f"ERROR: {e}")
-        )
-        self.ai.error_occurred.connect(lambda e: self.mini_overlay.show_error(e))
+        def _handle_error(e):
+            self.run_on_ui_thread.emit(lambda: self.overlay.on_complete(f"ERROR: {e}"))
+            self.run_on_ui_thread.emit(lambda: self.mini_overlay.show_error(e))
+        self.ai.error_occurred.connect(_handle_error)
         self.audio.transcription_ready.connect(self._on_transcription)
         if hasattr(self.audio, "interim_transcription_ready"):
             self.audio.interim_transcription_ready.connect(self._on_interim_transcription)
@@ -1506,23 +1510,27 @@ class OpenAssistApp(QObject):
         if not getattr(self, "ai", None) or not getattr(self, "screen", None):
             return
 
-        self.overlay.update_transcript("Screen captured. Analyzing current screen...")
+        self.run_on_ui_thread.emit(lambda: self.overlay.update_transcript("Screen captured. Analyzing current screen..."))
         if hasattr(self.overlay, "set_analysis_provider_badge"):
-            self.overlay.set_analysis_provider_badge(pending=True)
+            self.run_on_ui_thread.emit(lambda: self.overlay.set_analysis_provider_badge(pending=True))
         self._screen_analysis_pending = True
         request_epoch = self._generation_epoch
 
         async def _capture_and_analyze():
+            logger.info(f"[AnalyzeScreen] _capture_and_analyze started | epoch={request_epoch} | current_epoch={self._generation_epoch}")
             if request_epoch != self._generation_epoch:
+                logger.warning("[AnalyzeScreen] Epoch mismatch on entry — aborting")
                 return
+            logger.info("[AnalyzeScreen] Capturing screen image...")
             image_bytes = await self.screen.capture_image_bytes(for_analysis=True)
+            logger.info(f"[AnalyzeScreen] Captured image | size={len(image_bytes) if image_bytes else 0}B")
             if request_epoch != self._generation_epoch:
                 return
             if not image_bytes:
                 self._screen_analysis_pending = False
-                self.overlay.update_transcript("Screen capture failed.")
+                self.run_on_ui_thread.emit(lambda: self.overlay.update_transcript("Screen capture failed."))
                 if hasattr(self.overlay, "set_analysis_provider_badge"):
-                    self.overlay.set_analysis_provider_badge()
+                    self.run_on_ui_thread.emit(lambda: self.overlay.set_analysis_provider_badge())
                 return
 
             audio_text = self.audio.get_transcript()
@@ -1589,6 +1597,23 @@ class OpenAssistApp(QObject):
                         "If it is a coding/UI task, include code."
                     )
 
+                def _setup_ui():
+                    self.overlay.show_chat_view()
+                    self.overlay.response_area.clear()
+                    self.overlay._is_streaming = False
+                    self.overlay._current_query = query
+                    self.overlay._pending_thinking = True
+                    self.overlay.response_area.setHtml(
+                        f"<div style='color:#64748b;font-size:10px;margin-bottom:5px;'>"
+                        f"<b>QUERY:</b> {query}</div>"
+                    )
+                self.run_on_ui_thread.emit(_setup_ui)
+
+                logger.info(
+                    f"[AnalyzeScreen] Calling analyze_image_response | "
+                    f"image_bytes={len(image_bytes)}B | query_len={len(query)} | "
+                    f"screen_text_len={len(screen_text)} | audio_text_len={len(audio_text)}"
+                )
                 try:
                     await self.ai.analyze_image_response(
                         query,
@@ -1597,6 +1622,7 @@ class OpenAssistApp(QObject):
                         screen_context=screen_text,
                         audio_context=audio_text,
                     )
+                    logger.info("[AnalyzeScreen] analyze_image_response completed successfully")
                     # Best-effort: if OCR wasn't ready earlier, try to grab it quickly
                     # after vision completes so Nexus stays up-to-date.
                     latest_ocr = ocr_text
@@ -1607,22 +1633,27 @@ class OpenAssistApp(QObject):
                             latest_ocr = ""
                     if latest_ocr and request_epoch == self._generation_epoch:
                         self.nexus.push("screen", latest_ocr)
+                    
+                    self._screen_analysis_pending = False
+                    if hasattr(self.overlay, "set_analysis_provider_badge"):
+                        self.run_on_ui_thread.emit(lambda: self.overlay.set_analysis_provider_badge(provider="vision"))
                     return
                 except Exception as exc:
                     if request_epoch != self._generation_epoch:
                         return
                     self._screen_analysis_pending = False
                     if hasattr(self.overlay, "set_analysis_provider_badge"):
-                        self.overlay.set_analysis_provider_badge()
-                    logger.warning(f"Vision analysis exhausted providers: {exc}")
+                        self.run_on_ui_thread.emit(lambda: self.overlay.set_analysis_provider_badge())
+                    logger.error(f"Vision analysis exhausted providers: {exc}", exc_info=True)
                     if hasattr(self.overlay, "show_error_toast"):
-                        self.overlay.show_error_toast(
-                            "Image analysis failed — using OCR/text fallback."
-                        )
-                    self.overlay.update_transcript(
+                        error_msg = str(exc) if str(exc) else repr(exc)
+                        self.run_on_ui_thread.emit(lambda: self.overlay.show_error_toast(
+                            f"Image analysis failed ({error_msg}) — using text fallback."
+                        ))
+                    self.run_on_ui_thread.emit(lambda: self.overlay.update_transcript(
                         "Screen captured, but image analysis failed. Using OCR/text fallback...",
                         state="error",
-                    )
+                    ))
 
                     # Fall back to OCR/text routing (best-effort).
                     try:

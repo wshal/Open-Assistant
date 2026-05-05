@@ -361,10 +361,14 @@ class ScreenCapture(QObject):
         When `for_analysis=True`, uses a lower default quality and (if available)
         Smart-Crop focus region to reduce latency for vision providers.
         """
-        if not self._enabled:
+        # `_enabled` gates the *continuous background OCR loop*.
+        # A manual analysis request (for_analysis=True) must always proceed
+        # regardless of whether the loop is enabled, so the Analyze Screen
+        # button works even when capture.screen.enabled=false in config.
+        if not self._enabled and not for_analysis:
             return b""
 
-        img = self._screenshot()
+        img = await self._screenshot_async()
         if img is None:
             return b""
 
@@ -479,7 +483,8 @@ class ScreenCapture(QObject):
                 if active_rect:
                     x, y, w, h = active_rect
 
-                    screen_width, screen_height = ProcessUtils.get_primary_screen_size()
+                    from utils.platform_utils import ScreenInfo
+                    screen_width, screen_height = ScreenInfo.get_primary_screen_size()
 
                     # Sanitize the window rect to clamp it within the primary display bounding box
                     x = max(0, x)
