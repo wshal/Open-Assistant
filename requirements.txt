@@ -25,6 +25,7 @@ rapidocr_onnxruntime>=1.4.4
 
 # -- Audio & Speech-to-Text --------------------------------------------
 sounddevice>=0.4.0
+soundcard>=0.4.3
 numpy>=1.24.0
 faster-whisper>=1.0.0
 

@@ -873,13 +873,8 @@ class AudioCapture(QObject):
 
         try:
             devices = sd.query_devices()
-            for i, d in enumerate(devices):
-                if d["max_input_channels"] > 0 and any(
-                    x in d["name"].lower()
-                    for x in ["stereo mix", "cable", "vb-audio", "what u hear"]
-                ):
-                    return i, d["name"], False
-
+            
+            # 1. Prefer WASAPI Loopback (Modern, zero-setup, direct digital capture)
             apis = sd.query_hostapis()
             wasapi_idx = next(
                 (i for i, a in enumerate(apis) if "WASAPI" in a["name"]), None
@@ -888,6 +883,14 @@ class AudioCapture(QObject):
                 for i, d in enumerate(devices):
                     if d["hostapi"] == wasapi_idx and d["max_output_channels"] > 0:
                         return i, d["name"], True
+
+            # 2. Fallback to Stereo Mix / Virtual Cables (Legacy)
+            for i, d in enumerate(devices):
+                if d["max_input_channels"] > 0 and any(
+                    x in d["name"].lower()
+                    for x in ["stereo mix", "cable", "vb-audio", "what u hear"]
+                ):
+                    return i, d["name"], False
 
             for i, d in enumerate(devices):
                 if d["max_input_channels"] > 0 and any(
@@ -998,6 +1001,38 @@ class AudioCapture(QObject):
         except Exception:
             pass
 
+    def _start_windows_wasapi_loopback(self):
+        """Windows: Native WASAPI loopback via soundcard."""
+        import soundcard as sc
+        
+        try:
+            speaker = sc.default_speaker()
+            logger.info(f"🎤 Binding to WASAPI Loopback: {speaker.name}")
+        except Exception as e:
+            logger.error(f"Failed to find WASAPI loopback speaker: {e}")
+            return False
+
+        def _wasapi_reader():
+            try:
+                # Acquire the virtual loopback microphone for the default speaker
+                loopback_mic = sc.get_microphone(speaker.id, include_loopback=True)
+                with loopback_mic.recorder(samplerate=self.sr) as mic:
+                    chunk_frames = int(self.sr * self.block_ms / 1000.0)
+                    while self._running:
+                        data = mic.record(numframes=chunk_frames)
+                        if data is not None and len(data) > 0:
+                            # soundcard returns shape (frames, channels)
+                            mono = np.mean(data, axis=1, keepdims=True).astype(np.float32)
+                            self._enqueue_audio_frames(mono, "wasapi-loopback")
+            except Exception as e:
+                if self._running:
+                    logger.debug(f"WASAPI Loopback reader error: {e}")
+
+        t = threading.Thread(target=_wasapi_reader, daemon=True, name="wasapi-loopback")
+        self._active_streams.append(t)
+        t.start()
+        return True
+
     def _capture_loop(self):
         import sounddevice as sd
 
@@ -1036,6 +1071,8 @@ class AudioCapture(QObject):
                         import sys
                         if sys.platform == "darwin":
                             self._start_macos_system_audio()
+                        elif sys.platform == "win32":
+                            self._start_windows_wasapi_loopback()
                         else:
                             idx, name, is_loopback = self._find_system_audio_source()
                             if idx is not None:
@@ -1062,9 +1099,24 @@ class AudioCapture(QObject):
                                         )
                                         s_sys = sd.InputStream(**kwargs)
                                     except TypeError:
-                                        raise RuntimeError(
-                                            "Installed sounddevice build has no WASAPI loopback support"
-                                        )
+                                        logger.warning("Installed sounddevice build has no WASAPI loopback support. Falling back to Stereo Mix.")
+                                        fallback_idx = None
+                                        devices = sd.query_devices()
+                                        for i, d_fb in enumerate(devices):
+                                            if d_fb["max_input_channels"] > 0 and any(
+                                                x in d_fb["name"].lower()
+                                                for x in ["stereo mix", "cable", "vb-audio", "what u hear"]
+                                            ):
+                                                fallback_idx = i
+                                                logger.info(f"🎤 Fallback Binding to: {d_fb['name']}")
+                                                break
+                                        if fallback_idx is not None:
+                                            kwargs["device"] = fallback_idx
+                                            kwargs.pop("loopback", None)
+                                            kwargs["channels"] = max(1, min(2, devices[fallback_idx].get("max_input_channels", 0) or 1))
+                                            s_sys = sd.InputStream(**kwargs)
+                                        else:
+                                            raise RuntimeError("Installed sounddevice build has no WASAPI loopback support and no Stereo Mix found.")
                                 else:
                                     s_sys = sd.InputStream(**kwargs)
                                 self._active_streams.append(s_sys)
