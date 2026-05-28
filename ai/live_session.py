@@ -43,6 +43,8 @@ class LiveSessionManager(QObject):
         self._running = False
         self._stopping = False
         self._resume_handle: Optional[str] = None
+        self._audio_queue: Optional[asyncio.Queue] = None
+        self._sender_task: Optional[asyncio.Task] = None
 
     @property
     def is_connected(self) -> bool:
@@ -67,6 +69,7 @@ class LiveSessionManager(QObject):
         self._running = True
         self._stopping = False
         self._resume_handle = None
+        self._audio_queue = asyncio.Queue()
         system_prompt = self._build_live_system_prompt(
             self.prompts.system(mode=mode, session_context=session_context)
         )
@@ -76,6 +79,10 @@ class LiveSessionManager(QObject):
             self._session_task = asyncio.create_task(
                 self._session_main(system_prompt),
                 name="gemini-live-session",
+            )
+            self._sender_task = asyncio.create_task(
+                self._audio_sender_loop(),
+                name="gemini-live-sender",
             )
 
         asyncio.run_coroutine_threadsafe(_spawn(), loop)
@@ -96,6 +103,10 @@ class LiveSessionManager(QObject):
         async def _stop():
             task = self._session_task
             self._session_task = None
+            sender = getattr(self, "_sender_task", None)
+            self._sender_task = None
+            if sender and not sender.done():
+                sender.cancel()
             await self._close_specific_session(session)
             if task and not task.done():
                 task.cancel()
@@ -111,10 +122,40 @@ class LiveSessionManager(QObject):
     def send_audio_chunk(self, pcm_bytes: bytes, sample_rate: int = 16000) -> None:
         if not pcm_bytes or not self.is_connected or not self._loop or not self._loop.is_running():
             return
-        asyncio.run_coroutine_threadsafe(
-            self._send_audio_chunk_now(pcm_bytes, sample_rate),
-            self._loop,
-        )
+        if getattr(self, "_audio_queue", None) is not None:
+            self._loop.call_soon_threadsafe(self._audio_queue.put_nowait, (pcm_bytes, sample_rate))
+
+    async def _audio_sender_loop(self):
+        import time
+        while self._running:
+            try:
+                pcm_bytes, sample_rate = await self._audio_queue.get()
+                
+                qsize = self._audio_queue.qsize()
+                if qsize > 0:
+                    chunks = [pcm_bytes]
+                    for _ in range(qsize):
+                        chunks.append(self._audio_queue.get_nowait()[0])
+                    pcm_bytes = b"".join(chunks)
+                    if qsize >= 5:
+                        logger.warning(f"Live Audio Queue depth is {qsize} — batched {qsize + 1} chunks to relieve backlog")
+                
+                if not self._connected or not getattr(self, "_session", None):
+                    continue
+
+                t0 = time.time()
+                await self._send_audio_chunk_now(pcm_bytes, sample_rate)
+                t1 = time.time()
+                
+                duration_ms = (t1 - t0) * 1000
+                if duration_ms > 150:
+                    logger.debug(f"Live Audio send_realtime_input took {duration_ms:.1f}ms")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in Live Mode audio sender: {e}")
+                await asyncio.sleep(0.1)
 
     def end_audio_turn(self) -> None:
         if not self.is_connected or not self._loop or not self._loop.is_running():
@@ -218,12 +259,19 @@ class LiveSessionManager(QObject):
             if delta:
                 if not self._response_started:
                     self._response_started = True
+                    logger.info("Live Mode Native Event: First Delta Received (Time-to-first-byte)")
                     self.status_changed.emit("Live Responding...")
                 # Buffer raw live output and publish only the cleaned final answer
                 # on turn completion so users don't see planning/thinking prefaces.
                 self._response_buffer += delta
 
             if self._is_turn_complete(message):
+                server_content = self._extract_server_content(message)
+                if getattr(server_content, "turn_complete", False) or getattr(server_content, "turnComplete", False):
+                    logger.info("Live Mode Native Event: turnComplete")
+                if getattr(server_content, "generation_complete", False) or getattr(server_content, "generationComplete", False):
+                    logger.info("Live Mode Native Event: generationComplete")
+                
                 had_visible_response = self._response_started or bool(self._response_buffer.strip())
                 final_text = self._clean_live_response(self._response_buffer)
                 if final_text:
@@ -251,7 +299,10 @@ class LiveSessionManager(QObject):
         session = self._session
         if not session:
             return
-        await session.send_realtime_input(audio_stream_end=True)
+        from google.genai import types
+        await session.send_realtime_input(
+            client_content=types.LiveClientContent(turn_complete=True)
+        )
 
     async def _close_specific_session(self, session) -> None:
         if not session:

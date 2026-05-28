@@ -118,6 +118,7 @@ class OpenAssistApp(QObject):
         self._last_final_transcript_at = 0.0
         self._pending_incomplete_audio_query = ""
         self._pending_incomplete_audio_at = 0.0
+        self._neural_route_seq = 0
 
         # Async Loop
         self.loop = asyncio.new_event_loop()
@@ -2303,7 +2304,83 @@ class OpenAssistApp(QObject):
                 f"[{session_id}] 🤖 RESPONSE GENERATION START | total_elapsed_so_far={elapsed_ms:.1f}ms"
             )
             self.generate_response(t, "speech", {"audio": t})
+        else:
+            # ── Phase 3: Neural Intent Routing ────────────────────────────────────
+            # If rigid keyword parsing failed, use a fast LLM to route intent.
+            fast_provider = None
+            if getattr(self, "ai", None) and hasattr(self.ai, "providers"):
+                if "groq" in self.ai.providers and not self.ai.providers["groq"].is_disabled():
+                    fast_provider = self.ai.providers["groq"]
+                elif self.ai.active_provider:
+                    fast_provider = self.ai.providers.get(self.ai.active_provider)
 
+            if fast_provider and self.loop and self.loop.is_running():
+                self._neural_route_seq += 1
+                route_seq = self._neural_route_seq
+                self._pending_incomplete_audio_query = t
+                self._pending_incomplete_audio_at = time.time()
+                self.overlay.update_transcript("🤔 Analyzing intent...", state="processing")
+
+                async def _neural_route():
+                    try:
+                        logger.info(f"[{session_id}] 🧠 Neural Intent Router evaluating: '{t[:50]}'")
+                        prompt = (
+                            "You are a conversation intent router. Read the transcript. "
+                            "Is the user making a statement that requires a response, asking a subtle question, "
+                            "or directly addressing an AI assistant? "
+                            "IGNORE simple greetings ('hello', 'hi') and filler statements ('let's get started', 'okay'). "
+                            "Reply ONLY with YES or NO.\n\n"
+                            f"Transcript: {t}"
+                        )
+                        result = await fast_provider.generate(prompt, "", tier="fast")
+                        is_current_route = (
+                            route_seq == getattr(self, "_neural_route_seq", 0)
+                            and (getattr(self, "_pending_incomplete_audio_query", "") or "").strip() == t
+                        )
+                        if not is_current_route:
+                            logger.info(
+                                f"[{session_id}] Neural Intent Router result ignored as stale | intent='{t[:40]}'"
+                            )
+                            return
+                        if result and "yes" in result.strip().lower()[:5]:
+                            logger.info(f"[{session_id}] ⚡ NEURAL QUESTION DETECTED | auto_respond=True | intent='{t[:40]}'")
+                            def _fire_response():
+                                self._pending_incomplete_audio_query = ""
+                                self._pending_incomplete_audio_at = 0.0
+                                self._pending_request_metadata = dict(request_metadata or {})
+                                self._current_response_start_time = time.time()
+                                logger.info(f"[{session_id}] 🤖 NEURAL RESPONSE GENERATION START")
+                                self.generate_response(t, "speech", {"audio": t})
+                            self.run_on_ui_thread.emit(_fire_response)
+                        else:
+                            logger.info(f"[{session_id}] 🛑 Neural Intent Router: NO response needed.")
+                            def _hint():
+                                self._pending_incomplete_audio_query = ""
+                                self._pending_incomplete_audio_at = 0.0
+                                self.overlay.update_transcript(
+                                    f"🤔 Statement logged (tap ⎨ to force response)",
+                                    state="processing",
+                                )
+                            self.run_on_ui_thread.emit(_hint)
+                    except Exception as e:
+                        logger.error(f"Neural Intent Router failed: {e}")
+                        def _fail_hint():
+                            self._pending_incomplete_audio_query = ""
+                            self._pending_incomplete_audio_at = 0.0
+                            self.overlay.update_transcript(
+                                f"🤔 Possible question detected (tap ⎨ to answer)",
+                                state="processing",
+                            )
+                        self.run_on_ui_thread.emit(_fail_hint)
+
+                asyncio.run_coroutine_threadsafe(_neural_route(), self.loop)
+            else:
+                self._pending_incomplete_audio_query = t
+                self._pending_incomplete_audio_at = time.time()
+                self.overlay.update_transcript(
+                    f"🤔 Possible question detected (tap ⎨ to answer)",
+                    state="processing",
+                )
     def _should_ignore_final_transcript(self, text: str) -> bool:
         """Drop tiny non-question final ASR scraps before they enter context/history."""
         from utils.text_utils import is_likely_fragment
@@ -2311,6 +2388,10 @@ class OpenAssistApp(QObject):
         cleaned = (text or "").strip()
         if not cleaned:
             return True
+
+        # System audio is a perfect signal. Short phrases like "for" are usually valid and not hallucinations.
+        if getattr(self.audio, "capture_mode", "microphone") == "system" and len(cleaned) > 1:
+            return False
 
         if is_likely_fragment(cleaned):
             return True

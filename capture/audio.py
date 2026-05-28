@@ -1004,6 +1004,11 @@ class AudioCapture(QObject):
     def _start_windows_wasapi_loopback(self):
         """Windows: Native WASAPI loopback via soundcard."""
         import soundcard as sc
+        import warnings
+        
+        # Suppress the spammy WASAPI discontinuity warnings during silence
+        warnings.filterwarnings("ignore", category=UserWarning, module="soundcard")
+        warnings.filterwarnings("ignore", message="data discontinuity in recording")
         
         try:
             speaker = sc.default_speaker()
@@ -1376,22 +1381,40 @@ class AudioCapture(QObject):
         # during 4 seconds of fan noise will bypass the gate. We calculate the mean RMS
         # of the entire buffer to accurately drop sustained background noise.
         mean_rms = 0.0
+        rms_measurement_valid = False
         if buffer and len(buffer) > 0:
-            concat_data = np.concatenate(buffer)
-            mean_rms = float(np.sqrt(np.mean(concat_data**2)))
-            
+            numeric_blocks = []
+            for block in buffer:
+                try:
+                    arr = np.asarray(block, dtype=np.float32).reshape(-1)
+                except Exception:
+                    numeric_blocks = []
+                    break
+                if arr.size == 0:
+                    continue
+                numeric_blocks.append(arr)
+            if numeric_blocks:
+                concat_data = np.concatenate(numeric_blocks)
+                mean_rms = float(np.sqrt(np.mean(concat_data**2)))
+                rms_measurement_valid = True
+
         if (
             self.capture_mode == "system"
-            and mean_rms < (self._cold_start_guard_min_rms * 0.4)
+            and rms_measurement_valid
+            and mean_rms < 0.001
             and not bool((vad_meta or {}).get("chunk_aware_eos", False))
+            and (
+                self._final_decode_pending > 0
+                or speech_duration >= 2.0
+                or voiced_blocks >= self._system_followup_guard_max_voiced_blocks
+            )
         ):
             logger.info(
                 "[%s] FINAL TRANSCRIPTION DROP | utterance=%s | reason=absolute-noise-floor"
-                " | mean_rms=%.5f < %.5f (peak_rms=%.5f)",
+                " | mean_rms=%.5f < 0.00100 (peak_rms=%.5f)",
                 self._trace_session_id or "audio",
                 utterance_id,
                 mean_rms,
-                self._cold_start_guard_min_rms * 0.4,
                 peak_rms,
             )
             return False
@@ -1460,7 +1483,7 @@ class AudioCapture(QObject):
                     and not bool((vad_meta or {}).get("chunk_aware_eos", False))
                     and speech_duration <= self._system_superseded_final_skip_max_s
                     and peak_rms <= self._system_followup_guard_max_peak_rms
-                    and self._final_decode_pending > 2
+                    and self._final_decode_pending > 1
                 ):
                     logger.info(
                         "[%s] FINAL TRANSCRIPTION SKIP | utterance=%s | reason=superseded-system-short-final | job=%d | latest=%d | speech_duration=%.2fs | pending=%d",
@@ -1494,8 +1517,10 @@ class AudioCapture(QObject):
                 if (
                     self.capture_mode == "system"
                     and job_seq < self._latest_final_job_seq
-                    and self._final_decode_pending > 2
+                    and self._final_decode_pending > 1
                     and not bool((vad_meta or {}).get("chunk_aware_eos", False))
+                    and speech_duration <= self._system_superseded_final_skip_max_s
+                    and peak_rms <= self._system_followup_guard_max_peak_rms
                 ):
                     logger.info(
                         "[%s] FINAL TRANSCRIPTION SKIP | utterance=%s | reason=late-superseded | job=%d | latest=%d | pending=%d",
@@ -1645,6 +1670,11 @@ class AudioCapture(QObject):
                     logger.debug(f"Audio queue timeout: {e}")
                 continue
 
+            # Always emit raw continuous audio to the Live Mode signal. 
+            # This completely bypasses the local VAD, ensuring Gemini's server-side
+            # model receives the uninterrupted PCM stream it expects for organic turn-taking.
+            self._emit_live_audio_chunk(data)
+
             rms = float(np.sqrt(np.mean(data**2)))
 
             # Speech detection:
@@ -1733,10 +1763,8 @@ class AudioCapture(QObject):
                         rms,
                     )
                     if pre_roll:
-                        for pre_block in pre_roll:
-                            self._emit_live_audio_chunk(pre_block)
-                    for pending_block in pending_speech_blocks:
-                        self._emit_live_audio_chunk(pending_block)
+                        # (Live audio chunks have already been emitted at the top of the loop)
+                        pass
                     # Prepend pre-roll blocks so Whisper sees the onset context.
                     speech_buffer = list(pre_roll) + list(pending_speech_blocks)
                     pre_roll.clear()
@@ -1757,7 +1785,7 @@ class AudioCapture(QObject):
                 else:
                     utterance_peak_rms = max(utterance_peak_rms, rms)
                     utterance_voiced_blocks += 1
-                    self._emit_live_audio_chunk(data)
+                    # (Live audio chunks have already been emitted at the top of the loop)
                     idle_silence_blocks = 0
                 is_speaking = True
                 if self._max_utterance_exceeded(utterance_started_at):

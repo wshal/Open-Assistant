@@ -64,12 +64,7 @@ class StandbyView(QWidget):
 
     STYLE_ACTIVE = """
         QPushButton {
-            background: qlineargradient(
-                x1:0, y1:0, x2:1, y2:1,
-                stop:0 #5b4cf1,
-                stop:0.55 #6d4cf6,
-                stop:1 #8b5cf6
-            );
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #5b4cf1, stop:0.55 #6d4cf6, stop:1 #8b5cf6);
             color: white;
             border: 1px solid rgba(255,255,255,60);
             border-radius: 10px;
@@ -81,12 +76,7 @@ class StandbyView(QWidget):
 
     START_BUTTON_STYLE = """
         QPushButton {
-            background: qlineargradient(
-                x1:0, y1:0, x2:1, y2:1,
-                stop:0 #5b4cf1,
-                stop:0.55 #7047f5,
-                stop:1 #8b5cf6
-            );
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #5b4cf1, stop:0.55 #7047f5, stop:1 #8b5cf6);
             color: white;
             border-radius: 26px;
             font-weight: bold;
@@ -94,11 +84,7 @@ class StandbyView(QWidget):
             border: 1px solid rgba(255,255,255,18);
         }
         QPushButton:hover:enabled {
-            background: qlineargradient(
-                x1:0, y1:0, x2:1, y2:1,
-                stop:0 #6a68ff,
-                stop:1 #9b6bff
-            );
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #6a68ff, stop:1 #9b6bff);
             border: 1px solid rgba(255,255,255,40);
         }
         QPushButton:disabled {
@@ -110,11 +96,7 @@ class StandbyView(QWidget):
 
     START_BUTTON_READY_STYLE = """
         QPushButton {
-            background: qlineargradient(
-                x1:0, y1:0, x2:1, y2:1,
-                stop:0 #10b981,
-                stop:1 #059669
-            );
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #10b981, stop:1 #059669);
             color: white;
             border-radius: 26px;
             font-weight: bold;
@@ -122,11 +104,7 @@ class StandbyView(QWidget):
             border: 1px solid rgba(255,255,255,18);
         }
         QPushButton:hover:enabled {
-            background: qlineargradient(
-                x1:0, y1:0, x2:1, y2:1,
-                stop:0 #34d399,
-                stop:1 #10b981
-            );
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #34d399, stop:1 #10b981);
             border: 1px solid rgba(255,255,255,40);
         }
         QPushButton:disabled {
@@ -363,11 +341,7 @@ class StandbyView(QWidget):
                 border: none;
             }
             QProgressBar::chunk {
-                background: qlineargradient(
-                    x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #6a68ff,
-                    stop:1 #c15cff
-                );
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6a68ff, stop:1 #c15cff);
                 border-radius: 2px;
             }
         """)

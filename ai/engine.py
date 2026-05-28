@@ -118,6 +118,16 @@ class AIEngine(QObject):
         self._session_context: str = ""
         self._session_failed_providers: set[str] = set()
 
+    @property
+    def providers(self):
+        """Expose the provider map for lightweight app-side routing helpers."""
+        return self._providers
+
+    @property
+    def active_provider(self) -> str:
+        """Return the currently selected provider id."""
+        return self._active_provider_id
+
     def reset_session_failures(self) -> None:
         self._session_failed_providers.clear()
 
