@@ -22,7 +22,6 @@ from core.state import AppState
 from utils.platform_utils import WindowUtils, ProcessUtils
 from ai.providers.ollama_provider import OllamaProvider
 from ai.prompts import PromptBuilder
-from ai.live_session import LiveSessionManager
 from stealth.anti_detect import StealthManager
 from ui.settings_view import ProviderTestWorker, SettingsView
 from PyQt6.QtWidgets import QApplication
@@ -123,6 +122,16 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         audio.stop()
 
         self.assertFalse(audio._running)
+
+    def test_hardware_suspended_capture_is_healthy_for_injected_benchmark_frames(self):
+        audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
+        audio._running = True
+        audio._hardware_capture_suspended = True
+        audio._capture_thread = SimpleNamespace(is_alive=lambda: True)
+        audio._process_thread = SimpleNamespace(is_alive=lambda: True)
+        audio._active_streams = []
+
+        self.assertTrue(audio._capture_workers_healthy_locked())
         self.assertTrue(audio.q.empty())
 
     def test_restart_updates_mode_and_restarts_when_running(self):
@@ -161,19 +170,19 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         self.assertEqual(close_calls, ["close"])
         self.assertEqual(start_calls, ["start"])
 
-    def test_find_system_audio_source_prefers_stereo_mix_over_output_loopback(self):
+    def test_find_system_audio_source_prefers_wasapi_loopback_over_stereo_mix(self):
         audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
 
         fake_devices = [
             {
                 "name": "Speakers (Realtek(R) Audio)",
-                "hostapi": 2,
+                "hostapi": 0,
                 "max_input_channels": 0,
                 "max_output_channels": 2,
             },
             {
                 "name": "Stereo Mix (Realtek(R) Audio)",
-                "hostapi": 2,
+                "hostapi": 0,
                 "max_input_channels": 2,
                 "max_output_channels": 0,
             },
@@ -185,8 +194,174 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         ):
             self.assertEqual(
                 audio._find_system_audio_source(),
-                (1, "Stereo Mix (Realtek(R) Audio)", False),
+                (0, "Speakers (Realtek(R) Audio)", True),
             )
+
+    def test_system_audio_sources_do_not_use_microphone_as_desktop_source(self):
+        audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
+        fake_devices = [
+            {
+                "name": "Microphone Array",
+                "hostapi": 2,
+                "max_input_channels": 2,
+                "max_output_channels": 0,
+            }
+        ]
+        fake_hostapis = [{"name": "Windows WASAPI"}]
+
+        with patch("sounddevice.query_devices", return_value=fake_devices), patch(
+            "sounddevice.query_hostapis", return_value=fake_hostapis
+        ):
+            self.assertEqual(audio._system_audio_sources(), [])
+
+    def test_system_audio_sources_use_stereo_mix_as_last_default_system_source(self):
+        audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
+        fake_devices = [
+            {
+                "name": "Stereo Mix (Realtek(R) Audio)",
+                "hostapi": 0,
+                "max_input_channels": 2,
+                "max_output_channels": 0,
+            }
+        ]
+        fake_hostapis = [{"name": "Windows WASAPI"}]
+
+        with patch("sounddevice.query_devices", return_value=fake_devices), patch(
+            "sounddevice.query_hostapis", return_value=fake_hostapis
+        ):
+            self.assertEqual(
+                audio._system_audio_sources(),
+                [(0, "Stereo Mix (Realtek(R) Audio)", False)],
+            )
+
+    def test_system_audio_sources_can_disable_stereo_mix_explicitly(self):
+        audio = AudioCapture(
+            ConfigStub(
+                {
+                    "capture.audio.mode": "system",
+                    "capture.audio.allow_stereo_mix": False,
+                }
+            )
+        )
+        fake_devices = [
+            {
+                "name": "Stereo Mix (Realtek(R) Audio)",
+                "hostapi": 0,
+                "max_input_channels": 2,
+                "max_output_channels": 0,
+            }
+        ]
+        fake_hostapis = [{"name": "Windows WASAPI"}]
+
+        with patch("sounddevice.query_devices", return_value=fake_devices), patch(
+            "sounddevice.query_hostapis", return_value=fake_hostapis
+        ):
+            self.assertEqual(audio._system_audio_sources(), [])
+
+    def test_system_audio_falls_back_to_default_input_when_only_source_is_invalid(self):
+        audio = AudioCapture(
+            ConfigStub(
+                {
+                    "capture.audio.mode": "system",
+                    "capture.audio.enabled": True,
+                    "capture.audio.system_fallback_to_mic": True,
+                }
+            )
+        )
+        audio._running = True
+        audio._process_thread = SimpleNamespace(is_alive=lambda: True)
+
+        fake_devices = [
+            {
+                "name": "Stereo Mix (Realtek(R) Audio)",
+                "hostapi": 0,
+                "max_input_channels": 2,
+                "max_output_channels": 0,
+                "default_samplerate": 48000,
+            }
+        ]
+        fake_hostapis = [{"name": "Windows WASAPI"}]
+        default_input = {"name": "Microphone Array", "default_samplerate": 16000}
+        opened = []
+
+        class FakeStream:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def start(self):
+                opened.append(self.kwargs)
+                audio._running = False
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        def fake_query_devices(device=None, kind=None):
+            if device is None and kind == "input":
+                return default_input
+            if isinstance(device, int):
+                return fake_devices[device]
+            return fake_devices
+
+        def fake_input_stream(**kwargs):
+            if kwargs.get("device") == 0:
+                raise RuntimeError("Invalid device [PaErrorCode -9996]")
+            return FakeStream(**kwargs)
+
+        with patch("sounddevice.query_devices", side_effect=fake_query_devices), patch(
+            "sounddevice.query_hostapis", return_value=fake_hostapis
+        ), patch("sounddevice.InputStream", side_effect=fake_input_stream):
+            audio._capture_loop()
+
+        self.assertEqual(len(opened), 1)
+        self.assertNotIn("device", opened[0])
+        self.assertEqual(opened[0]["samplerate"], 16000)
+
+    def test_system_audio_does_not_fallback_to_mic_by_default(self):
+        audio = AudioCapture(
+            ConfigStub(
+                {
+                    "capture.audio.mode": "system",
+                    "capture.audio.enabled": True,
+                    "capture.audio.allow_stereo_mix": True,
+                }
+            )
+        )
+        audio._running = True
+        audio._process_thread = SimpleNamespace(is_alive=lambda: True)
+
+        fake_devices = [
+            {
+                "name": "Stereo Mix (Realtek(R) Audio)",
+                "hostapi": 0,
+                "max_input_channels": 2,
+                "max_output_channels": 0,
+                "default_samplerate": 48000,
+            }
+        ]
+        fake_hostapis = [{"name": "Windows WASAPI"}]
+        opened = []
+
+        def fake_query_devices(device=None, kind=None):
+            if device is None and kind == "input":
+                raise AssertionError("mic fallback should not be queried by default")
+            if isinstance(device, int):
+                return fake_devices[device]
+            return fake_devices
+
+        def fake_input_stream(**kwargs):
+            opened.append(kwargs)
+            raise RuntimeError("Invalid device [PaErrorCode -9996]")
+
+        with patch("sounddevice.query_devices", side_effect=fake_query_devices), patch(
+            "sounddevice.query_hostapis", return_value=fake_hostapis
+        ), patch("sounddevice.InputStream", side_effect=fake_input_stream):
+            audio._capture_loop()
+
+        self.assertGreaterEqual(len(opened), 1)
+        self.assertTrue(all(item.get("device") == 0 for item in opened))
 
     def test_resample_to_target_rate_matches_configured_rate(self):
         audio = AudioCapture(ConfigStub({"capture.audio.sample_rate": 16000}))
@@ -298,6 +473,25 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
 
         self.assertFalse(queued)
         self.assertEqual(submit_calls, [])
+
+    def test_submit_transcription_job_tracks_pending_work_until_wrapper_runs(self):
+        audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
+        queued_jobs = []
+
+        class _Pool:
+            def submit(self, fn):
+                queued_jobs.append(fn)
+
+        audio._transcribe_pool = _Pool()
+
+        ran = []
+        self.assertTrue(audio._submit_transcription_job(lambda: ran.append(True)))
+        self.assertTrue(audio.has_pending_transcription_jobs())
+
+        queued_jobs.pop()()
+
+        self.assertEqual(ran, [True])
+        self.assertFalse(audio.has_pending_transcription_jobs())
 
     def test_required_silence_blocks_shortens_after_mid_utterance_slice(self):
         audio = AudioCapture(
@@ -590,6 +784,52 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         self.assertEqual(queued[0].shape[0], audio.block_size)
         self.assertEqual(audio._capture_chunk_buffer.shape[0], (412 * 8) - audio.block_size)
 
+    def test_set_hardware_capture_suspended_toggles_flag(self):
+        audio = AudioCapture(ConfigStub({"capture.audio.mode": "mic"}))
+
+        audio.set_hardware_capture_suspended(True, "benchmark")
+        self.assertTrue(audio._hardware_capture_suspended)
+
+        audio.set_hardware_capture_suspended(False, "benchmark-done")
+        self.assertFalse(audio._hardware_capture_suspended)
+
+    def test_capture_loop_does_not_open_hardware_when_suspended(self):
+        audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
+        audio._running = True
+        audio._hardware_capture_suspended = True
+        fake_sd = SimpleNamespace(query_devices=Mock(), InputStream=Mock())
+
+        def stop_loop(_seconds):
+            audio._running = False
+
+        with patch.dict(sys.modules, {"sounddevice": fake_sd}), patch(
+            "capture.audio.time.sleep", side_effect=stop_loop
+        ):
+            audio._capture_loop()
+
+        fake_sd.query_devices.assert_not_called()
+        fake_sd.InputStream.assert_not_called()
+
+    def test_enqueue_audio_frames_still_accepts_fixture_audio_when_hardware_capture_suspended(self):
+        audio = AudioCapture(ConfigStub({"capture.audio.mode": "mic"}))
+        audio._running = True
+        audio._paused = False
+        audio._state.is_capturing = True
+        audio._hardware_capture_suspended = True
+
+        for _ in range(8):
+            audio._enqueue_audio_frames(
+                np.ones((412, 1), dtype=np.float32) * 0.02,
+                "benchmark-fixture",
+            )
+
+        queued = []
+        while not audio.q.empty():
+            queued.append(audio.q.get_nowait())
+
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].shape[0], audio.block_size)
+
     def test_ambient_calibration_skips_initial_speech_blocks(self):
         audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
         audio._ambient_calib_remaining = 1
@@ -742,29 +982,11 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         self.assertEqual(emitted, ["what is react"])
         self.assertEqual(calls["kwargs"]["beam_size"], audio._system_beam_size)
 
-    def test_emit_live_audio_chunk_converts_float32_to_pcm16(self):
-        audio = AudioCapture(
-            ConfigStub({"ai.live_mode.enabled": True})
-        )
-        chunks = []
-        audio.live_audio_chunk.connect(lambda data, sr: chunks.append((data, sr)))
+    def test_removed_live_audio_chunk_emitter_is_not_present(self):
+        audio = AudioCapture(ConfigStub({}))
 
-        audio._emit_live_audio_chunk(np.array([[0.0], [0.5], [-0.5]], dtype=np.float32))
-
-        self.assertEqual(len(chunks), 1)
-        payload, sr = chunks[0]
-        self.assertEqual(sr, 16000)
-        samples = np.frombuffer(payload, dtype=np.int16)
-        self.assertEqual(samples.tolist(), [0, 16383, -16383])
-
-    def test_emit_live_audio_chunk_is_silent_when_live_mode_disabled(self):
-        audio = AudioCapture(ConfigStub({"ai.live_mode.enabled": False}))
-        chunks = []
-        audio.live_audio_chunk.connect(lambda data, sr: chunks.append((data, sr)))
-
-        audio._emit_live_audio_chunk(np.array([[0.0], [0.5]], dtype=np.float32))
-
-        self.assertEqual(chunks, [])
+        self.assertFalse(hasattr(audio, "live_audio_chunk"))
+        self.assertFalse(hasattr(audio, "_emit_live_audio_chunk"))
 
     def test_clear_resets_chunk_accumulator_and_metrics(self):
         audio = AudioCapture(ConfigStub({}))
@@ -1117,7 +1339,7 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         audio = AudioCapture(
             ConfigStub(
                 {
-                    "capture.audio.transcription_provider": "local",
+                    "capture.audio.transcription_provider": "groq",
                     "capture.audio.prefer_free_cloud": True,
                     "api_key.groq": "gsk_test_key_1234567890",
                 }
@@ -1134,10 +1356,109 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
 
         self.assertEqual(provider, "local")
 
+    def test_groq_stt_is_used_when_configured_and_key_available(self):
+        audio = AudioCapture(
+            ConfigStub(
+                {
+                    "capture.audio.transcription_provider": "groq",
+                    "api_key.groq": "gsk_test_key_1234567890",
+                }
+            )
+        )
+
+        provider = audio._effective_transcription_provider(is_final=True)
+
+        self.assertEqual(provider, "groq")
+
+    def test_groq_stt_uses_cloud_pool_not_transcription_pool(self):
+        audio = AudioCapture(
+            ConfigStub(
+                {
+                    "capture.audio.transcription_provider": "groq",
+                    "api_key.groq": "gsk_test_key_1234567890",
+                }
+            )
+        )
+
+        class _Future:
+            def __init__(self, text):
+                self.text = text
+
+            def result(self, timeout=None):
+                return self.text
+
+        class _CloudPool:
+            def __init__(self):
+                self.calls = 0
+
+            def submit(self, fn, *args):
+                self.calls += 1
+                return _Future("Can you explain CSS Grid?")
+
+        class _TranscribePool:
+            def submit(self, *args):
+                raise AssertionError("Groq cloud calls must not use _transcribe_pool")
+
+        audio._cloud_stt_pool = _CloudPool()
+        audio._transcribe_pool = _TranscribePool()
+        buffer = [
+            np.ones((audio.block_size, 1), dtype=np.float32) * 0.02
+            for _ in range(3)
+        ]
+
+        audio._transcribe_groq(buffer, speech_started_at=1.0, is_final=True)
+
+        self.assertEqual(audio._cloud_stt_pool.calls, 1)
+        self.assertEqual(audio.transcripts[-1], "Can you explain CSS Grid?")
+        self.assertEqual(audio.get_last_transcription_metrics()["provider"], "groq")
+
+    def test_groq_short_final_tail_flushes_pending_chunks(self):
+        audio = AudioCapture(
+            ConfigStub(
+                {
+                    "capture.audio.transcription_provider": "groq",
+                    "api_key.groq": "gsk_test_key_1234567890",
+                }
+            )
+        )
+
+        class _Future:
+            def result(self, timeout=None):
+                return "What are some strategies to alleviate that bottleneck?"
+
+        audio._groq_chunk_futures = [
+            {
+                "future": _Future(),
+                "buffer": [np.ones((audio.block_size, 1), dtype=np.float32)],
+                "speech_started_at": 10.0,
+            }
+        ]
+        short_tail = [np.ones((audio.block_size, 1), dtype=np.float32)]
+
+        audio._transcribe_groq(short_tail, speech_started_at=10.0, is_final=True)
+
+        self.assertEqual(audio._groq_chunk_futures, [])
+        self.assertEqual(
+            audio.transcripts[-1],
+            "What are some strategies to alleviate that bottleneck?",
+        )
+        metrics = audio.get_last_transcription_metrics()
+        self.assertEqual(metrics["provider"], "groq")
+        self.assertEqual(metrics["chunks"], 1)
+
+    def test_groq_stt_falls_back_to_local_without_key(self):
+        audio = AudioCapture(
+            ConfigStub({"capture.audio.transcription_provider": "groq"})
+        )
+
+        provider = audio._effective_transcription_provider(is_final=True)
+
+        self.assertEqual(provider, "local")
+
     def test_auth_failure_blocks_same_groq_key_across_future_sessions(self):
         cfg = ConfigStub(
             {
-                "capture.audio.transcription_provider": "local",
+                "capture.audio.transcription_provider": "groq",
                 "capture.audio.prefer_free_cloud": True,
                 "api_key.groq": "gsk_test_key_1234567890",
             }
@@ -1220,6 +1541,7 @@ class AIEngineParallelOrderingTests(unittest.TestCase):
         )
 
 
+@unittest.skip("Legacy Gemini Live Mode has been removed.")
 class LiveSessionManagerTests(unittest.TestCase):
     def test_is_enabled_requires_flag_and_gemini_key(self):
         cfg = ConfigStub({"ai.live_mode.enabled": True, "api_key.gemini": "AIza123456789012345678901234567890"})
@@ -1279,7 +1601,19 @@ class LiveSessionManagerTests(unittest.TestCase):
     def test_candidate_models_migrates_legacy_live_name(self):
         self.assertEqual(
             LiveSessionManager._candidate_models("gemini-live-2.5-flash-preview"),
-            ["gemini-2.5-flash-native-audio-preview-12-2025"],
+            [
+                "gemini-3.1-flash-live-preview",
+                "gemini-2.5-flash-native-audio-preview-12-2025",
+            ],
+        )
+
+    def test_candidate_models_migrates_old_native_audio_default_to_current_live_model(self):
+        self.assertEqual(
+            LiveSessionManager._candidate_models("gemini-2.5-flash-native-audio-preview-12-2025"),
+            [
+                "gemini-3.1-flash-live-preview",
+                "gemini-2.5-flash-native-audio-preview-12-2025",
+            ],
         )
 
     def test_formats_model_compat_errors_with_clear_message(self):
@@ -1292,6 +1626,44 @@ class LiveSessionManagerTests(unittest.TestCase):
     def test_normal_close_error_detection(self):
         self.assertTrue(LiveSessionManager._is_normal_close_error(Exception("1000 None.")))
         self.assertFalse(LiveSessionManager._is_normal_close_error(Exception("1007 None.")))
+
+    def test_normal_live_close_while_running_reconnects_instead_of_hard_failing(self):
+        cfg = ConfigStub({"ai.live_mode.enabled": True, "api_key.gemini": "AIza123456789012345678901234567890"})
+        manager = LiveSessionManager(cfg)
+        manager._running = True
+        manager._stopping = False
+        manager._reconnect_backoff_s = lambda recently_completed_turn: 0.0
+        statuses = []
+        manager.status_changed.connect(lambda status: (statuses.append(status), setattr(manager, "_running", False)))
+
+        class _FakeConnect:
+            async def __aenter__(self):
+                raise Exception("1000 None.")
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeLive:
+            def connect(self, *args, **kwargs):
+                return _FakeConnect()
+
+        class _FakeAio:
+            live = _FakeLive()
+
+        class _FakeClient:
+            aio = _FakeAio()
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+        fake_genai = SimpleNamespace(Client=_FakeClient)
+        fake_google = SimpleNamespace(genai=fake_genai)
+
+        with patch.dict(sys.modules, {"google": fake_google, "google.genai": fake_genai}):
+            asyncio.run(manager._session_main("system prompt"))
+
+        self.assertIn("Reconnecting Live Mode...", statuses)
+        self.assertFalse(manager._connect_blocked)
 
     def test_build_live_system_prompt_forbids_reasoning_narration(self):
         prompt = LiveSessionManager._build_live_system_prompt("Base prompt")
@@ -1338,6 +1710,19 @@ class LiveSessionManagerTests(unittest.TestCase):
             "An interface is generally preferred for object shapes, while a type alias is more flexible.",
         )
 
+    def test_clean_live_response_strips_markdown_heading_and_semicolon_preface(self):
+        cleaned = LiveSessionManager._clean_live_response(
+            "**Differentiating Grid & Flexbox**\n\n"
+            "I've clarified the core difference; Flexbox is one-dimensional, aligning items in a row or column. "
+            "In contrast, Grid is two-dimensional, enabling control over rows and columns."
+        )
+
+        self.assertEqual(
+            cleaned,
+            "Flexbox is one-dimensional, aligning items in a row or column. "
+            "In contrast, Grid is two-dimensional, enabling control over rows and columns.",
+        )
+
     def test_updates_session_resumption_handle_from_message(self):
         manager = LiveSessionManager(ConfigStub({}))
         msg = SimpleNamespace(
@@ -1350,6 +1735,46 @@ class LiveSessionManagerTests(unittest.TestCase):
         manager._update_session_resumption(msg)
 
         self.assertEqual(manager._resume_handle, "resume-token-123")
+
+    def test_classifies_normal_turn_rollover_with_buffered_audio(self):
+        manager = LiveSessionManager(ConfigStub({}))
+
+        class QueueStub:
+            def empty(self):
+                return False
+
+        manager._audio_queue = QueueStub()
+
+        self.assertEqual(
+            manager._classify_disconnect_reason(recently_completed_turn=True),
+            "normal_turn_rollover_with_buffered_audio",
+        )
+
+    def test_classifies_normal_turn_rollover_with_pending_turn_end(self):
+        manager = LiveSessionManager(ConfigStub({}))
+        manager._pending_end_audio_turn = True
+
+        self.assertEqual(
+            manager._classify_disconnect_reason(recently_completed_turn=True),
+            "normal_turn_rollover_with_pending_turn_end",
+        )
+
+    def test_reconnect_backoff_prioritizes_pending_turn_end_for_low_latency(self):
+        manager = LiveSessionManager(ConfigStub({}))
+        manager._pending_end_audio_turn = True
+
+        self.assertEqual(manager._reconnect_backoff_s(recently_completed_turn=True), 0.10)
+
+    def test_reconnect_backoff_uses_shorter_delay_with_buffered_audio(self):
+        manager = LiveSessionManager(ConfigStub({}))
+
+        class QueueStub:
+            def empty(self):
+                return False
+
+        manager._audio_queue = QueueStub()
+
+        self.assertEqual(manager._reconnect_backoff_s(recently_completed_turn=True), 0.15)
 
 
 class PromptBuilderSpeechTests(unittest.TestCase):
@@ -2062,6 +2487,7 @@ class SettingsViewSyncTests(unittest.TestCase):
                 "app.gaze_fade.target_opacity": 0.20,
                 "app.focus_on_show": False,
                 "capture.audio.mode": "system",
+                "ai.auto_mode.enabled": True,
                 "ai.live_mode.enabled": True,
                 "ai.mode": "general",
             }
@@ -2087,7 +2513,7 @@ class SettingsViewSyncTests(unittest.TestCase):
         self.assertEqual(settings.margin_slider.currentIndex(), 5)
         self.assertEqual(settings.opacity_slider.currentIndex(), 4)
         self.assertTrue(settings.chk_focus_on_show.isChecked())
-        self.assertTrue(settings.chk_live_mode.isChecked())
+        self.assertTrue(settings.chk_auto_mode.isChecked())
 
     def test_system_tab_is_last_and_removed_tabs_do_not_reappear(self):
         settings = SettingsView(ConfigStub({"capture.audio.mode": "system"}), app=None)
@@ -2103,7 +2529,6 @@ class SettingsViewSyncTests(unittest.TestCase):
             {
                 "capture.audio.mode": "system",
                 "ai.mode": "general",
-                "ai.live_mode.enabled": False,
                 "app.focus_on_show": False,
             }
         )
@@ -2111,12 +2536,12 @@ class SettingsViewSyncTests(unittest.TestCase):
         self.addCleanup(settings.deleteLater)
 
         settings.chk_focus_on_show.setChecked(True)
-        settings.chk_live_mode.setChecked(True)
+        settings.chk_auto_mode.setChecked(True)
 
         settings._save_all()
 
         self.assertTrue(config.get("app.focus_on_show"))
-        self.assertTrue(config.get("ai.live_mode.enabled"))
+        self.assertTrue(config.get("ai.auto_mode.enabled"))
         self.assertEqual(config.saved, 1)
 
     def test_system_tab_shows_stealth_status_from_app_manager(self):

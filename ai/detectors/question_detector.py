@@ -14,7 +14,11 @@ from collections import deque
 from typing import Optional, List
 from dataclasses import dataclass
 from utils.logger import setup_logger
-from utils.text_utils import normalize_transcript
+from utils.text_utils import (
+    is_question_complete,
+    looks_like_fragmented_spelling_transcript,
+    normalize_transcript,
+)
 
 logger = setup_logger(__name__)
 
@@ -691,6 +695,8 @@ class QuestionDetector:
 
     def learn_from_query(self, query: str):
         """Learn a successful query prefix to dynamically improve detection."""
+        if looks_like_fragmented_spelling_transcript(query):
+            return
         normalized = normalize_transcript(query)
         extracted = self._extract_question_clause(normalized)
         text = (extracted or "").strip().lower()
@@ -703,8 +709,20 @@ class QuestionDetector:
         )
         if not looks_question_like:
             return
+        if not is_question_complete(text):
+            return
 
         words = text.replace("?", "").strip().split()
+        if not words:
+            return
+        first = words[0]
+        if first not in {
+            "what", "how", "why", "where", "when", "who", "which",
+            "can", "could", "would", "should", "will", "do", "does",
+            "did", "is", "are", "difference", "explain", "tell", "define",
+            "describe", "compare", "walk", "help", "clarify",
+        } and len(words) < 5:
+            return
         if len(words) >= 2:
             prefix = " ".join(words[:2]) + " "
             if prefix not in self.question_prefixes:
