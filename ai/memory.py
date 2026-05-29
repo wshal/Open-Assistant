@@ -27,7 +27,12 @@ _COLLECTION_NAME = "session_memory"
 _MAX_RESULTS = 1        # Reduced 3→1: each memory ~700 chars; injecting 3 was
                          # pushing prompts past Groq's 6000 TPM/min free limit.
                          # 1 memory keeps injection under ~200 tokens.
-_RELEVANCE_THRESHOLD = 0.55   # cosine similarity floor (0=unrelated, 1=identical)
+_RELEVANCE_THRESHOLD = 0.65   # cosine similarity floor — raised 0.55→0.65 to
+                               # prevent semantically-adjacent but topic-distinct
+                               # memories from being injected (e.g. fragments vs
+                               # stateless/stateful both contain React vocabulary).
+_MAX_RESPONSE_STORE_CHARS = 400  # Cap stored response length to prevent the LLM
+                                  # from regurgitating a full past answer verbatim.
 
 
 class LongTermMemory:
@@ -126,7 +131,7 @@ class LongTermMemory:
 
         def _do_store():
             try:
-                doc = f"Q: {query.strip()}\nA: {response.strip()}"
+                doc = f"Q: {query.strip()}\nA: {response.strip()[:_MAX_RESPONSE_STORE_CHARS]}"
                 doc_id = f"{session_id}_{int(time.time() * 1000)}"
                 with self._lock:
                     if not self._collection:

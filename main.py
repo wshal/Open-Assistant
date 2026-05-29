@@ -14,6 +14,21 @@ from PyQt6.QtWidgets import QApplication
 sys.path.insert(0, str(Path(__file__).parent))
 load_dotenv()
 
+# Patch SSL on Windows to fallback to certifi if access to system certificate store is denied
+if sys.platform == "win32":
+    try:
+        import ssl
+        import certifi
+        orig_load = ssl.SSLContext.load_default_certs
+        def patched_load(self, purpose=ssl.Purpose.SERVER_AUTH):
+            try:
+                orig_load(self, purpose)
+            except PermissionError:
+                self.load_verify_locations(cafile=certifi.where())
+        ssl.SSLContext.load_default_certs = patched_load
+    except Exception:
+        pass
+
 from core.config import Config
 from core.app import OpenAssistApp
 from core.constants import CONFIG_FILE
@@ -58,7 +73,89 @@ def global_exception_handler(exctype, value, tb):
     sys.exit(1)
 
 
+def cleanup_old_instances():
+    """Ensure no zombie instances of OpenAssist are running from previous sessions."""
+    try:
+        import psutil
+        import os
+        current_pid = os.getpid()
+        # Find absolute path of THIS main.py being launched right now
+        main_path = os.path.abspath(sys.argv[0])
+        main_dir = os.path.dirname(main_path).lower()
+
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if proc.info['pid'] == current_pid:
+                    continue
+                cmdline = proc.info['cmdline']
+                if not cmdline or len(cmdline) < 2:
+                    continue
+
+                proc_name = (proc.info.get('name') or '').lower()
+                if 'python' not in proc_name:
+                    continue
+
+                is_same_app = False
+
+                # Only consider the SCRIPT argument (argv[0] equivalent, which is cmdline[1])
+                # Skip processes invoked with -c (inline code), -m (module), etc.
+                # A real "python main.py" invocation has the script as the first non-flag argument.
+                script_arg = None
+                skip_next = False
+                for i, arg in enumerate(cmdline[1:], start=1):
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    # -c, -m, -W, -X etc. consume the next arg or are the end
+                    if arg in ('-c', '-m', '-W', '-X', '-u', '-O', '-B', '-E', '-i', '-q', '-s', '-S', '-v'):
+                        # -c and -m mean what follows is code/module, not a file
+                        if arg in ('-c', '-m'):
+                            break  # not a script invocation we care about
+                        skip_next = True
+                        continue
+                    if arg.startswith('-'):
+                        continue
+                    # First positional non-flag argument is the script
+                    script_arg = arg
+                    break
+
+                if script_arg and 'main.py' in script_arg:
+                    arg_abs = os.path.abspath(script_arg)
+                    if os.path.dirname(arg_abs).lower() == main_dir:
+                        is_same_app = True
+
+                # Fallback: match compiled/frozen OpenAssist executables by name
+                if not is_same_app and 'openassist' in proc_name:
+                    is_same_app = True
+
+                if is_same_app:
+                    try:
+                        # Use kill() (TerminateProcess) instead of terminate() (CTRL_BREAK) on Windows.
+                        # terminate() sends CTRL_BREAK_EVENT which propagates to the whole console
+                        # process group and can accidentally terminate the NEW process we are launching.
+                        # kill() directly calls TerminateProcess() which is fully isolated.
+                        proc.kill()
+                        proc.wait(timeout=1.0)
+                    except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                        pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+        # Brief pause after killing old instances so the OS can release audio
+        # devices, file handles, and sockets before we try to acquire them.
+        import time as _time
+        _time.sleep(0.5)
+    except Exception:
+        pass
+
+
 def main():
+    if sys.platform == "win32":
+        cleanup_old_instances()
+        import asyncio
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except Exception:
+            pass
     args = parse_args()
     logger = setup_logger("openassist", "DEBUG" if args.debug else "INFO")
 
