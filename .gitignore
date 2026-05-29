@@ -48,6 +48,7 @@ benchmarks/live_mode_smoke_react.log
 benchmarks/auto_mode_*.json
 benchmarks/standard_mode_*.json
 benchmarks/standard_*_check.json
+benchmarks/smoke_*.json
 auto_mode_report.json
 live_mode_report.json
 

@@ -370,8 +370,8 @@ def handle_auto_final_transcription(
 ) -> bool:
     """Whisper-first auto-answer mode.
 
-    Auto Mode is intentionally not Gemini Live. It keeps the standard local ASR
-    and provider pipeline, but treats each final transcript as a potential turn:
+    Auto Mode keeps the standard local ASR and provider pipeline, but treats
+    each final transcript as a potential turn:
     setup speech is retained as context, and complete/actionable questions are
     answered immediately.
     """

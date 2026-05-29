@@ -73,7 +73,7 @@ class TestQuestionDetectorLearning(unittest.TestCase):
         self.assertIn("how can you ", self.detector.question_prefixes)
         self.assertNotIn("howcan yousee ", self.detector.question_prefixes)
 
-    def test_learn_from_query_skips_garbled_live_fragment_question(self):
+    def test_learn_from_query_skips_garbled_fragment_question(self):
         original = list(self.detector.question_prefixes)
         self.detector.learn_from_query("is critical. web tokens work? ly cooking.")
         self.assertEqual(original, self.detector.question_prefixes)

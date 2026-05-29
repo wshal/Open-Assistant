@@ -166,8 +166,8 @@ class TestRAGPrefetch(unittest.TestCase):
 
         rag.query.assert_not_called()
 
-    def test_prefetch_hit_skips_live_query(self):
-        """When prefetch cache is warm, live RAG query is not called"""
+    def test_prefetch_hit_skips_uncached_query(self):
+        """When prefetch cache is warm, an uncached RAG query is not called"""
         rag = self._mock_rag(["prefetched content"])
         engine = _make_engine(rag=rag)
 

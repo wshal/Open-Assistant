@@ -834,7 +834,6 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
         audio._ambient_calib_remaining = 1
         audio._detect_speech = lambda data, rms: (True, "webrtc")
-        audio._emit_live_audio_chunk = lambda block: None
         audio._required_start_confirm_blocks = lambda: 1
         audio._max_utterance_exceeded = lambda started_at: False
         block = np.ones((audio.block_size, 1), dtype=np.float32) * 0.03
@@ -982,12 +981,6 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         self.assertEqual(emitted, ["what is react"])
         self.assertEqual(calls["kwargs"]["beam_size"], audio._system_beam_size)
 
-    def test_removed_live_audio_chunk_emitter_is_not_present(self):
-        audio = AudioCapture(ConfigStub({}))
-
-        self.assertFalse(hasattr(audio, "live_audio_chunk"))
-        self.assertFalse(hasattr(audio, "_emit_live_audio_chunk"))
-
     def test_clear_resets_chunk_accumulator_and_metrics(self):
         audio = AudioCapture(ConfigStub({}))
         audio.transcripts.append("what is react")
@@ -1048,10 +1041,9 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
             self.assertTrue(audio._max_utterance_exceeded(3.5))
 
     def test_process_loop_forces_final_turn_during_continuous_speech(self):
-        audio = AudioCapture(ConfigStub({"ai.live_mode.enabled": False}))
+        audio = AudioCapture(ConfigStub({}))
         audio._ambient_calib_remaining = 0
         audio._detect_speech = lambda data, rms: (True, "webrtc")
-        audio._emit_live_audio_chunk = lambda block: None
         submitted = []
 
         def _capture_submit(buffer, speech_started_at=None, vad_meta=None):
@@ -1076,7 +1068,7 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         self.assertEqual(vad_meta["end_silence_ms"], 0)
 
     def test_chunked_short_tail_flushes_accumulated_final_instead_of_dropping(self):
-        audio = AudioCapture(ConfigStub({"ai.live_mode.enabled": False}))
+        audio = AudioCapture(ConfigStub({}))
         submitted = []
 
         audio._submit_final_transcription = lambda buffer, speech_started_at=None, vad_meta=None: submitted.append(
@@ -1192,13 +1184,11 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         audio = AudioCapture(
             ConfigStub(
                 {
-                    "ai.live_mode.enabled": False,
                     "capture.audio.vad.inter_turn_start_silence_ms": 400,
                 }
             )
         )
         audio._ambient_calib_remaining = 0
-        audio._emit_live_audio_chunk = lambda block: None
         audio._required_start_confirm_blocks = lambda: 1
         audio._required_silence_blocks = lambda *args, **kwargs: 1
         audio._should_drop_final_utterance = lambda **kwargs: False
@@ -1541,242 +1531,6 @@ class AIEngineParallelOrderingTests(unittest.TestCase):
         )
 
 
-@unittest.skip("Legacy Gemini Live Mode has been removed.")
-class LiveSessionManagerTests(unittest.TestCase):
-    def test_is_enabled_requires_flag_and_gemini_key(self):
-        cfg = ConfigStub({"ai.live_mode.enabled": True, "api_key.gemini": "AIza123456789012345678901234567890"})
-        manager = LiveSessionManager(cfg)
-
-        self.assertTrue(manager.is_enabled())
-
-        disabled = LiveSessionManager(ConfigStub({"api_key.gemini": "AIza123456789012345678901234567890"}))
-        self.assertFalse(disabled.is_enabled())
-
-    def test_extracts_text_transcript_and_turn_complete_from_message(self):
-        msg = SimpleNamespace(
-            text="Hello ",
-            server_content=SimpleNamespace(
-                input_transcription=SimpleNamespace(text="what is react"),
-                turn_complete=True,
-            ),
-        )
-
-        self.assertEqual(LiveSessionManager._extract_output_text(msg), "Hello ")
-        self.assertEqual(LiveSessionManager._extract_input_transcript(msg), "what is react")
-        self.assertTrue(LiveSessionManager._is_turn_complete(msg))
-
-    def test_extracts_model_turn_text_from_parts(self):
-        msg = SimpleNamespace(
-            serverContent=SimpleNamespace(
-                modelTurn=SimpleNamespace(
-                    parts=[SimpleNamespace(text="Alpha "), SimpleNamespace(text="Beta")]
-                )
-            )
-        )
-
-        self.assertEqual(LiveSessionManager._extract_output_text(msg), "Alpha Beta")
-
-    def test_does_not_fallback_to_top_level_text_for_non_text_model_parts(self):
-        msg = SimpleNamespace(
-            text="Warning-backed helper text",
-            server_content=SimpleNamespace(
-                model_turn=SimpleNamespace(parts=[SimpleNamespace(inline_data=b"...")])
-            ),
-        )
-
-        self.assertEqual(LiveSessionManager._extract_output_text(msg), "")
-
-    def test_extracts_output_audio_transcription_text(self):
-        msg = SimpleNamespace(
-            server_content=SimpleNamespace(
-                output_transcription=SimpleNamespace(text="Here is the spoken reply")
-            )
-        )
-
-        self.assertEqual(
-            LiveSessionManager._extract_output_text(msg),
-            "Here is the spoken reply",
-        )
-
-    def test_candidate_models_migrates_legacy_live_name(self):
-        self.assertEqual(
-            LiveSessionManager._candidate_models("gemini-live-2.5-flash-preview"),
-            [
-                "gemini-3.1-flash-live-preview",
-                "gemini-2.5-flash-native-audio-preview-12-2025",
-            ],
-        )
-
-    def test_candidate_models_migrates_old_native_audio_default_to_current_live_model(self):
-        self.assertEqual(
-            LiveSessionManager._candidate_models("gemini-2.5-flash-native-audio-preview-12-2025"),
-            [
-                "gemini-3.1-flash-live-preview",
-                "gemini-2.5-flash-native-audio-preview-12-2025",
-            ],
-        )
-
-    def test_formats_model_compat_errors_with_clear_message(self):
-        msg = LiveSessionManager._format_error_message(
-            Exception("1008 None. models/gemini-live-2.5-flash-preview is not found for API version v1beta")
-        )
-
-        self.assertIn("no longer supported", msg)
-
-    def test_normal_close_error_detection(self):
-        self.assertTrue(LiveSessionManager._is_normal_close_error(Exception("1000 None.")))
-        self.assertFalse(LiveSessionManager._is_normal_close_error(Exception("1007 None.")))
-
-    def test_normal_live_close_while_running_reconnects_instead_of_hard_failing(self):
-        cfg = ConfigStub({"ai.live_mode.enabled": True, "api_key.gemini": "AIza123456789012345678901234567890"})
-        manager = LiveSessionManager(cfg)
-        manager._running = True
-        manager._stopping = False
-        manager._reconnect_backoff_s = lambda recently_completed_turn: 0.0
-        statuses = []
-        manager.status_changed.connect(lambda status: (statuses.append(status), setattr(manager, "_running", False)))
-
-        class _FakeConnect:
-            async def __aenter__(self):
-                raise Exception("1000 None.")
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-        class _FakeLive:
-            def connect(self, *args, **kwargs):
-                return _FakeConnect()
-
-        class _FakeAio:
-            live = _FakeLive()
-
-        class _FakeClient:
-            aio = _FakeAio()
-
-            def __init__(self, *args, **kwargs):
-                pass
-
-        fake_genai = SimpleNamespace(Client=_FakeClient)
-        fake_google = SimpleNamespace(genai=fake_genai)
-
-        with patch.dict(sys.modules, {"google": fake_google, "google.genai": fake_genai}):
-            asyncio.run(manager._session_main("system prompt"))
-
-        self.assertIn("Reconnecting Live Mode...", statuses)
-        self.assertFalse(manager._connect_blocked)
-
-    def test_build_live_system_prompt_forbids_reasoning_narration(self):
-        prompt = LiveSessionManager._build_live_system_prompt("Base prompt")
-
-        self.assertIn("Never narrate your reasoning", prompt)
-        self.assertIn("Give only the final answer", prompt)
-        self.assertIn("Never include planning headers", prompt)
-
-    def test_clean_live_response_strips_planning_preface(self):
-        cleaned = LiveSessionManager._clean_live_response(
-            "Defining Asynchronous Concepts\n"
-            "I'm now formulating concise definitions for event loop and async.\n"
-            "The event loop keeps the app responsive by processing queued tasks when the call stack is free."
-        )
-
-        self.assertEqual(
-            cleaned,
-            "The event loop keeps the app responsive by processing queued tasks when the call stack is free.",
-        )
-
-    def test_clean_live_response_drops_meta_paragraph_and_keeps_answer_paragraph(self):
-        cleaned = LiveSessionManager._clean_live_response(
-            "Defining the Event Loop\n"
-            "I'm now focusing on the user's request for an explanation of the event loop. "
-            "My goal is to craft a concise definition.\n\n"
-            "The event loop is a mechanism in JavaScript that monitors the call stack and callback queue, "
-            "allowing non-blocking asynchronous work."
-        )
-
-        self.assertEqual(
-            cleaned,
-            "The event loop is a mechanism in JavaScript that monitors the call stack and callback queue, "
-            "allowing non-blocking asynchronous work.",
-        )
-
-    def test_clean_live_response_strips_meta_sentences_before_answer(self):
-        cleaned = LiveSessionManager._clean_live_response(
-            "Clarifying Type vs. Interface. I'm focusing on the core distinction now. "
-            "An interface is generally preferred for object shapes, while a type alias is more flexible."
-        )
-
-        self.assertEqual(
-            cleaned,
-            "An interface is generally preferred for object shapes, while a type alias is more flexible.",
-        )
-
-    def test_clean_live_response_strips_markdown_heading_and_semicolon_preface(self):
-        cleaned = LiveSessionManager._clean_live_response(
-            "**Differentiating Grid & Flexbox**\n\n"
-            "I've clarified the core difference; Flexbox is one-dimensional, aligning items in a row or column. "
-            "In contrast, Grid is two-dimensional, enabling control over rows and columns."
-        )
-
-        self.assertEqual(
-            cleaned,
-            "Flexbox is one-dimensional, aligning items in a row or column. "
-            "In contrast, Grid is two-dimensional, enabling control over rows and columns.",
-        )
-
-    def test_updates_session_resumption_handle_from_message(self):
-        manager = LiveSessionManager(ConfigStub({}))
-        msg = SimpleNamespace(
-            session_resumption_update=SimpleNamespace(
-                resumable=True,
-                new_handle="resume-token-123",
-            )
-        )
-
-        manager._update_session_resumption(msg)
-
-        self.assertEqual(manager._resume_handle, "resume-token-123")
-
-    def test_classifies_normal_turn_rollover_with_buffered_audio(self):
-        manager = LiveSessionManager(ConfigStub({}))
-
-        class QueueStub:
-            def empty(self):
-                return False
-
-        manager._audio_queue = QueueStub()
-
-        self.assertEqual(
-            manager._classify_disconnect_reason(recently_completed_turn=True),
-            "normal_turn_rollover_with_buffered_audio",
-        )
-
-    def test_classifies_normal_turn_rollover_with_pending_turn_end(self):
-        manager = LiveSessionManager(ConfigStub({}))
-        manager._pending_end_audio_turn = True
-
-        self.assertEqual(
-            manager._classify_disconnect_reason(recently_completed_turn=True),
-            "normal_turn_rollover_with_pending_turn_end",
-        )
-
-    def test_reconnect_backoff_prioritizes_pending_turn_end_for_low_latency(self):
-        manager = LiveSessionManager(ConfigStub({}))
-        manager._pending_end_audio_turn = True
-
-        self.assertEqual(manager._reconnect_backoff_s(recently_completed_turn=True), 0.10)
-
-    def test_reconnect_backoff_uses_shorter_delay_with_buffered_audio(self):
-        manager = LiveSessionManager(ConfigStub({}))
-
-        class QueueStub:
-            def empty(self):
-                return False
-
-        manager._audio_queue = QueueStub()
-
-        self.assertEqual(manager._reconnect_backoff_s(recently_completed_turn=True), 0.15)
-
-
 class PromptBuilderSpeechTests(unittest.TestCase):
     def test_general_knowledge_classifier_handles_noisy_polite_speech(self):
         self.assertTrue(
@@ -1800,7 +1554,7 @@ class PromptBuilderSpeechTests(unittest.TestCase):
         self.assertIn("silently correct them before answering", prompt)
         self.assertIn("Do not mention audio context, ASR", prompt)
 
-    def test_speech_live_context_prompt_disallows_direct_screen_access_claims(self):
+    def test_speech_session_context_prompt_disallows_direct_screen_access_claims(self):
         prompt = PromptBuilder().user(
             query="How can you see the screen?",
             audio="How can you see the screen?",
@@ -2342,7 +2096,7 @@ class OllamaProviderTests(unittest.TestCase):
 
 
 class PromptBuilderTests(unittest.TestCase):
-    def test_manual_general_knowledge_query_suppresses_unrelated_live_context(self):
+    def test_manual_general_knowledge_query_suppresses_unrelated_session_context(self):
         builder = PromptBuilder()
 
         prompt = builder.user(
@@ -2358,7 +2112,7 @@ class PromptBuilderTests(unittest.TestCase):
         self.assertNotIn("[ENVIRONMENT]", prompt)
         self.assertIn("general knowledge", prompt)
 
-    def test_manual_contextual_query_keeps_live_context(self):
+    def test_manual_contextual_query_keeps_session_context(self):
         builder = PromptBuilder()
 
         prompt = builder.user(
@@ -2488,7 +2242,6 @@ class SettingsViewSyncTests(unittest.TestCase):
                 "app.focus_on_show": False,
                 "capture.audio.mode": "system",
                 "ai.auto_mode.enabled": True,
-                "ai.live_mode.enabled": True,
                 "ai.mode": "general",
             }
         )

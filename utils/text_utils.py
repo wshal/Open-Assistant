@@ -181,7 +181,7 @@ CONTINUATION_STARTERS = {
     "and", "or", "but", "so", "because", "then", "also",
     "for", "to", "with", "without", "about", "from", "in", "on", "at", "by",
 }
-_RE_LIVE_REQUEST_START = re.compile(
+_RE_AUTO_REQUEST_START = re.compile(
     r"^(?:please\s+)?(?:"
     r"explain|define|describe|tell(?:\s+me)?|show(?:\s+me)?|list|write|create|give(?:\s+me)?|"
     r"compare|contrast|summarize|outline|walk\s+me\s+through|help\s+me|debug|fix|"
@@ -1419,7 +1419,7 @@ def _looks_like_auto_query_clause(text: str) -> bool:
         }:
             return False
         return True
-    if _RE_LIVE_REQUEST_START.match(lowered):
+    if _RE_AUTO_REQUEST_START.match(lowered):
         return len(words) >= 2
     if lowered.startswith(
         (

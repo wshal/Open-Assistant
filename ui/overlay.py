@@ -950,14 +950,14 @@ class OverlayWindow(QMainWindow):
             color = "#4ade80"
             bg = "rgba(74,222,128,28)"
             border = "rgba(74,222,128,64)"
-            label = "LIVE"
-            tip = "Legacy live transport is connected"
+            label = "AUTO"
+            tip = "Auto Mode is active"
         elif reconnecting and enabled:
             color = "#f59e0b"
             bg = "rgba(245,158,11,24)"
             border = "rgba(245,158,11,56)"
             label = "RETRY"
-            tip = "Legacy live transport is reconnecting. Auto Mode keeps using the standard pipeline."
+            tip = "Auto Mode is refreshing. The standard pipeline remains available."
         elif fallback:
             color = "#f97316"
             bg = "rgba(249,115,22,24)"

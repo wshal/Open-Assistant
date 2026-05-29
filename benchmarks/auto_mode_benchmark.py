@@ -405,23 +405,8 @@ class AutoModeTester:
         self.current_result["_response_future_started_at"] = now
 
 
-    def hook_history_add(self, query: str, response: str, provider: str, mode: str = "general", latency: float = 0.0, metadata=None):
-        # Legacy duplicate guard: older reports may still surface a second audio
-        # provider completion. Auto Mode records the first real response per fixture.
-        if provider == "gemini-live":
-            for candidate in (self.current_result, self._recently_closed_result):
-                if candidate and candidate.get("responses"):
-                    candidate.setdefault("events", []).append({
-                        "time": time.time(),
-                        "type": "duplicate_response_suppressed",
-                        "provider": provider,
-                        "query": query,
-                    })
-                    self._save_report()
-                    safe_print(f"[DUPLICATE RESPONSE SUPPRESSED] provider={provider} query={query[:60]}")
-                    self.app._benchmark_suppress_duplicate_render = True
-                    return
 
+    def hook_history_add(self, query: str, response: str, provider: str, mode: str = "general", latency: float = 0.0, metadata=None):
         target_result = self._result_for_completion(query=query)
         if target_result:
             metadata = metadata or {}
@@ -485,20 +470,6 @@ class AutoModeTester:
                 self.app._benchmark_suppress_duplicate_render = False
                 safe_print(f"[SUPPRESSED RENDER] provider={provider} query={str(query or '')[:60]}")
                 return
-            # Secondary legacy duplicate guard for old audio provider completions
-            # whose query wording differs from the recorded fixture query.
-            if provider == "gemini-live":
-                for candidate in (self.current_result, self._recently_closed_result):
-                    if candidate and candidate.get("ui_completions"):
-                        candidate.setdefault("events", []).append({
-                            "time": time.time(),
-                            "type": "duplicate_ui_suppressed",
-                            "provider": provider,
-                            "query": query,
-                        })
-                        self._save_report()
-                        safe_print(f"[DUPLICATE UI SUPPRESSED broad] provider={provider} query={str(query or '')[:60]}")
-                        return
             has_visible_completion = bool((text or "").strip())
             target_result = self._result_for_completion(query=query)
             if target_result and has_visible_completion:
@@ -927,56 +898,6 @@ class AutoModeTester:
         standard_fallback = bool(
             self.current_result and self.current_result.get("standard_fallback")
         )
-        if False:
-            safe_print("Legacy live transport became unavailable while waiting to pump audio.")
-            if self.current_result is not None:
-                fallback_query = self._benchmark_fallback_query()
-                # Second-chance: if no partial query was assembled yet (live dropped too early),
-                # use the fixture's known expected query so we always produce a completion.
-                if not fallback_query and self.current_fixture_idx < len(self.fixtures):
-                    fixture_path = self.fixtures[self.current_fixture_idx]
-                    fallback_query = self._fixture_expected_query(fixture_path)
-                    if fallback_query:
-                        safe_print(f"[FALLBACK] Using fixture expected query as emergency fallback: {fallback_query[:80]}")
-                self.current_result["events"].append({"time": time.time(), "type": "auto_unavailable"})
-                self.current_result["auto_unavailable"] = True
-                self._save_report()
-                if fallback_query:
-                    self.current_result["standard_fallback"] = True
-                    self.current_result["_timeout_fallback_attempted"] = True
-                    self.current_result["events"].append(
-                        {
-                            "time": time.time(),
-                            "type": "auto_unavailable_fallback_triggered",
-                            "query": fallback_query,
-                            "standard_fallback": True,
-                        }
-                    )
-                    self.current_result["timeout_limit_s"] = max(
-                        float(self.current_result.get("timeout_limit_s", 50.0) or 50.0),
-                        (time.time() - float(self.current_result.get("started_at", time.time()) or time.time())) + 45.0,
-                    )
-                    try:
-                        self.app.config.set("ai.auto_mode.enabled", False)
-                        if hasattr(self.app.audio, "set_standard_transcription_suspended"):
-                            self.app.audio.set_standard_transcription_suspended(False, "benchmark:auto-unavailable-mid-fixture")
-                    except Exception as e:
-                        safe_print(f"Error switching benchmark to standard fallback: {e}")
-                    self._save_report()
-                    self.app.generate_response(fallback_query, "speech", {"audio": fallback_query})
-                    QTimer.singleShot(500, self.wait_for_fixture_settle)
-                    return
-                self.current_result["finished_at"] = time.time()
-                self.current_result["duration_s"] = max(
-                    0.0,
-                    self.current_result["finished_at"] - self.current_result.get("started_at", self.current_result["finished_at"]),
-                )
-                self.current_result["_closed_at"] = self.current_result["finished_at"]
-                self._recently_closed_result = self.current_result
-                self.current_result = None
-                self.current_fixture_idx += 1
-            QTimer.singleShot(100, self.next_fixture)
-            return
         if self.offset < len(self.samples):
             chunk = self.samples[self.offset:self.offset + self.chunk_size]
             self.offset += self.chunk_size
