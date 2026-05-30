@@ -3,7 +3,7 @@ AI Orchestration Engine - OpenAssist v4.2 (ModeProfile Edition).
 RESTORED: Async Task Control, RAG caching, and Cloud-ASR Correction.
 FIXED: Removed internal loops; App Master Loop now controls all AI execution.
 FIXED: Added latency tracking for performance monitoring.
-NEW: ModeManager wired in — engine reads live Mode objects, not bare strings.
+NEW: ModeManager wired in — engine reads active Mode objects, not bare strings.
 """
 
 import asyncio
@@ -48,7 +48,7 @@ class AIEngine(QObject):
         self.rag = rag
         self.prompts = PromptBuilder()
         self.detector = QuestionDetector(config)
-        # ModeManager: first-class dependency — resolves live Mode objects per request
+        # ModeManager: first-class dependency — resolves active Mode objects per request
         self._mode_manager = mode_manager
 
         self._providers = {}
@@ -60,6 +60,7 @@ class AIEngine(QObject):
         self._selected_tier = "balanced"
         self._parallel = None
         self._bg_slot = BackgroundGenerationSlot()
+        self._foreground_turn_id: str = ""
 
         # Provider speed ranking (fastest first)
         self._provider_priority = ["groq", "cerebras", "gemini", "together", "ollama"]
@@ -130,6 +131,42 @@ class AIEngine(QObject):
 
     def reset_session_failures(self) -> None:
         self._session_failed_providers.clear()
+
+    def set_foreground_turn_id(self, turn_id: str) -> None:
+        self._foreground_turn_id = str(turn_id or "").strip()
+
+    def _owns_foreground_turn(self, turn_id: str) -> bool:
+        active = str(self._foreground_turn_id or "").strip()
+        candidate = str(turn_id or "").strip()
+        if not active:
+            return True
+        return bool(candidate) and candidate == active
+
+    def _emit_response_chunk_for_turn(self, chunk: str, *, turn_id: str, bg_mode: bool = False) -> bool:
+        if bg_mode:
+            return False
+        if not self._owns_foreground_turn(turn_id):
+            logger.info(
+                "AI: Suppressing stale response chunk for turn=%s (active=%s)",
+                turn_id,
+                self._foreground_turn_id or "",
+            )
+            return False
+        self.response_chunk.emit(chunk)
+        return True
+
+    def _emit_response_complete_for_turn(self, full_text: str, *, turn_id: str, bg_mode: bool = False) -> bool:
+        if bg_mode:
+            return False
+        if not self._owns_foreground_turn(turn_id):
+            logger.info(
+                "AI: Suppressing stale response completion for turn=%s (active=%s)",
+                turn_id,
+                self._foreground_turn_id or "",
+            )
+            return False
+        self.response_complete.emit(full_text)
+        return True
 
     def _mark_provider_failed_for_session(self, provider_id: str) -> None:
         if provider_id:
@@ -407,10 +444,32 @@ class AIEngine(QObject):
         stage_timings = {}
         first_token_time = None
         request_metadata = dict(request_metadata or {})
+        isolate_context = bool(
+            request_metadata.get("benchmark_isolated")
+            or request_metadata.get("suppress_context")
+        )
+        if isolate_context:
+            preserve_session_context = bool(
+                request_metadata.get("preserve_session_context")
+            )
+            nexus_snapshot = {}
+            screen_context = ""
+            screen_hash = ""
+            boost_context = None
+            request_metadata.setdefault("suppress_screen_context", True)
+            request_metadata.setdefault("suppress_memory_context", True)
+            request_metadata.setdefault("suppress_history_context", True)
+            request_metadata.setdefault("suppress_rag_context", True)
+            request_metadata.setdefault("suppress_response_cache", True)
+            request_metadata.setdefault(
+                "suppress_session_context",
+                not preserve_session_context,
+            )
+        current_turn_id = str(request_metadata.get("turn_id", "") or "")
         request_started_at = request_metadata.get("request_started_at", start_time)
         stage_timings["request_to_ai_start_ms"] = (start_time - request_started_at) * 1000
 
-        # Resolve the live Mode object — use ModeManager if available
+        # Resolve the active Mode object — use ModeManager if available
         mode_obj = self._mode_manager.current if self._mode_manager else None
         mode_id = mode_obj.name if mode_obj else self.config.get("ai.mode", "general")
 
@@ -420,16 +479,16 @@ class AIEngine(QObject):
         max_q_chars = int(cache_cfg.get("max_query_chars", 320) or 320)
         allow_cache = (
             cache_enabled
+            and not bool(request_metadata.get("suppress_response_cache"))
             and origin in {"manual", "speech", "auto"}
             and isinstance(query, str)
             and len(query.strip()) > 0
             and len(query.strip()) <= max_q_chars
             # GAP 1: Cache is now allowed even when RAG is enabled.
-            # We track _rag_from_live_call below — if the RAG result came from
-            # prefetch/LRU (zero-latency), the response is stable and cacheable.
-            # We only block caching when a live ChromaDB call was made.
+            # We track _rag_from_uncached_call below — if the RAG result came from`r`n            # prefetch/LRU (zero-latency), the response is stable and cacheable.
+            # We only block caching when a uncached ChromaDB call was made.
         )
-        _rag_from_live_call: bool = False  # set True only if ChromaDB was queried
+        _rag_from_uncached_call: bool = False  # set True only if ChromaDB was queried
         context_fp = ""
         history_fp = ""
         if allow_cache:
@@ -508,10 +567,10 @@ class AIEngine(QObject):
                     if self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled:
                         return
                     if not bg_mode:
-                        self.response_chunk.emit(ch)
+                        self._emit_response_chunk_for_turn(ch, turn_id=current_turn_id, bg_mode=bg_mode)
                     await asyncio.sleep(0)
                 if not bg_mode:
-                    self.response_complete.emit(cached.response)
+                    self._emit_response_complete_for_turn(cached.response, turn_id=current_turn_id, bg_mode=bg_mode)
                 else:
                     self.background_complete.emit(query, cached.response)
                 return
@@ -554,11 +613,11 @@ class AIEngine(QObject):
             user_msg = self.prompts.user(
                 query=query,
                 screen=screen_context or "",
-                audio=audio_context or nexus_snapshot.get("recent_audio", ""),
+                audio=audio_context or ("" if isolate_context else nexus_snapshot.get("recent_audio", "")),
                 rag="",
                 mode=_mode_arg,
                 origin=origin,
-                nexus=nexus_snapshot
+                nexus=nexus_snapshot if not isolate_context else {},
             )
 
             try:
@@ -597,15 +656,15 @@ class AIEngine(QObject):
                     chunk = " ".join(batch) + " "
                     if len(chunk) >= batch_size:
                         if not bg_mode:
-                            self.response_chunk.emit(chunk)
+                            self._emit_response_chunk_for_turn(chunk, turn_id=current_turn_id, bg_mode=bg_mode)
                         batch = []
                         await asyncio.sleep(0)  # yield to event loop between batches
                 if batch:
                     if not bg_mode:
-                        self.response_chunk.emit(" ".join(batch))
+                        self._emit_response_chunk_for_turn(" ".join(batch), turn_id=current_turn_id, bg_mode=bg_mode)
 
                 if not bg_mode:
-                    self.response_complete.emit(full_response)
+                    self._emit_response_complete_for_turn(full_response, turn_id=current_turn_id, bg_mode=bg_mode)
                 else:
                     self.background_complete.emit(query, full_response)
                 logger.info(f"Parallel AI: Response complete ({latency_ms:.0f}ms)")
@@ -660,16 +719,18 @@ class AIEngine(QObject):
             # Previously resolved_query was built AFTER the RAG coro was scheduled.
             # That meant follow-ups like "give me an example" hit ChromaDB with no
             # topic signal.  Now we resolve first, so RAG searches with context.
-            effective_query = query
-            if origin == "speech":
+            effective_query = (audio_context or query) if isolate_context else query
+            if origin == "speech" and not isolate_context:
                 effective_query = self._effective_speech_query(query, audio_context or "")
-            resolved_query = self._resolve_followup_query(effective_query)
+            resolved_query = (
+                effective_query if isolate_context else self._resolve_followup_query(effective_query)
+            )
             _rag_search_query = resolved_query  # enriched query used for RAG
 
             # ── RAG: resolve from cache or build coroutine for parallel exec ─────────
             rag_context = ""
             rag_coro = None
-            if self.rag:
+            if self.rag and not bool(request_metadata.get("suppress_rag_context")):
                 now = time.time()
                 cache_key = _rag_search_query.lower().strip()[:100]
 
@@ -689,7 +750,7 @@ class AIEngine(QObject):
                     logger.debug("RAG: LRU Cache Hit (zero-latency) — response cache remains eligible")
                 else:
                     # Miss — schedule for parallel execution using resolved (enriched) query
-                    _rag_from_live_call = True  # GAP 1: live call — block response cache
+                    _rag_from_uncached_call = True  # GAP 1: uncached call — block response cache
                     rag_coro = self.rag.query(_rag_search_query)  # GAP 6: uses resolved query
 
             # ── Refinement: decide whether to run, build coroutine if so ────────
@@ -698,10 +759,10 @@ class AIEngine(QObject):
             is_general_knowledge = self.prompts._is_general_knowledge_query(query)
             # Keep manual simple queries ultra-fast, but allow spoken queries to
             # still refine transcript text so ASR slips do not leak into the answer.
-            skip_refinement = origin != "speech" and (
+            skip_refinement = isolate_context or (origin != "speech" and (
                 complexity == "simple"
                 or (origin == "manual" and is_general_knowledge)
-            )
+            ))
             needs_refinement = (
                 audio_context
                 and not skip_refinement
@@ -722,7 +783,7 @@ class AIEngine(QObject):
             # ── Parallel execution: gather only what needs a network call ────────
             parallel_start = time.time()
             if rag_coro and refine_coro:
-                # Both need a live call — run concurrently
+                # Both need a uncached call — run concurrently
                 rag_results, refined_text = await asyncio.gather(rag_coro, refine_coro)
                 if rag_results:
                     rag_context = "\n".join(rag_results)
@@ -757,22 +818,26 @@ class AIEngine(QObject):
             _mode_arg = mode_obj or mode_id
             sys_prompt = self.prompts.system(
                 _mode_arg,
-                session_context=getattr(self, "_session_context", ""),
+                session_context="" if request_metadata.get("suppress_session_context") else getattr(self, "_session_context", ""),
             )
 
             # Strict Output Cap for Cloud Background Fallback
-            if bg_mode and cloud_bg_fallback:
+            if request_metadata.get("suppress_history_context"):
+                history_block = ""
+            elif bg_mode and cloud_bg_fallback:
                 sys_prompt += "\n\nCRITICAL INSTRUCTION: You are generating a background thought. Keep your response extremely concise, under 100 words. Do not ramble."
 
             # GAP 6: resolved_query already computed before RAG coro (used for RAG search).
             # Re-apply speech refinement if transcript was refined after the initial resolution.
-            if origin == "speech" and refined_audio and refined_audio != audio_context:
+            if origin == "speech" and not isolate_context and refined_audio and refined_audio != audio_context:
                 effective_query = self._effective_speech_query(query, refined_audio)
                 resolved_query = self._resolve_followup_query(effective_query)
 
             # Build conversation history block from last 3 turns (capped at 1500 chars).
             # Injected into the prompt so the model understands what was discussed.
-            if bg_mode and cloud_bg_fallback:
+            if request_metadata.get("suppress_history_context"):
+                history_block = ""
+            elif bg_mode and cloud_bg_fallback:
                 history_block = ""
                 logger.debug("AI: Cloud bg fallback — skipping history block generation to save tokens.")
             else:
@@ -780,14 +845,14 @@ class AIEngine(QObject):
 
             user_msg = self.prompts.user(
                 query=resolved_query,
-                screen=screen_context or nexus_snapshot.get("latest_ocr", ""),
-                audio=refined_audio or nexus_snapshot.get("full_audio_history", ""),
-                rag=rag_context,
+                screen=screen_context or ("" if request_metadata.get("suppress_screen_context") else nexus_snapshot.get("latest_ocr", "")),
+                audio=refined_audio or ("" if isolate_context else nexus_snapshot.get("full_audio_history", "")),
+                rag="" if request_metadata.get("suppress_rag_context") else rag_context,
                 mode=_mode_arg,
                 origin=origin,
-                nexus=nexus_snapshot,
+                nexus=nexus_snapshot if not isolate_context else {},
                 history=history_block,
-                long_term_memory=(request_metadata or {}).get("long_term_memory", ""),
+                long_term_memory="" if request_metadata.get("suppress_memory_context") else (request_metadata or {}).get("long_term_memory", ""),
                 action_output=(request_metadata or {}).get("action_output", ""),
             )
 
@@ -877,14 +942,14 @@ class AIEngine(QObject):
                                         batch.append(word)
                                         if len(batch) >= 6:  # ~40–50 chars per emit
                                             if not bg_mode:
-                                                self.response_chunk.emit(" ".join(batch) + " ")
+                                                self._emit_response_chunk_for_turn(" ".join(batch) + " ", turn_id=current_turn_id, bg_mode=bg_mode)
                                             batch = []
                                             await asyncio.sleep(0.015)  # 15ms between batches
                                     if batch:
                                         if not bg_mode:
-                                            self.response_chunk.emit(" ".join(batch))
+                                            self._emit_response_chunk_for_turn(" ".join(batch), turn_id=current_turn_id, bg_mode=bg_mode)
                                 if not bg_mode:
-                                    self.response_complete.emit(raced)
+                                    self._emit_response_complete_for_turn(raced, turn_id=current_turn_id, bg_mode=bg_mode)
                                 else:
                                     self.background_complete.emit(query, raced)
                                 return
@@ -938,7 +1003,7 @@ class AIEngine(QObject):
                                 first_token_time - request_started_at
                             ) * 1000
                         if not bg_mode:
-                            self.response_chunk.emit(chunk)
+                            self._emit_response_chunk_for_turn(chunk, turn_id=current_turn_id, bg_mode=bg_mode)
                     generation_succeeded = True
                     break  # Stream completed successfully
 
@@ -992,8 +1057,8 @@ class AIEngine(QObject):
 
                 # GAP 1: Populate short-query cache after a successful response.
                 # Only cache if allow_cache AND the RAG result did NOT require a
-                # live ChromaDB call.  Prefetch/LRU RAG hits are stable and cacheable.
-                cache_eligible = allow_cache and not _rag_from_live_call
+                # uncached ChromaDB call.  Prefetch/LRU RAG hits are stable and cacheable.
+                cache_eligible = allow_cache and not _rag_from_uncached_call
                 if cache_eligible and (full_response or "").strip():
                     try:
                         self._short_cache.set(
@@ -1037,7 +1102,7 @@ class AIEngine(QObject):
                     }
                 )
                 if not bg_mode:
-                    self.response_complete.emit(full_response)
+                    self._emit_response_complete_for_turn(full_response, turn_id=current_turn_id, bg_mode=bg_mode)
                 else:
                     self.background_complete.emit(query, full_response)
                 logger.info(f"AI: Response complete ({latency_ms:.0f}ms) | {stage_timings}")
@@ -1183,16 +1248,51 @@ class AIEngine(QObject):
             return text
 
         patterns = [
+            # Legacy: audio-context meta narration
             r"^\s*based on the audio context[:,]?\s*i(?:'m| am)\s+assuming\s+[^.?!]*[.?!]\s*",
             r"^\s*based on the audio context(?:\s+and\s+correcting\s+the\s+asr\s+error)?[:,]?\s*",
             r"^\s*based on the (?:audio|spoken) context[:,]?\s*",
             r"^\s*(?:correcting|fixing)\s+the\s+asr\s+error[:,]?\s*",
             r"^\s*(?:it\s+seems|i'm assuming|i am assuming)\s+like\s+the\s+user\s+asked\s+about\s+[^.?!]*[.?!]\s*",
+            # OCR/code-context preamble
+            r"^\s*based on the provided code context(?:\s+and\s+your\s+question)?[:,]?\s*i(?:'m| am)\s+assuming\s+[^.?!]*[.?!]\s*",
+            r"^\s*based on the provided (?:code\s+)?context(?:\s+and\s+your\s+question)?[:,]?\s*",
+            # "Based on the captured screen/OCR context..." (Q3 leak)
+            r"^\s*based on captured (?:screen|screen/ocr|ocr) context[^.]*[.!?]\s*",
+            r"^\s*based on captured (?:screen|screen/ocr|ocr) context[,:]?\s*",
+            r"^\s*based on the captured (?:screen|screen/ocr|ocr) context[^.]*[.!?]\s*",
+            r"^\s*based on the captured (?:screen|screen/ocr|ocr) context[,:]?\s*",
+            # "Based on the live session context and past memory..." (Q5 leak)
+            r"^\s*based on the live session context[^.]*[.!?]\s*",
+            r"^\s*based on the live session context[,:]?\s*",
+            # Generic "Based on ..." preamble referencing context/session/knowledge
+            r"^\s*based on the (?:current\s+)?(?:context|session)[^.]*[.!?]\s*",
+            r"^\s*based on general knowledge[,:]?\s*",
+            # Captured screen/OCR inline sentence at start
+            r"^\s*captured screen/ocr context shows[^.!?]*[.!?]\s*",
+            r"^\s*the\s+(?:screen|ocr)\s+context shows[^.!?]*[.!?]\s*",
         ]
-        for pattern in patterns:
-            updated = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
-            if updated != text:
-                text = updated.lstrip(" \"' -:\n\t")
+        # Iterative strip: some responses stack multiple filler sentences before the answer.
+        changed = True
+        while changed:
+            changed = False
+            for pattern in patterns:
+                updated = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
+                if updated != text:
+                    text = updated.lstrip(" \"' -:\n\t")
+                    changed = True
+
+        # Strip inline/suffix OCR context asides that appear anywhere in the response
+        inline_patterns = [
+            r"\s*[Ii]n the captured screen/ocr context[^.!?]*[.!?]",
+            r"\s*[Ii]n the (?:screen|ocr) context[^.!?]*[.!?]",
+            # Suffix: "Captured screen/OCR context suggests..." at end of answer
+            r"\s*[Cc]aptured screen(?:/ocr)? context suggests[^.!?]*[.!?]",
+            r"\s*[Tt]he (?:captured )?(?:screen|ocr) context (?:suggests|shows|indicates)[^.!?]*[.!?]",
+            r"\s*[Bb]ased on the (?:current )?(?:screen|ocr) context[^.!?]*[.!?]",
+        ]
+        for pattern in inline_patterns:
+            text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
 
         return text.strip() or (content or "").strip()
 
@@ -1255,7 +1355,7 @@ class AIEngine(QObject):
             query = mode_obj.quick_answer_query
         else:
             query = (
-                "Using the latest live context, give a quick answer. "
+                "Using the latest session context, give a quick answer. "
                 "First summarise the current audio briefly, then give the most useful "
                 "immediate response in 2-4 bullets."
             )

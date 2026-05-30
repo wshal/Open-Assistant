@@ -219,9 +219,9 @@ class Config:
         self._data["ai"]["text"].setdefault(
             "first_token_timeout_ms_by_provider",
             {
-                "groq": 1800,
+                "groq": 4000,
                 "cerebras": 1800,
-                "gemini": 2500,
+                "gemini": 6000,
                 "together": 2000,
                 # Raised 8000 → 12000: Ollama cold-start (first load) regularly
                 # takes 5-10s TTFB. 8s was letting it time out then retrying
@@ -243,12 +243,12 @@ class Config:
         # P1: Vision payload controls (JPEG bytes). Keep conservative defaults.
         self._data["ai"]["vision"].setdefault("max_bytes", 1_800_000)  # ~1.8MB
         self._data["ai"]["vision"].setdefault("min_downscale_w", 720)
-        self._data["ai"].setdefault("live_mode", {})
-        self._data["ai"]["live_mode"].setdefault("enabled", False)
-        self._data["ai"]["live_mode"].setdefault(
-            "model",
-            "gemini-2.5-flash-native-audio-preview-12-2025",
-        )
+        self._data["ai"].setdefault("auto_mode", {})
+        self._data["ai"]["auto_mode"].setdefault("enabled", False)
+        self._data["ai"]["auto_mode"].setdefault("speculative_interim", {})
+        self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("enabled", True)
+        self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("stability_ms", 650)
+        self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("delay_ms", 250)
 
         # P1: Provider health polling (adaptive)
         self._data["ai"].setdefault("health", {})
@@ -285,19 +285,25 @@ class Config:
 
         # Phase 2: Transcription provider ("local" = faster-whisper, "groq" = Groq Cloud)
         self._data["capture"].setdefault("audio", {})
-        self._data["capture"]["audio"].setdefault("transcription_provider", "local")
+        self._data["capture"]["audio"].setdefault("transcription_provider", "groq")
+        self._data["capture"]["audio"].setdefault("groq_stt_model", "whisper-large-v3-turbo")
+        self._data["capture"]["audio"].setdefault("groq_stt_timeout_s", 8.0)
+        self._data["capture"]["audio"].setdefault("whisper_model", "small.en")
         self._data["capture"]["audio"].setdefault("prefer_free_cloud", False)
-        self._data["capture"]["audio"].setdefault("cloud_final_max_s", 8.0)
+        self._data["capture"]["audio"].setdefault("cloud_final_max_s", 12.0)
         self._data["capture"]["audio"].setdefault("interim.beam_size", 1)
         self._data["capture"]["audio"].setdefault("interim.max_pending_finals", 1)
         self._data["capture"]["audio"].setdefault("whisper_system_beam_size", 1)
+        self._data["capture"]["audio"].setdefault("whisper_cpu_threads", 0)
+        self._data["capture"]["audio"].setdefault("allow_stereo_mix", True)
+        self._data["capture"]["audio"].setdefault("system_fallback_to_mic", False)
         # Phase 2: Hybrid micro-pause VAD chunking
         # Slicing begins only after min_chunk_s and fires on any micro-pause up to max_chunk_s.
         self._data["capture"]["audio"].setdefault("chunking", {})
         self._data["capture"]["audio"]["chunking"].setdefault("enabled", True)
         self._data["capture"]["audio"]["chunking"].setdefault("system_mode_enabled", False)
-        self._data["capture"]["audio"]["chunking"].setdefault("min_chunk_s", 2.0)
-        self._data["capture"]["audio"]["chunking"].setdefault("max_chunk_s", 4.0)
+        self._data["capture"]["audio"]["chunking"].setdefault("min_chunk_s", 3.0)
+        self._data["capture"]["audio"]["chunking"].setdefault("max_chunk_s", 6.0)
         # Phase 2: Ambient noise calibration window at session start
         self._data["capture"]["audio"].setdefault("ambient_calibration_ms", 500)
         self._data["capture"]["audio"].setdefault("vad", {})
@@ -327,7 +333,7 @@ class Config:
         )
 
         # Final speech transcript gating: ignore tiny non-question scraps like
-        # "API." so they do not pollute live context or auto-trigger answers.
+        # "API." so they do not pollute session context or auto-trigger answers.
         self._data.setdefault("detection", {})
         self._data["detection"].setdefault("final_min_chars", 6)
         self._data["detection"].setdefault("final_min_words", 2)

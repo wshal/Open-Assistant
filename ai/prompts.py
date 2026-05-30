@@ -284,7 +284,7 @@ For MCQ: state correct answer first.""",
     ) -> str:
         """Build user prompt with mode-profile-aware context ranking and limits."""
         parts = []
-        suppress_live_context = (
+        suppress_session_context = (
             origin in {"manual", "speech"}
             and self._is_general_knowledge_query(query)
         )
@@ -298,14 +298,14 @@ For MCQ: state correct answer first.""",
         contexts = [screen, audio, rag]
         ranked = ContextRanker.rank(contexts, mode=mode)
 
-        if nexus and not suppress_live_context:
+        if nexus and not suppress_session_context:
             parts.append(
                 f"[ENVIRONMENT]\nActive Window: {nexus.get('active_window', 'Unknown')}\n"
                 f"History Depth: {nexus.get('history_depth_secs', 60)}s"
             )
 
         for src, content, _ in ranked:
-            if suppress_live_context and src in {"screen", "audio"}:
+            if suppress_session_context and src in {"screen", "audio"}:
                 continue
             # Use mode-aware limits
             limited = ContextRanker.limit(src, content, mode=mode)
@@ -320,18 +320,26 @@ For MCQ: state correct answer first.""",
             parts.append(f"[CLIP]\n{clipboard[:1000]}")
 
         if origin == "speech":
-            if suppress_live_context:
+            if suppress_session_context:
                 parts.append(
                     "[TASK]\nAnswer the spoken question directly from general knowledge. "
                     "If the transcript has minor ASR mistakes, silently correct them before answering. "
                     "Do not mention audio context, ASR, transcription mistakes, or that you corrected the wording."
                 )
             else:
+                # Only include the screen-reference note when there is actual screen content;
+                # omitting it when screen is empty prevents the LLM from echoing the phrase
+                # "captured screen/OCR context" as a literal answer artefact.
+                has_screen = bool((screen or "").strip())
+                screen_ref = (
+                    "If you refer to anything visible, describe it as captured screen/OCR context rather than direct screen access. "
+                    if has_screen else ""
+                )
                 parts.append(
                     "[TASK]\nAnswer the spoken question using the live session context when it is relevant. "
+                    f"{screen_ref}"
                     "If the transcript has minor ASR mistakes, silently correct them before answering. "
-                    "Do not mention audio context, ASR, transcription mistakes, or that you corrected the wording unless the user asks. "
-                    "If you reference the screen, describe it as captured screen/OCR context rather than direct sensory access."
+                    "Do not mention audio context, ASR, transcription mistakes, or that you corrected the wording unless the user asks."
                 )
         elif origin == "screen_analysis":
             parts.append(
@@ -345,17 +353,16 @@ For MCQ: state correct answer first.""",
                 "FORMAT:\n- Task (one line)\n- Solution (concise)\n- Code (fenced, if applicable)\n- Notes (optional)"
             )
         elif origin == "manual":
-            if suppress_live_context:
+            if suppress_session_context:
                 parts.append(
                     "[TASK]\nAnswer the user's question directly from general knowledge. "
-                    "Do not mention the current screen, codebase, active window, or live session unless the question clearly asks about them."
+                    "Do not mention the current screen, codebase, active window, or session context unless the question clearly asks about them."
                 )
             else:
                 parts.append(
-                    "[TASK]\nAnswer the user's question using the current live session context. "
+                    "[TASK]\nAnswer the user's question using the current session context. "
                     "Prefer the most recent on-screen evidence when relevant. "
-                    "If the question is generic and the live context is unrelated, answer directly without talking about the unrelated context. "
-                    "If you reference the screen, describe it as captured screen/OCR context rather than direct sensory access."
+                    "If the question is generic and the session context is unrelated, answer directly without talking about the unrelated context."
                 )
         elif origin == "quick":
             # Mode-specific quick-answer format injected here
@@ -363,7 +370,7 @@ For MCQ: state correct answer first.""",
             if mode and hasattr(mode, "quick_answer_format"):
                 fmt = f"\n{mode.quick_answer_format}"
             parts.append(
-                "[TASK]\nGive the fastest useful context answer using the most recent live context. "
+                "[TASK]\nGive the fastest useful context answer using the most recent session context. "
                 "Prioritise context in the order it appears above (highest weight first). "
                 f"Keep it extremely concise and actionable.{fmt}"
             )

@@ -47,7 +47,7 @@ class RoutingTabMixin:
         self._style_combo(self.ai_mode)
         l.addWidget(self.ai_mode)
         mode_desc = QLabel(
-            "Controls how OpenAssist prioritizes speed, reasoning, and live context while answering."
+            "Controls how OpenAssist prioritizes speed, reasoning, and session context while answering."
         )
         mode_desc.setWordWrap(True)
         mode_desc.setStyleSheet(

@@ -55,7 +55,7 @@ class AudioProfile:
     short_silence_ms: int = 500
     chunking_enabled: bool = True
     vad_backend: str = "webrtc"  # "webrtc" or "rms"
-    whisper_model: str = "base.en"
+    whisper_model: str = "small.en"
     language: str = "en"
     beam_size: int = 5
     condition_on_previous_text: bool = True

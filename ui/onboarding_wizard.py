@@ -609,20 +609,20 @@ class OnboardingWizard(QWidget):
 
         self.content_layout.addSpacing(12)
 
-        live_note = QLabel(
-            "Live Mode is fastest with Gemini; standard mode is best for the usual transcript-first flow."
+        auto_note = QLabel(
+            "Auto Mode uses Whisper transcripts to answer complete spoken prompts automatically."
         )
-        live_note.setWordWrap(True)
-        live_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        live_note.setToolTip(
-            "Live Mode keeps one Gemini Live session open for low-latency audio replies.\n"
-            "Standard mode waits for the transcript, then sends it through the normal provider pipeline."
+        auto_note.setWordWrap(True)
+        auto_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        auto_note.setToolTip(
+            "Auto Mode keeps the reliable transcript-first pipeline, but answers when it can infer the intended question.\n"
+            "Standard mode waits for a clearer question signal before responding."
         )
-        live_note.setStyleSheet(
+        auto_note.setStyleSheet(
             "color: #94a3b8; font-size: 10px; background: rgba(255,255,255,6); "
             "border: 1px solid rgba(255,255,255,12); border-radius: 10px; padding: 10px 12px;"
         )
-        self.content_layout.addWidget(live_note)
+        self.content_layout.addWidget(auto_note)
 
         self.content_layout.addSpacing(20)
 

@@ -89,8 +89,8 @@ class CaptureTabMixin:
         whisper_models = ["tiny.en", "base.en", "small.en", "medium.en"]
         self.whisper_model.addItems([
             "tiny.en  (fastest, English-only)",
-            "base.en  (balanced speed and accuracy)",
-            "small.en (default, best local benchmark result)",
+            "base.en  (faster CPU, lower accuracy)",
+            "small.en (default, best benchmark WER)",
             "medium.en (best accuracy, heaviest runtime cost)",
         ])
         wm_map = {m: i for i, m in enumerate(whisper_models)}
@@ -99,8 +99,8 @@ class CaptureTabMixin:
         self.whisper_model.setToolTip(
             "Whisper model size affects transcription speed vs accuracy.\n"
             "tiny.en: fastest, but weaker on longer coding questions.\n"
-            "base.en: balanced fallback with lower CPU cost.\n"
-            "small.en: current default and best local benchmark winner.\n"
+            "base.en: lower CPU cost, less accurate.\n"
+            "small.en: default from local WER benchmark, but slower on CPU.\n"
             "medium.en: higher accuracy potential, but much slower.\n"
             "Changing this requires an app restart to take effect."
         )
@@ -120,8 +120,8 @@ class CaptureTabMixin:
 
         self.whisper_model.currentIndexChanged.connect(_on_whisper_model_changed)
         wm_desc = QLabel(
-            "Select the Whisper ASR model size. small.en is the current recommended "
-            "default for local coding Q&A. Changes apply after restart."
+            "Select the local fallback Whisper model size. Auto Mode uses Groq STT first when configured, "
+            "then falls back to this model. Changes apply after restart."
         )
         wm_desc.setWordWrap(True)
         wm_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
@@ -139,7 +139,7 @@ class CaptureTabMixin:
             "Local (Faster-Whisper)",
             "Cloud (Groq Whisper - Fastest)",
         ])
-        saved_tp = self.config.get("capture.audio.transcription_provider", "local")
+        saved_tp = self.config.get("capture.audio.transcription_provider", "groq")
         self.transcription_provider.setCurrentIndex(0 if saved_tp != "groq" else 1)
         self._style_combo(self.transcription_provider)
         l.addWidget(self.transcription_provider)
@@ -161,16 +161,17 @@ class CaptureTabMixin:
         chunking_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
         l.addWidget(chunking_desc)
 
-        self.chk_live_mode = PremiumCheckBox("Enable Live Audio Mode (Gemini Live)")
-        self.chk_live_mode.setChecked(bool(self.config.get("ai.live_mode.enabled", False)))
-        l.addWidget(self.chk_live_mode)
-        live_desc = QLabel(
-            "Keeps a live Gemini session open for faster back-and-forth audio replies. "
-            "Requires a Gemini API key and uses streaming cloud audio."
+        self.chk_auto_mode = PremiumCheckBox("Enable Auto-Answer Mode")
+        self.chk_auto_mode.setChecked(
+            bool(self.config.get("ai.auto_mode.enabled", False))
         )
-        live_desc.setWordWrap(True)
-        live_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
-        l.addWidget(live_desc)
+        l.addWidget(self.chk_auto_mode)
+        auto_desc = QLabel(
+            "Uses Whisper transcripts to infer and answer complete spoken prompts through the normal provider pipeline."
+        )
+        auto_desc.setWordWrap(True)
+        auto_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+        l.addWidget(auto_desc)
 
         sep3 = QFrame()
         sep3.setFixedHeight(1)

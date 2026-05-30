@@ -1,7 +1,7 @@
 """
 Short-query response cache (P1).
 
-Goal: return instantly for repeated small questions when the live context
+Goal: return instantly for repeated small questions when the session context
 fingerprint hasn't changed materially.
 
 Four-Tier Lookup:

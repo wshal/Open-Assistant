@@ -39,8 +39,12 @@ class MiniOverlay(QMainWindow):
         self.app = app
         self._response = ""
         self._raw_buffer = ""
+        self._active_response_query = ""
+        self._active_response_text = ""
+        self._active_response_streaming = False
         self._drag = False
         self._expanded = False
+        self._user_is_scrolling = False
         self._nano_mode = False  # P2.6: ultra-compact nano state
         self._warmup_done = False  # Guard: input locked until AI engines are ready
 
@@ -167,7 +171,22 @@ class MiniOverlay(QMainWindow):
             "background: rgba(15,15,30,240); border: none; border-radius: 12px; color: #d0d0e8; font-size: 11px; padding: 8px;"
         )
         self.response_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.response_area.verticalScrollBar().valueChanged.connect(
+            self._on_scroll_changed
+        )
         self.ml.addWidget(self.response_area)
+
+    def _on_scroll_changed(self, value):
+        sb = self.response_area.verticalScrollBar()
+        at_bottom = value >= sb.maximum() - 40
+        self._user_is_scrolling = not at_bottom
+
+    def _restore_scroll_after_update(self, previous_value: int, was_scrolling: bool):
+        sb = self.response_area.verticalScrollBar()
+        if was_scrolling:
+            sb.setValue(min(previous_value, sb.maximum()))
+        else:
+            sb.setValue(sb.maximum())
 
     def _sync_existing_response(self):
         """Sync the current history entry into the Mini-HUD.
@@ -233,13 +252,66 @@ class MiniOverlay(QMainWindow):
             return
 
         html = self.md.render(text or "Waiting...")
+        sb = self.response_area.verticalScrollBar()
+        previous_value = sb.value()
+        was_scrolling = bool(self._user_is_scrolling)
         self.response_area.setHtml(html)
+        self._restore_scroll_after_update(previous_value, was_scrolling)
         if text and not self._expanded:
             self._toggle_expand(True)
         self._adjust_height()
 
+    def begin_active_response(self, query: str) -> None:
+        self._active_response_query = query or ""
+        self._active_response_text = ""
+        self._active_response_streaming = False
+
+    def capture_active_response_chunk(self, text: str) -> None:
+        if not text:
+            return
+        self._active_response_text += text
+        self._active_response_streaming = True
+
+    def restore_active_response_view(self) -> bool:
+        query = (self._active_response_query or "").strip()
+        text = self._active_response_text or ""
+        if not query and not text:
+            return False
+
+        self._raw_buffer = text
+        if not self._expanded:
+            self._toggle_expand(True)
+        if self._active_response_streaming:
+            self.response_area.clear()
+            self.response_area.setHtml(
+                f"<div style='color:#64748b;font-size:9px;margin-bottom:8px;'>"
+                f"<b>Q:</b> {query}</div>"
+            )
+            if text:
+                cursor = self.response_area.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                fmt = QTextCharFormat()
+                fmt.setForeground(QColor("#d0d0e8"))
+                cursor.setCharFormat(fmt)
+                cursor.insertText(text)
+                self.response_area.setTextCursor(cursor)
+            if "```" not in text:
+                self._render_timer.start()
+        elif not text:
+            self.response_area.setHtml(
+                f"<div style='color:#64748b;font-size:9px;margin-bottom:8px;'>"
+                f"<b>Q:</b> {query}</div>"
+                f"<div style='color:#f59e0b;font-size:11px;font-style:italic;'>⏳ Thinking...</div>"
+            )
+        else:
+            self._render_markdown_now()
+        return True
+
     def append_response(self, text: str):
         """Called on every streaming chunk — immediate display + periodic markdown re-render."""
+        self.capture_active_response_chunk(text)
+        if bool(getattr(self.app, "_history_navigation_active", False)):
+            return
         if not self._raw_buffer:
             # First chunk: expand panel, clear area, start periodic timer
             self._toggle_expand(True)
@@ -255,6 +327,9 @@ class MiniOverlay(QMainWindow):
             self._render_timer.stop()
 
         # Immediate colour-correct text append
+        sb = self.response_area.verticalScrollBar()
+        previous_value = sb.value()
+        was_scrolling = bool(self._user_is_scrolling)
         cursor = self.response_area.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         fmt = QTextCharFormat()
@@ -262,10 +337,7 @@ class MiniOverlay(QMainWindow):
         cursor.setCharFormat(fmt)
         cursor.insertText(text)
         self.response_area.setTextCursor(cursor)
-        # Auto-scroll to bottom
-        self.response_area.verticalScrollBar().setValue(
-            self.response_area.verticalScrollBar().maximum()
-        )
+        self._restore_scroll_after_update(previous_value, was_scrolling)
 
     def on_complete(
         self,
@@ -280,6 +352,10 @@ class MiniOverlay(QMainWindow):
         """
         self._render_timer.stop()
         self._raw_buffer = full_text or ""
+        if query is not None:
+            self._active_response_query = query
+        self._active_response_text = self._raw_buffer
+        self._active_response_streaming = False
         
         # P4: If both full_text and query are empty, session has ended
         if not full_text and not query:
@@ -294,6 +370,19 @@ class MiniOverlay(QMainWindow):
             self.type_btn.setVisible(True)
         else:
             self.type_btn.setVisible(False)
+
+    def clear_session_response(self):
+        """Clear response state without pretending a response completed."""
+        self._render_timer.stop()
+        self._raw_buffer = ""
+        self._active_response_query = ""
+        self._active_response_text = ""
+        self._active_response_streaming = False
+        self.input.clear()
+        self.input.setPlaceholderText("Ask anything...")
+        self.response_area.clear()
+        self.type_btn.setVisible(False)
+        self.set_ready()
 
     def _on_bg_complete(self, query: str, response: str):
         """Called when a background generation finishes."""
@@ -374,9 +463,10 @@ class MiniOverlay(QMainWindow):
         self.setFixedHeight(new_h)
         self.response_area.setMinimumHeight(min_response_height)
         self.response_area.setMaximumHeight(max_response_height)
-        self.response_area.verticalScrollBar().setValue(
-            self.response_area.verticalScrollBar().maximum()
-        )
+        if not self._user_is_scrolling:
+            self.response_area.verticalScrollBar().setValue(
+                self.response_area.verticalScrollBar().maximum()
+            )
 
     def _toggle_expand(self, force=None):
         self._expanded = force if force is not None else not self._expanded

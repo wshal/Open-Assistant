@@ -27,14 +27,8 @@ class SecureStorage:
 
     def _maybe_import_legacy_storage(self) -> None:
         """Migrate legacy side-by-side encrypted settings into persistent storage."""
-        default_target = Path(SETTINGS_FILE)
-        try:
-            if self.filepath.resolve() != default_target.resolve():
-                return
-        except Exception:
-            if str(self.filepath) != str(default_target):
-                return
-
+        if self.filepath.name != "settings.enc":
+            return
         if self.filepath.exists():
             return
 

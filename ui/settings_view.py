@@ -627,9 +627,9 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             self.audio_mode.blockSignals(True)
             self.audio_mode.setCurrentIndex(0 if curr == "system" else 1 if curr == "mic" else 2)
             self.audio_mode.blockSignals(False)
-        if hasattr(self, "chk_live_mode"):
-            self.chk_live_mode.setChecked(
-                bool(self.config.get("ai.live_mode.enabled", False))
+        if hasattr(self, "chk_auto_mode"):
+            self.chk_auto_mode.setChecked(
+                bool(self.config.get("ai.auto_mode.enabled", False))
             )
 
         # 3. Always refresh API key fields from encrypted storage.
@@ -795,8 +795,8 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
                 self.config.set("capture.audio.transcription_provider", tp)
             if hasattr(self, "chk_chunking"):
                 self.config.set("capture.audio.chunking.enabled", self.chk_chunking.isChecked())
-            if hasattr(self, "chk_live_mode"):
-                self.config.set("ai.live_mode.enabled", self.chk_live_mode.isChecked())
+            if hasattr(self, "chk_auto_mode"):
+                self.config.set("ai.auto_mode.enabled", self.chk_auto_mode.isChecked())
             if hasattr(self, "chk_paid_vision_fallback"):
                 self.config.set(
                     "ai.vision.allow_paid_fallback",
@@ -889,12 +889,12 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
                 idx = self.whisper_model.currentIndex()
                 self.config.set(
                     "capture.audio.whisper_model",
-                    _wm_values[idx] if idx < len(_wm_values) else "base.en",
+                    _wm_values[idx] if idx < len(_wm_values) else "small.en",
                 )
                 import logging as _log
                 _log.getLogger(__name__).info(
                     "[Q21] Whisper model saved: %s (restart required to apply)",
-                    _wm_values[idx] if idx < len(_wm_values) else "base.en",
+                    _wm_values[idx] if idx < len(_wm_values) else "small.en",
                 )
 
             # Save image quality

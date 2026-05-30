@@ -6,6 +6,7 @@ P0.1 FIX: Removed duplicate CRLF class definition artifact.
 """
 
 import time
+from html import escape
 from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -44,6 +45,9 @@ class OverlayWindow(QMainWindow):
         self._current_query = ""
         self._is_streaming = False
         self._raw_buffer = ""
+        self._active_response_query = ""
+        self._active_response_text = ""
+        self._active_response_streaming = False
         self._user_is_scrolling = False
         self._prev_stack_index = 0
         self._prev_stack_widget = None
@@ -94,10 +98,11 @@ class OverlayWindow(QMainWindow):
 
     def start_session_ui(self):
         """Called when session starts - show timer and end button"""
+        self.show_chat_view()
         self._session_start_time = time.time()
         self.session_timer.setVisible(True)
         self.audio_status.setVisible(True)
-        self.live_status.setVisible(True)
+        self.auto_status.setVisible(True)
         self.vision_status.setVisible(True)
         self.update_vision_state(reset_to_master=True)
         self.btn_end_session.setVisible(True)
@@ -108,18 +113,19 @@ class OverlayWindow(QMainWindow):
             self.btn_timeline.setVisible(False)
         self.set_analysis_provider_badge()
         self.update_audio_state(self.app.state.is_muted)
-        self.update_live_mode_state(
-            bool(self.config.get("ai.live_mode.enabled", False)),
-            bool(getattr(self.app, "_live_mode_connected", lambda: False)()),
+        self.update_auto_mode_state(
+            bool(self.config.get("ai.auto_mode.enabled", False)),
+            bool(getattr(self.app, "_auto_mode_requested", lambda: False)()),
         )
         self._session_timer.start(1000)
 
     def end_session_ui(self):
         """Called when session ends - hide timer, reset standby view to ready state."""
+        self.show_standby_view()
         self._session_start_time = None
         self.session_timer.setVisible(False)
         self.audio_status.setVisible(False)
-        self.live_status.setVisible(False)
+        self.auto_status.setVisible(False)
         self.vision_status.setVisible(False)
         self.btn_end_session.setVisible(False)
         self.btn_history.setVisible(True)
@@ -138,6 +144,20 @@ class OverlayWindow(QMainWindow):
             sv.start_btn.setEnabled(True)
             sv.start_btn.setStyleSheet(sv.START_BUTTON_READY_STYLE)
             sv.progress_bar.setValue(100)
+
+    def clear_session_response(self):
+        """Clear visible and cached response state without emitting a completion."""
+        self._render_timer.stop()
+        self._current_query = ""
+        self._raw_buffer = ""
+        self._is_streaming = False
+        self._pending_thinking = False
+        self._active_response_query = ""
+        self._active_response_text = ""
+        self._active_response_streaming = False
+        self._history_navigation_header = ""
+        self._source_badge = ""
+        self.response_area.clear()
 
     def _connect_state(self):
         self.app.state.muted_changed.connect(self.update_audio_state)
@@ -228,15 +248,15 @@ class OverlayWindow(QMainWindow):
 
         hl.addStretch()
         
-        # Live Mode button
-        self.live_status = QPushButton("LIVE")
-        self.live_status.setToolTip("Toggle Gemini Live audio mode")
-        self.live_status.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.live_status.setFixedHeight(24)
-        self.live_status.setMinimumWidth(42)
-        self.live_status.clicked.connect(self.app.toggle_live_mode)
-        self.live_status.setVisible(False)
-        hl.addWidget(self.live_status)
+        # Auto Mode button
+        self.auto_status = QPushButton("AUTO")
+        self.auto_status.setToolTip("Toggle Auto-Answer Mode")
+        self.auto_status.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.auto_status.setFixedHeight(24)
+        self.auto_status.setMinimumWidth(42)
+        self.auto_status.clicked.connect(self.app.toggle_auto_mode)
+        self.auto_status.setVisible(False)
+        hl.addWidget(self.auto_status)
 
         # PHASE 1: Interactive Vision Kill Switch (Placed BEFORE mic)
         self.vision_status = QPushButton("👁️")
@@ -448,6 +468,13 @@ class OverlayWindow(QMainWindow):
         at_bottom = value >= sb.maximum() - 50
         self._user_is_scrolling = not at_bottom
 
+    def _restore_scroll_after_update(self, previous_value: int, was_scrolling: bool):
+        sb = self.response_area.verticalScrollBar()
+        if was_scrolling:
+            sb.setValue(min(previous_value, sb.maximum()))
+        else:
+            self.response_area.moveCursor(QTextCursor.MoveOperation.End)
+
     def _render_markdown_now(self):
         """Full markdown re-render of the accumulated buffer."""
         content = self._raw_buffer
@@ -477,10 +504,66 @@ class OverlayWindow(QMainWindow):
         rendered = self.md.render(content)
         # Combine query header + navigation header + rendered content
         full_html = q_html + nav_header + rendered
+        sb = self.response_area.verticalScrollBar()
+        previous_value = sb.value()
+        was_scrolling = bool(self._user_is_scrolling)
         self.response_area.setHtml(full_html)
+        self._restore_scroll_after_update(previous_value, was_scrolling)
 
-        if not self._user_is_scrolling:
-            self.response_area.moveCursor(QTextCursor.MoveOperation.End)
+    def begin_active_response(self, query: str) -> None:
+        self._active_response_query = query or ""
+        self._active_response_text = ""
+        self._active_response_streaming = False
+        self._history_navigation_header = ""
+
+    def capture_active_response_chunk(self, text: str) -> None:
+        if not text:
+            return
+        self._active_response_text += text
+        self._active_response_streaming = True
+
+    def restore_active_response_view(self) -> bool:
+        query = (self._active_response_query or "").strip()
+        text = self._active_response_text or ""
+        streaming = bool(self._active_response_streaming)
+        if not query and not text:
+            return False
+
+        self._history_navigation_header = ""
+        self.show_chat_view()
+        self._current_query = query
+        self._raw_buffer = text
+        self._pending_thinking = not text and not streaming
+
+        if streaming:
+            self._is_streaming = True
+            self.response_area.clear()
+            if self._current_query:
+                self.response_area.setHtml(
+                    f"<div style='color: #64748b; font-size: 10px; margin-bottom: 5px;'>"
+                    f"<b>QUERY:</b> {escape(self._current_query)}</div>"
+                )
+            if text:
+                cursor = self.response_area.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                fmt = QTextCharFormat()
+                fmt.setForeground(QColor("#d0d0e8"))
+                cursor.setCharFormat(fmt)
+                cursor.insertText(text)
+                self.response_area.setTextCursor(cursor)
+            if "```" not in text:
+                self._render_timer.start()
+        elif not text:
+            self._is_streaming = False
+            self.response_area.setHtml(
+                f"<div style='color: #64748b; font-size: 10px; margin-bottom: 5px;'>"
+                f"<b>QUERY:</b> {escape(self._current_query)}</div>"
+                f"<div style='color: #f59e0b; font-size: 11px; font-style: italic;'>⏳ Thinking...</div>"
+            )
+        else:
+            self._is_streaming = False
+            self._render_markdown_now()
+        return True
 
     def append_response(self, text: str):
         """Called on every streaming chunk from AIEngine.response_chunk.
@@ -491,6 +574,9 @@ class OverlayWindow(QMainWindow):
         - Accumulate in _raw_buffer for the periodic Markdown re-render (300ms).
         - On the very first chunk, clear the widget and start the periodic timer.
         """
+        self.capture_active_response_chunk(text)
+        if bool(getattr(self.app, "_history_navigation_active", False)):
+            return
         if not self._is_streaming:
             # First chunk: switch into streaming mode
             self._is_streaming = True
@@ -518,6 +604,9 @@ class OverlayWindow(QMainWindow):
         # Immediate plaintext append — character-level, zero lag.
         # Use QTextCharFormat to keep text in the correct colour (#d0d0e8)
         # even after a prior setHtml() call switched the document to rich-text mode.
+        sb = self.response_area.verticalScrollBar()
+        previous_value = sb.value()
+        was_scrolling = bool(self._user_is_scrolling)
         cursor = self.response_area.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         fmt = QTextCharFormat()
@@ -525,9 +614,7 @@ class OverlayWindow(QMainWindow):
         cursor.setCharFormat(fmt)
         cursor.insertText(text)
         self.response_area.setTextCursor(cursor)
-
-        if not self._user_is_scrolling:
-            self.response_area.moveCursor(QTextCursor.MoveOperation.End)
+        self._restore_scroll_after_update(previous_value, was_scrolling)
 
     def on_complete(self, full_text: str, query: str = None, cache_tier: int = 0, provider: str = ""):
         """Called when streaming finishes. Does a final full Markdown render.
@@ -539,8 +626,11 @@ class OverlayWindow(QMainWindow):
         self._render_timer.stop()    # stop the periodic timer
         self._is_streaming = False
         self._pending_thinking = False  # GAP 2: always clear on completion
-        if query:
+        if query is not None:
             self._current_query = query
+        self._active_response_query = self._current_query
+        self._active_response_text = full_text or ""
+        self._active_response_streaming = False
         self._raw_buffer = full_text
 
         # GAP 5: Build source badge for the response header
@@ -832,52 +922,64 @@ class OverlayWindow(QMainWindow):
 
         self.refresh_standby_state()
 
-    def update_live_mode_state(
+    def update_auto_mode_state(
         self,
         enabled: bool,
         connected: bool,
         reconnecting: bool = False,
         fallback: bool = False,
     ):
-        if not hasattr(self, "live_status"):
+        if not hasattr(self, "auto_status"):
             return
-        self.live_status.setVisible(bool(getattr(self.app, "session_active", False)))
-        if connected and enabled:
+        self.auto_status.setVisible(bool(getattr(self.app, "session_active", False)))
+
+        # Auto Mode has no WebSocket; enabled == active.
+        auto_active = bool(
+            enabled
+            and getattr(self.app, "_auto_mode_requested", lambda: False)()
+        )
+
+        if auto_active and not reconnecting and not fallback:
+            # Auto Mode active — green
             color = "#4ade80"
             bg = "rgba(74,222,128,28)"
             border = "rgba(74,222,128,64)"
-            label = "LIVE ON"
-            tip = "Gemini Live audio mode is connected for low-latency spoken replies"
+            label = "AUTO"
+            tip = "Auto Mode is answering from Whisper transcripts through the normal provider pipeline"
+        elif connected and enabled:
+            color = "#4ade80"
+            bg = "rgba(74,222,128,28)"
+            border = "rgba(74,222,128,64)"
+            label = "AUTO"
+            tip = "Auto Mode is active"
         elif reconnecting and enabled:
             color = "#f59e0b"
             bg = "rgba(245,158,11,24)"
             border = "rgba(245,158,11,56)"
             label = "RETRY"
-            tip = "Gemini Live is reconnecting. Standard mode will take over if reconnect fails."
+            tip = "Auto Mode is refreshing. The standard pipeline remains available."
         elif fallback:
             color = "#f97316"
             bg = "rgba(249,115,22,24)"
             border = "rgba(249,115,22,60)"
             label = "STD"
-            tip = "Standard mode is active because Gemini Live is unavailable for this session right now."
+            tip = "Standard question detection is active because Auto Mode is unavailable right now."
         else:
-            color = "#f59e0b" if enabled else "#64748b"
-            bg = "rgba(245,158,11,24)" if enabled else "rgba(100,116,139,18)"
-            border = "rgba(245,158,11,56)" if enabled else "rgba(100,116,139,36)"
-            label = "LIVE" if enabled else "OFF"
-            tip = (
-                "Toggle Gemini Live audio mode. Use it for faster voice back-and-forth with Gemini."
-                if enabled
-                else "Live mode is turned off. Click to switch back to Gemini Live."
-            )
-        self.live_status.setText(label)
-        self.live_status.setToolTip(tip)
-        self.live_status.setStyleSheet(
+            color = "#64748b"
+            bg = "rgba(100,116,139,18)"
+            border = "rgba(100,116,139,36)"
+            label = "OFF"
+            tip = "Auto Mode is turned off. Click to answer spoken prompts automatically."
+
+        self.auto_status.setText(label)
+        self.auto_status.setToolTip(tip)
+        self.auto_status.setStyleSheet(
             "QPushButton { "
             f"color: {color}; background: {bg}; border: 1px solid {border}; "
             "border-radius: 10px; font-size: 10px; font-weight: 800; padding: 0 8px; } "
             "QPushButton:hover { background: rgba(255,255,255,12); }"
         )
+
 
     def _toggle_vision(self):
         """Full vision kill switch — toggles screen capture + OCR as a unit.
@@ -990,9 +1092,6 @@ class OverlayWindow(QMainWindow):
         self.show_chat_view()
         
         # P3.2: Add mode-aware response display with index indicator
-        self._render_markdown_now()
-        
-        # P3.2: Update response header to show navigation indicator
         query = e.get("query", "")
         provider = e.get("provider", "")
         indicator = f"Response {i + 1} of {t}"  # Display 1-based index
@@ -1007,6 +1106,7 @@ class OverlayWindow(QMainWindow):
         
         # Store header for rendering after markdown (will be prepended in the response area)
         self._history_navigation_header = header_html
+        self._render_markdown_now()
 
     def show_standby_view(self):
         self.stack.setCurrentWidget(self.standby_view)
