@@ -408,6 +408,7 @@ class AutoModeTester:
         if target_result:
             metadata = metadata or {}
             req_meta = metadata.get("request_metadata", {}) if isinstance(metadata, dict) else {}
+            stage_timings = metadata.get("stage_timings", {}) if isinstance(metadata, dict) else {}
             # First response wins — if the fixture already has a recorded response
             # Record later arrivals as duplicate_response events for observability
             # but do not add them to the responses list.
@@ -436,6 +437,7 @@ class AutoModeTester:
                         "latency_ms": latency,
                         "source": "auto_answer" if req_meta.get("auto_answer") else "standard_fallback",
                         "request_metadata": req_meta,
+                        "stage_timings": stage_timings,
                     }
                 )
                 target_result["late_completion"] = bool(target_result is not self.current_result)
