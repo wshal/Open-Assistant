@@ -81,6 +81,15 @@ _STATIC_ASR_CORRECTIONS: list[tuple[re.Pattern, str]] = [
     (re.compile(r'\bLe\s*pivot\b', re.IGNORECASE), "Let's pivot"),
     # noise tags from ASR like "<noise>" → empty (stripped later)
     (re.compile(r'<[^>]{0,20}>', re.IGNORECASE), ''),
+    # ── Common developer term mishears ──────────────────────────────────────
+    # "poll request" -> "pull request" (extremely common in code review context)
+    (re.compile(r'\bpoll\s+requests?\b', re.IGNORECASE), 'pull request'),
+    # "git hub" -> "GitHub"
+    (re.compile(r'\bgit\s+hub\b', re.IGNORECASE), 'GitHub'),
+    # "type script" -> "TypeScript"
+    (re.compile(r'\btype\s+script\b', re.IGNORECASE), 'TypeScript'),
+    # "cash eviction" -> "cache eviction" in system-design cache prompts
+    (re.compile(r'\bcash\s+eviction\b', re.IGNORECASE), 'cache eviction'),
 ]
 
 
@@ -1229,7 +1238,7 @@ def _trim_weak_leading_fragments(text: str) -> str:
     return text
 
 
-def _extract_last_actionable_question_clause(text: str) -> str:
+def _extract_actionable_question_clause(text: str) -> str:
     normalized_sentences = _normalize_question_sentences(text)
     actionable_questions = [
         part.strip()
@@ -1239,17 +1248,21 @@ def _extract_last_actionable_question_clause(text: str) -> str:
     if len(actionable_questions) >= 2:
         return " ".join(actionable_questions)
 
+    whole_clause = text.rstrip(".?!").strip()
+    if "?" in text and _looks_like_auto_query_clause(whole_clause):
+        return text
+
     matches = list(
         re.finditer(
-            r"(?i)(?:^|[.?!]\s+|\band\s+)(what|why|how|when|where|who|which|can|could|would|should|do|does|did|is|are|tell|explain|compare|define)\b",
+            r"(?i)(?:^|[.?!,;]\s+|\band\s+)(what|why|how|when|where|who|which|can|could|would|should|do|does|did|is|are|tell|explain|compare|define)\b",
             text,
         )
     )
     if not matches:
         return text
 
-    last = matches[-1]
-    candidate = text[last.start():].strip()
+    first = matches[0]
+    candidate = text[first.start():].strip()
     candidate = re.sub(r"^and\s+", "", candidate, flags=re.IGNORECASE).strip()
     if not candidate:
         return text
@@ -1258,7 +1271,7 @@ def _extract_last_actionable_question_clause(text: str) -> str:
     if len(words) < 6:
         return text
     if "?" not in candidate:
-        return text
+        return candidate if _looks_like_auto_query_clause(candidate) else text
     return candidate
 
 
@@ -1376,7 +1389,7 @@ def _finalize_query_label_text(text: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
-    cleaned = _extract_last_actionable_question_clause(cleaned)
+    cleaned = _extract_actionable_question_clause(cleaned)
     cleaned = _dedupe_overlapping_query_sentences(cleaned)
     cleaned = _drop_setup_preamble_before_questions(cleaned)
     cleaned = _trim_weak_leading_fragments(cleaned)

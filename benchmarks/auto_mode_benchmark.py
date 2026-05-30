@@ -277,10 +277,7 @@ class AutoModeTester:
         if self.current_result:
             canonical = self._canonical_query_text(query)
             fixture_name = str(self.current_result.get("file") or "")
-            query_belongs_to_current_fixture = (
-                not fixture_name
-                or self._query_matches_fixture(query, fixture_name)
-            )
+            query_belongs_to_current_fixture = self._query_belongs_to_fixture(query, fixture_name)
             if query_belongs_to_current_fixture:
                 already_dispatched_queries = {
                     self._canonical_query_text(e.get("query", ""))
@@ -522,6 +519,16 @@ class AutoModeTester:
         normalized_expected = self._canonical_query_text(expected)
         return bool(normalized_query and normalized_query == normalized_expected)
 
+    def _fixture_has_expected_query(self, fixture_name: str) -> bool:
+        return bool(fixture_name and self._fixture_expected_query(Path(fixture_name)))
+
+    def _query_belongs_to_fixture(self, query: str, fixture_name: str) -> bool:
+        if not query or not fixture_name:
+            return False
+        if not self._fixture_has_expected_query(fixture_name):
+            return True
+        return self._query_matches_fixture(query, fixture_name)
+
     @staticmethod
     def _canonical_query_text(text: str) -> str:
         import re
@@ -539,7 +546,7 @@ class AutoModeTester:
         query = (query or "").strip()
         if query and self.current_result and recent:
             closed_at = float(recent.get("_closed_at", 0.0) or 0.0)
-            current_matches = self._query_matches_fixture(query, self.current_result.get("file", ""))
+            current_matches = self._query_belongs_to_fixture(query, self.current_result.get("file", ""))
             recent_matches = (
                 closed_at > 0.0
                 and (now - closed_at) <= 30.0

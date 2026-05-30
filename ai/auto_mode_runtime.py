@@ -15,6 +15,12 @@ def init_auto_mode_state(app) -> None:
     app._auto_interim_pending_query = ""
     app._auto_interim_pending_raw = ""
     app._auto_interim_pending_seq = 0
+    app._auto_final_pending_query = ""
+    app._auto_final_pending_raw = ""
+    app._auto_final_pending_metadata = None
+    app._auto_final_pending_session_id = ""
+    app._auto_final_pending_seq = 0
+    app._auto_final_pending_at = 0.0
     app._pending_incomplete_audio_query = ""
     app._pending_incomplete_audio_at = 0.0
 
@@ -30,6 +36,12 @@ def reset_auto_mode_turn_state(app, *, cancel_pending_interim: bool = True) -> N
     app._auto_interim_pending_raw = ""
     if cancel_pending_interim:
         app._auto_interim_pending_seq = int(getattr(app, "_auto_interim_pending_seq", 0) or 0) + 1
+    app._auto_final_pending_query = ""
+    app._auto_final_pending_raw = ""
+    app._auto_final_pending_metadata = None
+    app._auto_final_pending_session_id = ""
+    app._auto_final_pending_seq = int(getattr(app, "_auto_final_pending_seq", 0) or 0) + 1
+    app._auto_final_pending_at = 0.0
     app._pending_incomplete_audio_query = ""
     app._pending_incomplete_audio_at = 0.0
 

@@ -835,7 +835,9 @@ class AIEngine(QObject):
 
             # Build conversation history block from last 3 turns (capped at 1500 chars).
             # Injected into the prompt so the model understands what was discussed.
-            if bg_mode and cloud_bg_fallback:
+            if request_metadata.get("suppress_history_context"):
+                history_block = ""
+            elif bg_mode and cloud_bg_fallback:
                 history_block = ""
                 logger.debug("AI: Cloud bg fallback — skipping history block generation to save tokens.")
             else:

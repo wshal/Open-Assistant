@@ -96,6 +96,12 @@ class TextUtilsTests(unittest.TestCase):
             "Let's pivot to some CSS basics. A lot of developers get confused between CSS Grid and Flexbox.",
         )
 
+    def test_sanitize_auto_transcript_repairs_common_developer_mishears(self):
+        self.assertEqual(
+            sanitize_auto_transcript("What do you look for in a poll request on git hub with type script and cash eviction?"),
+            "What do you look for in a pull request on GitHub with TypeScript and cache eviction?",
+        )
+
     def test_sanitize_query_label_repairs_css_benchmark_question(self):
         self.assertEqual(
             sanitize_query_label("A lot of de velopersgetcon fusedbet ween CSS Grid. and Flexbox. Can you plain the pri marydi fferences between the two?"),
@@ -288,6 +294,34 @@ class TextUtilsTests(unittest.TestCase):
                 "What are the potential security risks if you store a JWT in the browser's local storage instead of an?"
             ),
             "Could you explain how JWT tokens work? What are the potential security risks if you store a JWT in the browser local storage instead of an http-only cookie?",
+        )
+
+    def test_sanitize_query_label_preserves_single_sentence_compound_question(self):
+        self.assertEqual(
+            sanitize_query_label(
+                "Can you explain to me what the borrow checker does and why it's important for memory safety?"
+            ),
+            "Can you explain to me what the borrow checker does and why it's important for memory safety?",
+        )
+
+    def test_sanitize_query_label_keeps_all_questions_after_context_clause(self):
+        self.assertEqual(
+            sanitize_query_label(
+                "If you are traversing a binary search tree to find a specific node, "
+                "What is the expected time complexity in big O notation? "
+                "And what is the worst case scenario if the tree is unbalanced?"
+            ),
+            "What is the expected time complexity in big O notation? And what is the worst case scenario if the tree is unbalanced?",
+        )
+
+    def test_sanitize_query_label_strips_setup_before_command_style_ask(self):
+        self.assertEqual(
+            sanitize_query_label(
+                "Let's do a quick system design thought experiment. "
+                "We are building a high-traffic news website. "
+                "Explain how you would implement a caching layer, and what cache eviction policies you might use to keep the content fresh."
+            ),
+            "explain how you would implement a caching layer, and what cache eviction policies you might use to keep the content fresh?",
         )
 
 

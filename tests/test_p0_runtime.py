@@ -1436,6 +1436,45 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         self.assertEqual(metrics["provider"], "groq")
         self.assertEqual(metrics["chunks"], 1)
 
+    def test_groq_stt_timeout_falls_back_to_local_without_blocking_session(self):
+        from concurrent.futures import TimeoutError
+
+        audio = AudioCapture(
+            ConfigStub(
+                {
+                    "capture.audio.transcription_provider": "groq",
+                    "capture.audio.groq_stt_timeout_s": 1.5,
+                    "api_key.groq": "gsk_test_key_1234567890",
+                }
+            )
+        )
+        fallback_calls = []
+
+        class _Future:
+            def result(self, timeout=None):
+                self.timeout = timeout
+                raise TimeoutError()
+
+        class _CloudPool:
+            def __init__(self):
+                self.future = _Future()
+
+            def submit(self, fn, *args):
+                return self.future
+
+        audio._cloud_stt_pool = _CloudPool()
+        audio._transcribe_local = lambda *args, **kwargs: fallback_calls.append((args, kwargs))
+        buffer = [
+            np.ones((audio.block_size, 1), dtype=np.float32) * 0.02
+            for _ in range(3)
+        ]
+
+        audio._transcribe_groq(buffer, speech_started_at=1.0, is_final=True)
+
+        self.assertEqual(len(fallback_calls), 1)
+        self.assertFalse(audio._cloud_stt_session_blocked)
+        self.assertEqual(audio._cloud_stt_pool.future.timeout, 1.5)
+
     def test_groq_stt_falls_back_to_local_without_key(self):
         audio = AudioCapture(
             ConfigStub({"capture.audio.transcription_provider": "groq"})

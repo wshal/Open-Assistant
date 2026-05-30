@@ -934,6 +934,141 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertIn("alleviate that bottleneck", dispatched[0][0])
         self.assertTrue(app._pending_request_metadata["preserve_session_context"])
 
+    def test_auto_mode_injects_api_preamble_even_when_query_mentions_api(self):
+        app = self._build_app()
+        app.session_active = True
+        app.config.set("ai.auto_mode.enabled", True)
+        dispatched = []
+        session_contexts = []
+        app.nexus = SimpleNamespace(push=lambda source, value: None, get_snapshot=lambda: {})
+        app.generate_response = lambda query, origin, ctx: dispatched.append((query, origin, ctx))
+        app.audio = SimpleNamespace(get_last_transcription_metrics=lambda: {})
+        app.ai.set_session_context = session_contexts.append
+        app.ai.detector = SimpleNamespace(
+            question_prefixes=["what ", "how ", "why ", "can ", "could "],
+            question_patterns=["what is", "how do", "can you", "could you"],
+            detect_with_confidence=lambda text, source="audio": SimpleNamespace(
+                triggered=False,
+                confidence=0.0,
+                detected_text="",
+                should_auto_respond=lambda: False,
+            ),
+        )
+
+        OpenAssistApp._on_transcription(
+            app,
+            "Imagine we are designing a new public-facing API for our mobile app.",
+        )
+        self.assertEqual(dispatched, [])
+
+        OpenAssistApp._on_transcription(
+            app,
+            "What are some of the key principles you would follow to ensure the API is robust, maintainable, and provides a good developer experience for the frontend team?",
+        )
+
+        self.assertEqual(len(dispatched), 1)
+        self.assertTrue(app._pending_request_metadata["preserve_session_context"])
+        self.assertEqual(len(session_contexts), 1)
+        self.assertIn("new public-facing API for our mobile app", session_contexts[0])
+
+    def test_auto_mode_injects_recent_context_even_for_full_scenario_query(self):
+        from ai.auto_answer_controller import _dispatch_auto_query
+
+        app = self._build_app()
+        session_contexts = []
+        dispatched = []
+        app.ai.set_session_context = session_contexts.append
+        app.generate_response = lambda query, origin, ctx: dispatched.append((query, origin, ctx))
+        app._auto_answer_context = "The interviewer first mentioned strict backwards compatibility."
+
+        candidate = (
+            "Imagine we are designing a new public-facing API for our mobile app "
+            "that must support external developers and internal frontend teams. "
+            "What are some of the key principles you would follow to ensure the API "
+            "is robust, maintainable, versionable, and provides a good developer experience?"
+        )
+
+        _dispatch_auto_query(app, candidate, candidate, "session_test")
+
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(len(session_contexts), 1)
+        self.assertIn("[RECENT SPOKEN CONTEXT]", session_contexts[0])
+        self.assertIn("strict backwards compatibility", session_contexts[0])
+        self.assertTrue(app._pending_request_metadata["preserve_session_context"])
+
+    def test_auto_mode_defers_open_ended_prompt_and_merges_followup(self):
+        from ai.auto_answer_controller import (
+            _final_dispatch_delay_ms,
+            _should_defer_for_followup,
+            handle_auto_final_transcription,
+        )
+
+        app = self._build_app()
+        app.session_active = True
+        app.config.set("ai.auto_mode.enabled", True)
+        app.config.set("ai.auto_mode.final_dispatch_debounce_ms", 900)
+        app.config.set("ai.auto_mode.open_ended_followup_debounce_ms", 5200)
+        dispatched = []
+        scheduled = []
+        app.generate_response = lambda query, origin, ctx: dispatched.append((query, origin, ctx))
+
+        self.assertTrue(
+            _should_defer_for_followup(
+                "Tell me about a time when you disagreed with a senior engineer?",
+                "Tell me about a time when you disagreed with a senior engineer?",
+            )
+        )
+        self.assertEqual(
+            _final_dispatch_delay_ms(
+                app,
+                "Tell me about a time when you disagreed with a senior engineer?",
+                "Tell me about a time when you disagreed with a senior engineer?",
+            ),
+            5200,
+        )
+        self.assertEqual(
+            _final_dispatch_delay_ms(
+                app,
+                "How do I merge two dictionaries in Python?",
+                "How do I merge two dictionaries in Python?",
+            ),
+            900,
+        )
+        self.assertEqual(
+            _final_dispatch_delay_ms(
+                app,
+                "Explain how you would implement a caching layer, and what cache eviction policies you might use.",
+                "explain how you would implement a caching layer, and what cache eviction policies you might use?",
+            ),
+            900,
+        )
+
+        with patch("PyQt6.QtCore.QTimer.singleShot", side_effect=lambda delay, cb: scheduled.append((delay, cb))):
+            handle_auto_final_transcription(
+                app,
+                "Tell me about a time when you disagreed with a senior engineer or product manager about a technical decision.",
+                "session_test",
+            )
+            self.assertEqual(dispatched, [])
+            self.assertIn("Tell me about a time", app._auto_final_pending_query)
+            self.assertEqual(scheduled[-1][0], 5200)
+
+            handle_auto_final_transcription(
+                app,
+                "How did you approach the situation and what was the outcome?",
+                "session_test",
+            )
+            self.assertEqual(dispatched, [])
+            self.assertIn("How did you approach", app._auto_final_pending_query)
+            self.assertEqual(scheduled[-1][0], 900)
+
+            for _delay, callback in list(scheduled):
+                callback()
+
+        self.assertEqual(len(dispatched), 1)
+        self.assertIn("Tell me about a time", dispatched[0][0])
+        self.assertIn("How did you approach", dispatched[0][0])
+
     def test_auto_mode_speculative_interim_dispatches_stable_complete_question(self):
         from ai.auto_answer_controller import handle_auto_interim_transcription
 
@@ -1391,6 +1526,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         app = self._build_app()
         app._auto_answer_context = "stale context from previous fixture"
         app._auto_interim_pending_query = "half-heard question"
+        app._auto_final_pending_query = "pending open-ended prompt"
         app._pending_incomplete_audio_query = "incomplete carry-forward"
         app.overlay.response_area = SimpleNamespace(clear=lambda: None)
 
@@ -1398,6 +1534,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertEqual(app._auto_answer_context, "")
         self.assertEqual(app._auto_interim_pending_query, "")
+        self.assertEqual(app._auto_final_pending_query, "")
         self.assertEqual(app._pending_incomplete_audio_query, "")
 
     def test_reset_benchmark_fixture_runtime_clears_pending_audio_followup_state(self):

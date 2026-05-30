@@ -68,6 +68,10 @@ class AudioCapture(QObject):
             config.get("capture.audio.groq_stt_model", "whisper-large-v3-turbo")
             or "whisper-large-v3-turbo"
         )
+        self._groq_stt_timeout_s = max(
+            1.0,
+            float(config.get("capture.audio.groq_stt_timeout_s", 8.0) or 8.0),
+        )
         self._cloud_stt_unavailable_logged = False
 
         # ── Phase 2: Adaptive Ambient VAD Calibration ─────────────────────────
@@ -2079,12 +2083,14 @@ class AudioCapture(QObject):
         self,
         speech_started_at=None,
         vad_meta=None,
-        timeout_s: float = 13.0,
+        timeout_s: float | None = None,
     ) -> tuple[int, bool]:
+        if timeout_s is None:
+            timeout_s = float(getattr(self, "_groq_stt_timeout_s", 8.0) or 8.0)
         pending = list(getattr(self, "_groq_chunk_futures", []))
         self._groq_chunk_futures = []
         chunk_count = 0
-        cloud_failed = False
+        auth_failed = False
         for entry in pending:
             fut = entry.get("future") if isinstance(entry, dict) else entry
             entry_buffer = entry.get("buffer", []) if isinstance(entry, dict) else []
@@ -2104,7 +2110,7 @@ class AudioCapture(QObject):
                         vad_meta=vad_meta,
                     )
             except Exception as exc:
-                cloud_failed = True
+                auth_failed = auth_failed or self._is_groq_auth_error(exc)
                 logger.warning(
                     "[Groq STT] Pending chunk failed (%r); using local fallback for this chunk",
                     exc,
@@ -2116,7 +2122,22 @@ class AudioCapture(QObject):
                         is_final=False,
                         vad_meta=vad_meta,
                     )
-        return chunk_count, cloud_failed
+        return chunk_count, auth_failed
+
+    @staticmethod
+    def _is_groq_auth_error(exc: Exception) -> bool:
+        status = getattr(exc, "code", None)
+        response = getattr(exc, "response", None)
+        if response is not None:
+            status = getattr(response, "status_code", status)
+        err_str = str(exc or "")
+        return (
+            status in {401, 403}
+            or "403" in err_str
+            or "401" in err_str
+            or "Forbidden" in err_str
+            or "Unauthorized" in err_str
+        )
 
     def _transcribe_groq(self, buffer, speech_started_at=None, is_final: bool = True, vad_meta=None):
         """Phase 2: Transcribe via Groq Cloud Whisper API.
@@ -2144,14 +2165,15 @@ class AudioCapture(QObject):
         if not buffer or len(buffer) < 2:
             if is_final:
                 transcribe_started_at = time.time()
-                chunk_count, cloud_failed = self._consume_pending_groq_chunk_futures(
+                chunk_count, auth_failed = self._consume_pending_groq_chunk_futures(
                     speech_started_at=speech_started_at,
                     vad_meta=vad_meta,
                 )
-                if cloud_failed:
+                if auth_failed:
                     self._cloud_stt_session_blocked = True
+                    self._cloud_stt_failed_key = self._groq_api_key()
                     logger.warning(
-                        "[Groq STT] Disabled for this session after pending chunk failure; future utterances will use local Whisper"
+                        "[Groq STT] Disabled for this session after pending auth failure; future utterances will use local Whisper"
                     )
                 if chunk_count:
                     logger.info(
@@ -2204,51 +2226,28 @@ class AudioCapture(QObject):
             return
 
         _groq_stt_model = self._groq_stt_model
+        _groq_stt_timeout_s = float(getattr(self, "_groq_stt_timeout_s", 8.0) or 8.0)
         _language = getattr(self, "_language", None)
         _is_hall = self._is_hall
 
         def _call_groq(wav_bytes: bytes) -> str:
             """POST wav_bytes to Groq and return transcript text (empty on error)."""
-            try:
-                from groq import Groq
-                buf = io.BytesIO(wav_bytes)
-                buf.name = "audio.wav"
-                client = Groq(api_key=groq_key, max_retries=0, timeout=12.0)
-                kwargs = {"file": buf, "model": _groq_stt_model}
-                if _language:
-                    kwargs["language"] = _language
-                result = client.audio.transcriptions.create(**kwargs)
-                return (
-                    getattr(result, "text", "")
-                    or (result.get("text", "") if isinstance(result, dict) else "")
-                ).strip()
-            except (ImportError, AttributeError, TypeError):
-                import urllib.request, json as _json
-                boundary = "----OpenAssistBoundary"
-                body_parts = [
-                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{_groq_stt_model}\r\n".encode()
-                ]
-                if _language:
-                    body_parts.append(
-                        f"--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n{_language}\r\n".encode()
-                    )
-                body_parts.append(
-                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n".encode()
-                    + wav_bytes + b"\r\n"
-                )
-                body_parts.append(f"--{boundary}--\r\n".encode())
-                body = b"".join(body_parts)
-                req = urllib.request.Request(
-                    "https://api.groq.com/openai/v1/audio/transcriptions",
-                    data=body,
-                    headers={
-                        "Authorization": f"Bearer {groq_key}",
-                        "Content-Type": f"multipart/form-data; boundary={boundary}",
-                    },
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=12) as resp:
-                    return _json.loads(resp.read().decode()).get("text", "").strip()
+            import requests
+
+            data = {"model": _groq_stt_model}
+            if _language:
+                data["language"] = _language
+            response = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={
+                    "Authorization": f"Bearer {groq_key}",
+                },
+                data=data,
+                files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+                timeout=(min(2.0, _groq_stt_timeout_s), _groq_stt_timeout_s),
+            )
+            response.raise_for_status()
+            return str(response.json().get("text", "") or "").strip()
 
         try:
             wav_bytes, n_samples = _build_wav(buffer)
@@ -2277,7 +2276,7 @@ class AudioCapture(QObject):
             self._groq_chunk_futures = []  # reset before any await
 
             chunk_texts = []
-            cloud_failed = False
+            auth_failed = False
 
             def _fallback_local_part(entry_buffer, entry_started_at) -> None:
                 self._transcribe_local(
@@ -2290,7 +2289,7 @@ class AudioCapture(QObject):
             for entry in pending:
                 fut = entry.get("future") if isinstance(entry, dict) else entry
                 try:
-                    t = fut.result(timeout=13.0)
+                    t = fut.result(timeout=_groq_stt_timeout_s)
                     if t and not _is_hall(t):
                         chunk_texts.append(t)
                         self._append_session_transcript_part(t, provider="groq")
@@ -2300,7 +2299,7 @@ class AudioCapture(QObject):
                             entry.get("speech_started_at") if isinstance(entry, dict) else speech_started_at,
                         )
                 except Exception as exc:
-                    cloud_failed = True
+                    auth_failed = auth_failed or self._is_groq_auth_error(exc)
                     logger.warning("[Groq STT] Pending chunk failed (%r); using local fallback for this chunk", exc)
                     _fallback_local_part(
                         entry.get("buffer", []) if isinstance(entry, dict) else [],
@@ -2308,9 +2307,9 @@ class AudioCapture(QObject):
                     )
 
             try:
-                final_text = final_future.result(timeout=13.0)
+                final_text = final_future.result(timeout=_groq_stt_timeout_s)
             except Exception as exc:
-                cloud_failed = True
+                auth_failed = auth_failed or self._is_groq_auth_error(exc)
                 logger.warning("[Groq STT] Final chunk failed (%r); using local fallback for this chunk", exc)
                 final_text = ""
 
@@ -2321,10 +2320,11 @@ class AudioCapture(QObject):
             if not (final_text and not _is_hall(final_text)):
                 _fallback_local_part(buffer, speech_started_at)
 
-            if cloud_failed:
+            if auth_failed:
                 self._cloud_stt_session_blocked = True
+                self._cloud_stt_failed_key = groq_key
                 logger.warning(
-                    "[Groq STT] Disabled for this session after chunk failure; future utterances will use local Whisper"
+                    "[Groq STT] Disabled for this session after auth failure; future utterances will use local Whisper"
                 )
 
             transcribe_finished_at = time.time()
@@ -2343,8 +2343,16 @@ class AudioCapture(QObject):
 
         except Exception as e:
             status = getattr(e, "code", None)
+            response = getattr(e, "response", None)
+            if response is not None:
+                status = getattr(response, "status_code", status)
             detail = ""
-            if hasattr(e, "read"):
+            if response is not None:
+                try:
+                    detail = str(getattr(response, "text", "") or "")[:500]
+                except Exception:
+                    detail = ""
+            if not detail and hasattr(e, "read"):
                 try:
                     detail = e.read().decode("utf-8", errors="replace")[:500]
                 except Exception:
@@ -2363,11 +2371,10 @@ class AudioCapture(QObject):
                     self._cloud_stt_failed_key = groq_key
             else:
                 logger.warning(
-                    "[Groq STT] API error (%s)%s - Groq STT disabled for this session; falling back to local Whisper",
+                    "[Groq STT] API error (%s)%s - falling back to local Whisper for this chunk; Groq remains enabled",
                     e,
                     f" | response={detail}" if detail else "",
                 )
-                self._cloud_stt_session_blocked = True
             self._groq_chunk_futures = []
             self._transcribe_local(buffer, speech_started_at, is_final, vad_meta=vad_meta)
 

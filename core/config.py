@@ -287,6 +287,7 @@ class Config:
         self._data["capture"].setdefault("audio", {})
         self._data["capture"]["audio"].setdefault("transcription_provider", "groq")
         self._data["capture"]["audio"].setdefault("groq_stt_model", "whisper-large-v3-turbo")
+        self._data["capture"]["audio"].setdefault("groq_stt_timeout_s", 8.0)
         self._data["capture"]["audio"].setdefault("whisper_model", "small.en")
         self._data["capture"]["audio"].setdefault("prefer_free_cloud", False)
         self._data["capture"]["audio"].setdefault("cloud_final_max_s", 12.0)

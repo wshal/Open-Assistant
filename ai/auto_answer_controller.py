@@ -208,6 +208,136 @@ def _recent_auto_dispatch_matches(app: "OpenAssistApp", candidate: str, window_s
     return _query_similarity(suppressed, candidate) >= 0.72
 
 
+def _audio_processing_busy(app: "OpenAssistApp") -> bool:
+    audio = getattr(app, "audio", None)
+    if audio and hasattr(audio, "has_pending_transcription_jobs"):
+        try:
+            return bool(audio.has_pending_transcription_jobs())
+        except Exception:
+            return False
+    return False
+
+
+def _should_defer_for_followup(raw: str, candidate: str) -> bool:
+    """Delay broad command-style prompts briefly so nearby follow-ups can merge.
+
+    In interview scenarios, a single spoken prompt often arrives as two separate
+    transcripts:
+      T1: "Tell me about a time when you disagreed with a senior engineer."
+      T2: "How did you approach the situation and what was the outcome?"
+
+    Without deferral, T1 dispatches immediately and T2 either creates a
+    duplicate response or arrives too late to be contextualised.
+
+    Strategy: check for open-ended patterns FIRST (they always defer regardless
+    of punctuation), then short-circuit on explicit ``?`` only for non-open-ended
+    questions.
+    """
+    cleaned = " ".join((candidate or raw or "").split()).strip()
+    if not cleaned:
+        return False
+
+    words = re.findall(r"[A-Za-z0-9']+", cleaned)
+    if len(words) < 8:
+        return False
+
+    lower = cleaned.lower().rstrip(".?!")
+
+    # ── Open-ended prompts: ALWAYS defer regardless of punctuation ──────────
+    # Whisper may or may not add a `?`; we must not depend on it.
+    OPEN_ENDED_STARTS = (
+        "tell me about ",
+        "tell us about ",
+        "describe ",
+        "discuss ",
+        "walk me through ",
+        "walk us through ",
+        "take me through ",
+        "explain how you ",
+        "explain a time ",
+        "outline how ",
+        "give me an example ",
+        "give an example ",
+        "share ",
+    )
+    OPEN_ENDED_PHRASES = (
+        " about a time ",
+        " about a situation ",
+        " situation where ",
+        " situation when ",
+        " scenario where ",
+        " experience with ",
+        " experience where ",
+    )
+    is_open_ended = (
+        lower.startswith(OPEN_ENDED_STARTS)
+        or any(p in f" {lower} " for p in OPEN_ENDED_PHRASES)
+    )
+    if is_open_ended:
+        return True
+
+    # ── Non-open-ended with explicit ? → treat as complete, don't defer ────
+    raw_cleaned = " ".join((raw or "").split()).strip()
+    if "?" in raw_cleaned:
+        return False
+
+    # ── Catch remaining behavioral / outcome patterns without ? ─────────────
+    return bool(
+        " outcome" in lower
+        or " result" in lower
+        or " what happened" in lower
+        or lower.endswith("and how")
+        or lower.endswith("and what")
+        or lower.endswith("and why")
+    )
+
+
+def _needs_long_followup_debounce(text: str) -> bool:
+    cleaned = " ".join((text or "").split()).strip().lower().rstrip(".?!")
+    if not cleaned:
+        return False
+    behavioral_starts = (
+        "tell me about ",
+        "tell us about ",
+        "explain a time ",
+        "give me an example ",
+        "give an example ",
+        "share ",
+    )
+    behavioral_phrases = (
+        " about a time ",
+        " about a situation ",
+        " situation where ",
+        " situation when ",
+        " scenario where ",
+        " experience with ",
+        " experience where ",
+    )
+    if cleaned.startswith(("describe ", "discuss ")):
+        return any(phrase in f" {cleaned} " for phrase in behavioral_phrases)
+    return cleaned.startswith(behavioral_starts) or any(
+        phrase in f" {cleaned} " for phrase in behavioral_phrases
+    )
+
+
+def _final_dispatch_delay_ms(app: "OpenAssistApp", raw: str, candidate: str) -> int:
+    default_delay_ms = max(0, int(app.config.get("ai.auto_mode.final_dispatch_debounce_ms", 900) or 900))
+    if _needs_long_followup_debounce(candidate or raw):
+        return max(
+            default_delay_ms,
+            int(app.config.get("ai.auto_mode.open_ended_followup_debounce_ms", 5200) or 5200),
+        )
+    return default_delay_ms
+
+
+def _clear_pending_final_dispatch(app: "OpenAssistApp") -> None:
+    app._auto_final_pending_query = ""
+    app._auto_final_pending_raw = ""
+    app._auto_final_pending_metadata = None
+    app._auto_final_pending_session_id = ""
+    app._auto_final_pending_at = 0.0
+
+
 def _dispatch_auto_query(
     app: "OpenAssistApp",
     candidate: str,
@@ -225,21 +355,19 @@ def _dispatch_auto_query(
     request_metadata = dict(request_metadata or {})
     preamble = (getattr(app, "_auto_answer_context", "") or "").strip()
     if preamble and hasattr(app, "ai") and hasattr(app.ai, "set_session_context"):
-        # Only inject if the candidate query is NOT already self-contained
-        # (i.e. skip if the full scenario is already embedded in the query text)
-        if len(candidate.split()) < 20 or not any(
-            kw in candidate.lower()
-            for kw in ("monolithic", "database", "api", "scenario", "system", "application")
-        ):
-            # Format it as a clean scenario block for the system prompt
-            context_block = f"[INTERVIEW SCENARIO CONTEXT]\n{preamble}"
-            app.ai.set_session_context(context_block)
-            request_metadata["preserve_session_context"] = True
-            logger.info(
-                "[%s] Auto Mode injected %d-char preamble into session context",
-                session_id,
-                len(preamble),
-            )
+        context_block = (
+            "[RECENT SPOKEN CONTEXT]\n"
+            "Use this only when it helps disambiguate the user's current question. "
+            "Ignore it if the current question is clearly unrelated.\n"
+            f"{preamble}"
+        )
+        app.ai.set_session_context(context_block)
+        request_metadata["preserve_session_context"] = True
+        logger.info(
+            "[%s] Auto Mode injected %d-char spoken context into session context",
+            session_id,
+            len(preamble),
+        )
 
     app._auto_answer_last_dispatched_query = candidate
     app._auto_answer_last_dispatched_at = time.time()
@@ -249,6 +377,7 @@ def _dispatch_auto_query(
     app._auto_interim_pending_query = ""
     app._auto_interim_pending_raw = ""
     app._auto_interim_pending_seq = int(getattr(app, "_auto_interim_pending_seq", 0) or 0) + 1
+    _clear_pending_final_dispatch(app)
     app.overlay.update_transcript(raw)
     if request_metadata:
         app._pending_request_metadata = dict(request_metadata)
@@ -271,6 +400,110 @@ def _dispatch_auto_query(
         QTimer.singleShot(45_000, lambda: _reset_session_context_if_stale(app, session_id))
     except Exception:
         pass
+
+
+def _dispatch_pending_final_if_current(app: "OpenAssistApp", seq: int) -> None:
+    if int(getattr(app, "_auto_final_pending_seq", 0) or 0) != seq:
+        return
+    candidate = (getattr(app, "_auto_final_pending_query", "") or "").strip()
+    raw = (getattr(app, "_auto_final_pending_raw", "") or candidate).strip()
+    if not candidate or not getattr(app, "_auto_mode_requested", lambda: False)():
+        _clear_pending_final_dispatch(app)
+        return
+
+    pending_at = float(getattr(app, "_auto_final_pending_at", 0.0) or 0.0)
+    max_wait_ms = int(app.config.get("ai.auto_mode.final_dispatch_max_wait_ms", 6500) or 6500)
+    if _audio_processing_busy(app) and pending_at > 0 and (time.time() - pending_at) * 1000.0 < max_wait_ms:
+        try:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(500, lambda: _dispatch_pending_final_if_current(app, seq))
+            return
+        except Exception:
+            logger.debug(
+                "[%s] Auto Mode could not reschedule busy final dispatch; dispatching now",
+                getattr(app, "_auto_final_pending_session_id", "auto") or "auto",
+            )
+
+    metadata = dict(getattr(app, "_auto_final_pending_metadata", None) or {})
+    session_id = getattr(app, "_auto_final_pending_session_id", "") or "auto"
+    if _recent_auto_dispatch_matches(app, candidate):
+        _clear_pending_final_dispatch(app)
+        return
+    _dispatch_auto_query(
+        app,
+        candidate,
+        raw,
+        session_id,
+        request_metadata=metadata,
+        speculative=False,
+    )
+
+
+def _schedule_final_dispatch(
+    app: "OpenAssistApp",
+    candidate: str,
+    raw: str,
+    session_id: str,
+    request_metadata: dict | None,
+    *,
+    delay_ms: int | None = None,
+) -> None:
+    app._auto_final_pending_query = candidate
+    app._auto_final_pending_raw = raw
+    app._auto_final_pending_metadata = dict(request_metadata or {})
+    app._auto_final_pending_session_id = session_id
+    app._auto_final_pending_at = time.time()
+    app._auto_final_pending_seq = int(getattr(app, "_auto_final_pending_seq", 0) or 0) + 1
+    seq = app._auto_final_pending_seq
+    if delay_ms is None:
+        delay_ms = _final_dispatch_delay_ms(app, raw, candidate)
+    delay_ms = max(0, int(delay_ms or 0))
+    app.overlay.update_transcript(raw)
+    logger.info(
+        "[%s] Auto Mode queued final dispatch for follow-up merge | delay_ms=%d query=%r",
+        session_id,
+        delay_ms,
+        candidate[:120],
+    )
+    try:
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(delay_ms, lambda: _dispatch_pending_final_if_current(app, seq))
+    except Exception:
+        _dispatch_pending_final_if_current(app, seq)
+
+
+def _merge_pending_final_dispatch(
+    app: "OpenAssistApp",
+    candidate: str,
+    raw: str,
+    session_id: str,
+    request_metadata: dict | None,
+) -> bool:
+    pending = (getattr(app, "_auto_final_pending_query", "") or "").strip()
+    if not pending:
+        return False
+    pending_at = float(getattr(app, "_auto_final_pending_at", 0.0) or 0.0)
+    max_wait_ms = int(app.config.get("ai.auto_mode.final_dispatch_max_wait_ms", 6500) or 6500)
+    if pending_at <= 0 or (time.time() - pending_at) * 1000.0 > max_wait_ms:
+        _dispatch_pending_final_if_current(app, int(getattr(app, "_auto_final_pending_seq", 0) or 0))
+        return False
+
+    prior_raw = (getattr(app, "_auto_final_pending_raw", "") or pending).strip()
+    merged_raw = merge_transcripts(prior_raw, raw, max_overlap_words=24).strip()
+    merged_candidate = (sanitize_query_label(merge_transcripts(pending, candidate, max_overlap_words=24)) or candidate).strip()
+    metadata = dict(getattr(app, "_auto_final_pending_metadata", None) or {})
+    metadata.update(dict(request_metadata or {}))
+    followup_delay_ms = max(0, int(app.config.get("ai.auto_mode.final_dispatch_debounce_ms", 900) or 900))
+    _schedule_final_dispatch(
+        app,
+        merged_candidate,
+        merged_raw,
+        session_id,
+        metadata,
+        delay_ms=followup_delay_ms,
+    )
+    logger.info("[%s] Auto Mode merged follow-up into pending final dispatch | query=%r", session_id, merged_candidate[:120])
+    return True
 
 
 def _dispatch_auto_interim_if_current(app: "OpenAssistApp", seq: int, session_id: str) -> None:
@@ -408,8 +641,15 @@ def handle_auto_final_transcription(
         logger.info("[%s] Auto Mode waiting for clipped query continuation | query=%r", session_id, candidate[:120])
         return True
 
+    if _merge_pending_final_dispatch(app, candidate, raw, session_id, request_metadata):
+        return True
+
     if _recent_auto_dispatch_matches(app, candidate):
         logger.info("[%s] Auto Mode duplicate final transcript suppressed | query=%r", session_id, candidate[:120])
+        return True
+
+    if _should_defer_for_followup(raw, candidate):
+        _schedule_final_dispatch(app, candidate, raw, session_id, request_metadata)
         return True
 
     _dispatch_auto_query(
