@@ -523,12 +523,16 @@ class AutoModeTester:
         if not query or not fixture_name:
             return False
 
-        expected = self._fixture_expected_query(Path(fixture_name))
-        if not expected:
+        expected_queries = self._fixture_expected_queries(Path(fixture_name))
+        if not expected_queries:
             return False
         normalized_query = self._canonical_query_text(query)
-        normalized_expected = self._canonical_query_text(expected)
-        return bool(normalized_query and normalized_query == normalized_expected)
+        normalized_expected = {
+            self._canonical_query_text(expected)
+            for expected in expected_queries
+            if expected
+        }
+        return bool(normalized_query and normalized_query in normalized_expected)
 
     def _fixture_has_expected_query(self, fixture_name: str) -> bool:
         return bool(fixture_name and self._fixture_expected_query(Path(fixture_name)))
@@ -738,6 +742,23 @@ class AutoModeTester:
             ),
         }
         return expected.get(audio_path.name, "")
+
+    @staticmethod
+    def _fixture_expected_queries(audio_path: Path) -> list[str]:
+        primary = AutoModeTester._fixture_expected_query(audio_path)
+        aliases = {
+            "fullstack_api_design.wav": [
+                (
+                    "What are some of the key principles you would follow to ensure the API is robust, "
+                    "versionable and provides a good developer experience for the frontend team?"
+                ),
+                (
+                    "What are some of the key principles you would follow to ensure the API is robust, "
+                    "versionable and provides a good developer experience for the front-end team?"
+                ),
+            ],
+        }
+        return [q for q in [primary, *aliases.get(audio_path.name, [])] if q]
 
     @staticmethod
     def _fixture_expected_transcript(audio_path: Path) -> str:

@@ -4,6 +4,14 @@ OpenAssist is a local-first AI assistant for real-time work. It listens to syste
 
 The goal is simple: capture context from the environment you are already working in, understand the actual question, and return a useful answer quickly.
 
+## Use Cases
+
+- AI coding assistant for live debugging, architecture questions, and code review.
+- Meeting copilot for system-audio transcription and follow-up answers.
+- Interview assistant for technical and behavioral question practice.
+- Screen-aware assistant for OCR, docs, terminals, and browser workflows.
+- Local knowledge assistant with RAG over project files and documents.
+
 ## What It Does
 
 - Turns spoken audio into actionable questions with Auto Mode.
