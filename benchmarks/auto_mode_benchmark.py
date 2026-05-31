@@ -235,11 +235,20 @@ class AutoModeTester:
 
     @staticmethod
     def _should_record_transcript(text: str, state: str) -> bool:
-        if state in {"processing", "error"}:
-            return True
+        if state in {"processing", "error", "idle"}:
+            return False
         if state == "interim":
             return False
-        if text in {"Live Listening...", "Listening for context...", "Ready..."}:
+        if text in {
+            "Live Listening...",
+            "Listening for context...",
+            "Ready...",
+            "Auto Mode listening...",
+            "Click-through enabled. Press Ctrl+M to restore interaction.",
+            "Click-through disabled.",
+        }:
+            return False
+        if text.startswith("⏳ Processing"):
             return False
         if text.startswith("🌐 Listening"):
             return False

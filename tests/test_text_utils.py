@@ -285,7 +285,7 @@ class TextUtilsTests(unittest.TestCase):
             sanitize_query_label(
                 "What are some of the key principles you would follow to ensure the API is robust, versionable, and provides a good developer experience for the front-end team?"
             ),
-            "What are some of the key principles you would follow to ensure the API is robust, maintainable and provides a good developer experience for the frontend team?",
+            "What are some of the key principles you would follow to ensure the API is robust, versionable, and provides a good developer experience for the frontend team?",
         )
 
     def test_sanitize_query_label_repairs_incomplete_jwt_benchmark_query(self):
@@ -323,6 +323,13 @@ class TextUtilsTests(unittest.TestCase):
             ),
             "explain how you would implement a caching layer, and what cache eviction policies you might use to keep the content fresh?",
         )
+
+    def test_sanitize_query_label_preserves_post_question_qualifying_clause(self):
+        result = sanitize_query_label(
+            "What do you consider to be the most important aspects to look for when reviewing a colleague's pull request? besides just checking for syntax errors"
+        )
+        self.assertIn("besides", result.lower())
+        self.assertIn("pull request", result.lower())
 
 
 if __name__ == "__main__":
