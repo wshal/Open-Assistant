@@ -2141,6 +2141,14 @@ class OpenAssistApp(QObject):
         def _warm_brain():
             try:
                 self.ai.warmup()
+                try:
+                    from ai.auto_answer_controller import _get_intent_classifier
+
+                    classifier = _get_intent_classifier()
+                    if classifier is not None:
+                        classifier.classify("What is the warmup question?")
+                except Exception as e:
+                    logger.debug("Intent classifier warmup skipped: %s", e)
                 self.ai.ensure_health_monitor(self.loop)
                 asyncio.run_coroutine_threadsafe(
                     self._continuous_capture_loop(), self.loop

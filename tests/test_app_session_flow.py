@@ -567,12 +567,16 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         app.audio._effective_transcription_provider = lambda is_final=True: "groq"
         app.audio._ensure_whisper_loaded = lambda: order.append("whisper")
         app.rag.add_directory = lambda path: None
+        classifier = SimpleNamespace(classify=lambda text: order.append("intent"))
 
         with patch("core.app.threading.Thread", ImmediateThread), patch(
             "core.app.asyncio.run_coroutine_threadsafe", return_value=None
+        ), patch(
+            "ai.auto_answer_controller._get_intent_classifier", return_value=classifier
         ), patch("knowledge.ingest.ingest_all", lambda rag, path: order.append("rag")):
             OpenAssistApp._background_warmup(app)
 
+        self.assertIn("intent", order)
         self.assertIn("whisper", order)
         self.assertIn(("Cloud + Local STT Ready", 90, False), updates)
         self.assertEqual(updates[-1], ("✅ READY", 100, True))

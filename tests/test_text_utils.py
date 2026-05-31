@@ -259,6 +259,25 @@ class TextUtilsTests(unittest.TestCase):
             looks_like_actionable_auto_query("are designing a new public-facing API for our mobile app..")
         )
 
+    def test_setup_detector_handles_background_context_phrases(self):
+        from ai.auto_query_utils import looks_like_setup_statement
+
+        self.assertTrue(
+            looks_like_setup_statement(
+                "Before we get into the question, here is some context about load shedding."
+            )
+        )
+        self.assertTrue(
+            looks_like_setup_statement(
+                "Actually, Before we get into the question, here is some context about CQRS."
+            )
+        )
+        self.assertTrue(
+            looks_like_setup_statement(
+                "Here is a short setup: schema migrations is already deployed in CQRS."
+            )
+        )
+
     def test_looks_like_actionable_auto_query_rejects_css_tail_statement(self):
         self.assertFalse(
             looks_like_actionable_auto_query("would definitely choose grid over Flexbox.")

@@ -20,6 +20,7 @@ data/cache/
 data/chroma_db/
 data/test_tmp/
 data/context_presets.json
+data/learned_intents.jsonl
 logs/
 .openassist/
 
@@ -46,6 +47,7 @@ benchmarks/live_mode_smoke_react.log
 
 # Auto/standard benchmark run output (generated on demand, never commit)
 benchmarks/auto_mode_*.json
+benchmarks/intent_classifier_*.json
 benchmarks/standard_mode_*.json
 benchmarks/standard_*_check.json
 benchmarks/smoke_*.json
