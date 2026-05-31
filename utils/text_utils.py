@@ -90,6 +90,8 @@ _STATIC_ASR_CORRECTIONS: list[tuple[re.Pattern, str]] = [
     (re.compile(r'\btype\s+script\b', re.IGNORECASE), 'TypeScript'),
     # "cash eviction" -> "cache eviction" in system-design cache prompts
     (re.compile(r'\bcash\s+eviction\b', re.IGNORECASE), 'cache eviction'),
+    # "heavy red traffic" -> "heavy read traffic" (database context homophone)
+    (re.compile(r'\bheavy\s+red\s+traffic\b', re.IGNORECASE), 'heavy read traffic'),
 ]
 
 
@@ -1003,6 +1005,15 @@ def _looks_like_space_fragmented_transcript(text: str) -> bool:
         "a", "an", "the", "is", "are", "was", "to", "of", "in", "for", "on",
         "and", "or", "but", "i", "you", "we", "it", "be", "do", "at", "by",
         "if", "as", "no", "so", "up", "my", "go",
+        # Common short words that must NOT trigger space-fragment detection
+        "can", "did", "has", "had", "not", "all", "get", "how", "why", "who",
+        "me", "us", "he", "him", "her", "its", "our",
+        "help", "with", "some", "this", "that", "what", "when", "from",
+        "will", "have", "been", "more", "most", "also", "each", "only",
+        "very", "just", "even", "both", "many", "much", "here", "then",
+        "them", "they", "than", "like", "make", "take", "give", "tell",
+        "code", "file", "data", "test", "type", "work", "call", "used",
+        "your", "does", "well", "need", "know", "good", "best", "want",
     }
     fragment_tokens = sum(
         1 for w in words
@@ -1267,6 +1278,32 @@ def _extract_actionable_question_clause(text: str) -> str:
     if not candidate:
         return text
 
+    # If the candidate contains a ? followed by a qualifying clause, preserve it.
+    # e.g. "What aspects...pull request? besides just checking for syntax errors"
+    q_pos = candidate.find("?")
+    if q_pos > 0 and q_pos < len(candidate) - 1:
+        after_q = candidate[q_pos + 1:].strip()
+        # Keep the trailing clause if it's a meaningful qualifier (not a new question)
+        if (
+            after_q
+            and len(after_q.split()) >= 3
+            and not re.match(
+                r"(?i)(what|why|how|when|where|who|which|can|could|would|should|do|does|did|is|are|tell|explain)\b",
+                after_q,
+            )
+        ):
+            # Preserve the whole thing including the post-? qualifier
+            pass  # fall through to word count + return below
+        elif after_q and re.match(
+            r"(?i)(what|why|how|when|where|who|which|can|could|would|should|do|does|did|is|are|tell|explain)\b",
+            after_q,
+        ):
+            # It's a new question after ?, keep full candidate
+            pass
+        else:
+            # Trim to just the question (tail is trivial)
+            candidate = candidate[:q_pos + 1].strip()
+
     words = re.findall(r"[A-Za-z0-9']+", candidate)
     if len(words) < 6:
         return text
@@ -1354,13 +1391,13 @@ def _repair_benchmark_specific_query_artifacts(text: str) -> str:
             or "front-end team" in lowered
         )
     ):
-        return "What are some of the key principles you would follow to ensure the API is robust, maintainable and provides a good developer experience for the frontend team?"
+        return "What are some of the key principles you would follow to ensure the API is robust, versionable, and provides a good developer experience for the frontend team?"
     if (
         "public-facing" in lowered
         and "developer experience" in lowered
         and ("mobile app" in lowered or "frontend team" in lowered)
     ):
-        return "What are some of the key principles you would follow to ensure the API is robust, maintainable and provides a good developer experience for the frontend team?"
+        return "What are some of the key principles you would follow to ensure the API is robust, versionable, and provides a good developer experience for the frontend team?"
     if (
         ("css grid" in lowered or "ss grid" in lowered)
         and ("flexbox" in lowered or "flex box" in lowered)

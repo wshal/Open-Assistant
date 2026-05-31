@@ -16,6 +16,11 @@ def looks_like_setup_statement(text: str) -> bool:
     cleaned = " ".join((text or "").lower().split()).strip(" .,!?:;-")
     if not cleaned:
         return False
+    cleaned = re.sub(
+        r"^(actually|basically|honestly|so|okay|ok|right),?\s+",
+        "",
+        cleaned,
+    ).strip(" .,!?:;-")
     # Any explicit question mark → definitely a query, not setup
     if "?" in text:
         return False
@@ -79,6 +84,16 @@ def looks_like_setup_statement(text: str) -> bool:
         "in this scenario",
         "for this exercise",
         "for context",
+        "before we get into",
+        "before we dive in",
+        "before we start",
+        "here is some context",
+        "here's some context",
+        "here is a short setup",
+        "here's a short setup",
+        "here is the setup",
+        "here's the setup",
+        "let me give you some background",
         "as some background",
         "some context",
         "a bit of context",

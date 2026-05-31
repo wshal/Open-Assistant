@@ -59,7 +59,7 @@ QLineEdit, QComboBox {
 """
 
 STYLE_BTN_PRIMARY = """
-QPushButton {{
+QPushButton {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #4f46e5, stop:1 #7c3aed);
     color: white;
     border-radius: 12px;
@@ -67,15 +67,15 @@ QPushButton {{
     font-size: 12px;
     padding: 15px 30px;
     border: none;
-}}
-QPushButton:hover {{
+}
+QPushButton:hover {
     background: #6366f1;
     border: 1px solid rgba(255,255,255,20);
-}}
+}
 """
 
 STYLE_BTN_SECONDARY = """
-QPushButton {{
+QPushButton {
     background: rgba(255,255,255,12);
     color: #94a3b8;
     border-radius: 12px;
@@ -83,12 +83,13 @@ QPushButton {{
     font-size: 11px;
     padding: 12px 24px;
     border: 1px solid rgba(255,255,255,25);
-}}
-QPushButton:hover {{
+}
+QPushButton:hover {
     background: rgba(255,255,255,20);
     color: white;
-}}
+}
 """
+
 
 
 class ProviderTestWorker(QThread):

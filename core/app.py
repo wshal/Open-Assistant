@@ -2141,6 +2141,14 @@ class OpenAssistApp(QObject):
         def _warm_brain():
             try:
                 self.ai.warmup()
+                try:
+                    from ai.auto_answer_controller import _get_intent_classifier
+
+                    classifier = _get_intent_classifier()
+                    if classifier is not None:
+                        classifier.classify("What is the warmup question?")
+                except Exception as e:
+                    logger.debug("Intent classifier warmup skipped: %s", e)
                 self.ai.ensure_health_monitor(self.loop)
                 asyncio.run_coroutine_threadsafe(
                     self._continuous_capture_loop(), self.loop
@@ -2150,17 +2158,23 @@ class OpenAssistApp(QObject):
                 logger.error(f"Brain Warmup Fault: {e}")
 
         def _warm_audio():
-            """Warm the selected STT path before the Start Session button unlocks."""
+            """Warm STT before the Start Session button unlocks.
+
+            Groq is the primary STT path in Auto Mode, but local Whisper is the
+            safety net for provider stalls, auth errors, and offline use.  The
+            standby READY state means the first real prompt can be handled, so
+            this deliberately blocks on local Whisper preload even when cloud
+            STT is selected.  It does not start hardware capture.
+            """
             try:
                 provider = "local"
                 if hasattr(self.audio, "_effective_transcription_provider"):
                     provider = self.audio._effective_transcription_provider(is_final=True)
+                if hasattr(self.audio, "_ensure_whisper_loaded"):
+                    self.audio._ensure_whisper_loaded()
                 if provider == "groq":
-                    if hasattr(self.audio, "_ensure_whisper_loaded_async"):
-                        self.audio._ensure_whisper_loaded_async(force=True)
-                    self.warmup_status_update.emit("Cloud STT Ready", 90, False)
+                    self.warmup_status_update.emit("Cloud + Local STT Ready", 90, False)
                     return
-                self.audio._ensure_whisper_loaded()
                 self.warmup_status_update.emit("Audio Ready", 90, False)
             except Exception as e:
                 logger.error(f"Audio Warmup Fault: {e}")

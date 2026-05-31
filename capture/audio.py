@@ -25,6 +25,47 @@ from utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
+class _SoundcardLoopbackHandle:
+    def __init__(self, name: str):
+        self.name = name
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    def close(self):
+        self.running = False
+
+
+class _PyAudioLoopbackHandle:
+    def __init__(self, pa_instance, pa_stream):
+        self._pa = pa_instance
+        self._stream = pa_stream
+        self.running = True
+        self.active = True
+
+    def stop(self):
+        self.running = False
+        self.active = False
+        try:
+            if self._stream.is_active():
+                self._stream.stop_stream()
+        except Exception:
+            pass
+
+    def close(self):
+        self.running = False
+        self.active = False
+        try:
+            self._stream.close()
+        except Exception:
+            pass
+        try:
+            self._pa.terminate()
+        except Exception:
+            pass
+
+
 class AudioCapture(QObject):
     transcription_ready = pyqtSignal(str)
     interim_transcription_ready = pyqtSignal(str)
@@ -356,6 +397,7 @@ class AudioCapture(QObject):
         self._active_streams = []
         self._lock = threading.RLock()
         self._capture_buffer_lock = threading.Lock()
+        self._last_system_audio_error = ""
         self._pending_transcription_jobs = 0
         self._standard_transcription_suspended = False
         self._hardware_capture_suspended = False
@@ -808,25 +850,28 @@ class AudioCapture(QObject):
         else:
             data = data.astype(np.float32, copy=False)
 
-        if not bool(getattr(self._state, "is_capturing", False)):
-            self._capture_chunk_buffer = np.empty((0, 1), dtype=np.float32)
-            return
+        with self._capture_buffer_lock:
+            if not bool(getattr(self._state, "is_capturing", False)):
+                self._capture_chunk_buffer = np.empty((0, 1), dtype=np.float32)
+                return
 
-        if self._capture_chunk_buffer.size:
-            data = np.concatenate((self._capture_chunk_buffer, data), axis=0)
+            if self._capture_chunk_buffer.size:
+                data = np.concatenate((self._capture_chunk_buffer, data), axis=0)
 
-        while data.shape[0] >= self.block_size:
-            chunk = data[: self.block_size].copy()
-            data = data[self.block_size :]
-            try:
-                self.q.put_nowait(chunk)
-                self._current_rms = float(np.sqrt(np.mean(chunk ** 2)))
-                self._trace_raw_audio_block(source, self._current_rms, len(chunk))
-            except queue.Full:
-                logger.debug("Audio queue full; dropping frame")
-                break
+            while data.shape[0] >= self.block_size:
+                chunk = data[: self.block_size].copy()
+                data = data[self.block_size :]
+                try:
+                    self.q.put_nowait(chunk)
+                    self._current_rms = float(np.sqrt(np.mean(chunk ** 2)))
+                    self._trace_raw_audio_block(source, self._current_rms, len(chunk))
+                except queue.Full:
+                    logger.debug("Audio queue full; dropping frame")
+                    break
 
-        self._capture_chunk_buffer = data.copy() if data.size else np.empty((0, 1), dtype=np.float32)
+            self._capture_chunk_buffer = (
+                data.copy() if data.size else np.empty((0, 1), dtype=np.float32)
+            )
 
     def _find_system_audio_source(self):
         sources = self._system_audio_sources()
@@ -846,15 +891,6 @@ class AudioCapture(QObject):
 
         try:
             devices = sd.query_devices()
-            apis = sd.query_hostapis()
-            wasapi_idx = next(
-                (i for i, a in enumerate(apis) if "WASAPI" in a["name"]), None
-            )
-            if wasapi_idx is not None:
-                for i, d in enumerate(devices):
-                    if d["hostapi"] == wasapi_idx and d["max_output_channels"] > 0:
-                        add(i, d["name"], True)
-
             for i, d in enumerate(devices):
                 if d["max_input_channels"] > 0 and any(
                     x in d["name"].lower()
@@ -872,6 +908,189 @@ class AudioCapture(QObject):
         except Exception as e:
             logger.debug(f"Source discovery error: {e}")
         return candidates
+
+    def _soundcard_loopback_source(self):
+        try:
+            import soundcard as sc
+        except Exception as exc:
+            logger.debug("soundcard loopback unavailable: %s", exc)
+            return None
+
+        try:
+            default_speaker = sc.default_speaker()
+            speaker_id = getattr(default_speaker, "id", None)
+            loopbacks = [
+                mic
+                for mic in sc.all_microphones(include_loopback=True)
+                if bool(getattr(mic, "isloopback", False))
+            ]
+            if speaker_id:
+                for mic in loopbacks:
+                    if getattr(mic, "id", None) == speaker_id:
+                        return mic
+            return loopbacks[0] if loopbacks else None
+        except Exception as exc:
+            logger.debug("soundcard loopback discovery failed: %s", exc)
+            return None
+
+    def _start_pyaudiowpatch_loopback(self) -> bool:
+        try:
+            import pyaudiowpatch as pyaudio
+        except Exception as exc:
+            logger.debug("PyAudioWPatch loopback unavailable: %s", exc)
+            self._last_system_audio_error = f"PyAudioWPatch unavailable: {exc}"
+            return False
+
+        pa = None
+        try:
+            pa = pyaudio.PyAudio()
+            wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+            default_output_idx = int(wasapi_info["defaultOutputDevice"])
+            default_output = pa.get_device_info_by_index(default_output_idx)
+            default_name = str(default_output.get("name", ""))
+
+            loopback_device = None
+            for loopback in pa.get_loopback_device_info_generator():
+                loopback_name = str(loopback.get("name", ""))
+                if loopback_name.startswith(default_name):
+                    loopback_device = loopback
+                    break
+            if loopback_device is None:
+                loopbacks = list(pa.get_loopback_device_info_generator())
+                loopback_device = loopbacks[0] if loopbacks else None
+            if loopback_device is None:
+                raise RuntimeError(f"No WASAPI loopback device found for: {default_name}")
+
+            native_rate = int(loopback_device.get("defaultSampleRate") or self.sr)
+            channels = max(1, min(2, int(loopback_device.get("maxInputChannels") or 1)))
+            frames_per_buffer = max(1, int(native_rate * self.block_ms / 1000))
+            handle_ref = {"handle": None}
+
+            def callback(in_data, frame_count, time_info, status):
+                handle = handle_ref.get("handle")
+                if (
+                    handle is not None
+                    and bool(getattr(handle, "active", False))
+                    and not self._paused
+                    and not self._hardware_capture_suspended
+                    and self._running
+                    and in_data
+                ):
+                    try:
+                        audio = np.frombuffer(in_data, dtype=np.int16)
+                        if channels > 1 and len(audio) % channels == 0:
+                            audio = audio.reshape(-1, channels)
+                        else:
+                            audio = audio.reshape(-1, 1)
+                        audio = audio.astype(np.float32) / 32768.0
+                        resampled = self._resample_to_target_rate(audio, native_rate)
+                        self._enqueue_audio_frames(resampled, "wasapi-loopback")
+                    except Exception as exc:
+                        logger.debug("PyAudioWPatch loopback callback error: %s", exc)
+                return (None, pyaudio.paContinue)
+
+            stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=channels,
+                rate=native_rate,
+                input=True,
+                input_device_index=int(loopback_device["index"]),
+                frames_per_buffer=frames_per_buffer,
+                stream_callback=callback,
+            )
+            handle = _PyAudioLoopbackHandle(pa, stream)
+            handle_ref["handle"] = handle
+            self._active_streams.append(handle)
+            logger.info(
+                "Binding to WASAPI loopback via PyAudioWPatch: %s (%d Hz, %d ch)",
+                loopback_device.get("name", default_name or "default output"),
+                native_rate,
+                channels,
+            )
+            if not stream.is_active():
+                stream.start_stream()
+            return True
+        except Exception as exc:
+            if pa is not None:
+                try:
+                    pa.terminate()
+                except Exception:
+                    pass
+            self._last_system_audio_error = f"PyAudioWPatch WASAPI failed: {exc}"
+            logger.warning("WASAPI loopback unavailable via PyAudioWPatch: %s", exc)
+            return False
+
+    def _start_soundcard_loopback(self) -> bool:
+        mic = self._soundcard_loopback_source()
+        if mic is None:
+            if not self._last_system_audio_error:
+                self._last_system_audio_error = "No soundcard WASAPI loopback device found"
+            return False
+
+        name = str(getattr(mic, "name", "default speaker loopback"))
+        handle = _SoundcardLoopbackHandle(name)
+        self._active_streams.append(handle)
+        logger.info("Binding to WASAPI loopback via soundcard: %s", name)
+        started = threading.Event()
+        failed = []
+
+        def cleanup_handle() -> None:
+            handle.stop()
+            try:
+                if handle in self._active_streams:
+                    self._active_streams.remove(handle)
+            except ValueError:
+                pass
+
+        def read_loop():
+            try:
+                with mic.recorder(
+                    samplerate=self.sr,
+                    channels=2,
+                    blocksize=self.block_size,
+                ) as recorder:
+                    started.set()
+                    while self._running and handle.running:
+                        try:
+                            data = recorder.record(numframes=self.block_size)
+                        except Exception as exc:
+                            if self._running and handle.running:
+                                logger.warning("WASAPI loopback read failed: %s", exc)
+                            break
+
+                        if (
+                            self._paused
+                            or self._hardware_capture_suspended
+                            or not self._running
+                        ):
+                            continue
+                        self._enqueue_audio_frames(data, "wasapi-loopback")
+            except Exception as exc:
+                failed.append(exc)
+                handle.running = False
+                started.set()
+                self._last_system_audio_error = f"soundcard WASAPI failed: {exc}"
+                if self._running:
+                    logger.warning("WASAPI loopback unavailable via soundcard: %s", exc)
+            finally:
+                handle.running = False
+
+        thread = threading.Thread(
+            target=read_loop,
+            daemon=True,
+            name="soundcard-wasapi-loopback",
+        )
+        thread.start()
+        if not started.wait(timeout=0.5):
+            self._last_system_audio_error = (
+                "soundcard WASAPI did not confirm recorder startup"
+            )
+            cleanup_handle()
+            return False
+        if failed or not handle.running:
+            cleanup_handle()
+            return False
+        return True
 
     def _resample_to_target_rate(self, indata, source_rate):
         if source_rate == self.sr:
@@ -967,20 +1186,7 @@ class AudioCapture(QObject):
 
                     # Resample to target rate (self.sr)
                     resampled = self._resample_to_target_rate(audio_float, source_rate)
-
-                    # Convert to mono
-                    data = np.mean(resampled, axis=1, keepdims=True).astype(np.float32)
-
-                    try:
-                        self.q.put_nowait(data)
-                        self._current_rms = float(np.sqrt(np.mean(resampled**2)))
-                        self._trace_raw_audio_block(
-                            "macos-system-audio",
-                            self._current_rms,
-                            len(data),
-                        )
-                    except queue.Full:
-                        logger.debug("Audio queue full; dropping frame")
+                    self._enqueue_audio_frames(resampled, "macos-system-audio")
             except Exception as e:
                 if self._running:
                     logger.debug(f"macOS SystemAudioDump read error: {e}")
@@ -1007,20 +1213,12 @@ class AudioCapture(QObject):
                 ):
                     try:
                         normalized = self._resample_to_target_rate(indata, source_rate)
-                        data = (
-                            np.mean(normalized, axis=1, keepdims=True).astype(np.float32)
-                            if normalized.shape[1] > 1
-                            else normalized.copy().astype(np.float32)
-                        )
-                        self.q.put_nowait(data)
-                        self._current_rms = float(np.sqrt(np.mean(normalized**2)))
-                        self._trace_raw_audio_block(
+                        self._enqueue_audio_frames(
+                            normalized,
                             f"{self.capture_mode}-audio",
-                            self._current_rms,
-                            len(data),
                         )
-                    except queue.Full:
-                        logger.debug("Audio queue full; dropping frame")
+                    except Exception as exc:
+                        logger.debug("Audio callback enqueue error: %s", exc)
 
             return cb
 
@@ -1057,9 +1255,14 @@ class AudioCapture(QObject):
                         if sys.platform == "darwin":
                             self._start_macos_system_audio()
                         else:
-                            opened = False
-                            last_error = None
+                            self._last_system_audio_error = ""
+                            opened = self._start_pyaudiowpatch_loopback()
+                            if not opened:
+                                opened = self._start_soundcard_loopback()
+                            last_error = self._last_system_audio_error or None
                             for idx, name, is_loopback in self._system_audio_sources():
+                                if opened:
+                                    break
                                 try:
                                     d = sd.query_devices(idx)
                                     logger.info(
@@ -1067,28 +1270,15 @@ class AudioCapture(QObject):
                                     )
                                     native_rate = int(d.get("default_samplerate", self.sr))
                                     input_channels = int(d.get("max_input_channels", 0))
-                                    output_channels = int(d.get("max_output_channels", 0))
                                     kwargs = {
                                         "device": idx,
                                         "samplerate": native_rate,
                                         "channels": max(
-                                            1, min(2, input_channels or output_channels or 1)
+                                            1, min(2, input_channels or 1)
                                         ),
                                         "callback": make_cb(native_rate),
                                     }
-                                    if is_loopback:
-                                        try:
-                                            kwargs["loopback"] = True
-                                            kwargs["channels"] = max(
-                                                1, min(2, output_channels or 2)
-                                            )
-                                            s_sys = sd.InputStream(**kwargs)
-                                        except TypeError:
-                                            raise RuntimeError(
-                                                "Installed sounddevice build has no WASAPI loopback support"
-                                            )
-                                    else:
-                                        s_sys = sd.InputStream(**kwargs)
+                                    s_sys = sd.InputStream(**kwargs)
                                     self._active_streams.append(s_sys)
                                     s_sys.start()
                                     opened = True
@@ -1129,40 +1319,8 @@ class AudioCapture(QObject):
                                         last_error = fallback_error
                                 if not opened:
                                     raise RuntimeError(
-                                        f"No usable system audio source found: {last_error or 'no candidate devices'}"
+                                        f"No usable system audio source found: {last_error or self._last_system_audio_error or 'no candidate devices'}"
                                     )
-                            if False:
-                                d = sd.query_devices(idx)
-                                logger.info(
-                                    f"🎤 Binding to System Audio: {name} (Loopback: {is_loopback})"
-                                )
-                                native_rate = int(d.get("default_samplerate", self.sr))
-                                input_channels = int(d.get("max_input_channels", 0))
-                                output_channels = int(d.get("max_output_channels", 0))
-                                kwargs = {
-                                    "device": idx,
-                                    "samplerate": native_rate,
-                                    "channels": max(
-                                        1, min(2, input_channels or output_channels or 1)
-                                    ),
-                                    "callback": make_cb(native_rate),
-                                }
-                                if is_loopback:
-                                    try:
-                                        kwargs["loopback"] = True
-                                        kwargs["channels"] = max(
-                                            1, min(2, output_channels or 2)
-                                        )
-                                        s_sys = sd.InputStream(**kwargs)
-                                    except TypeError:
-                                        raise RuntimeError(
-                                            "Installed sounddevice build has no WASAPI loopback support"
-                                        )
-                                else:
-                                    s_sys = sd.InputStream(**kwargs)
-                                self._active_streams.append(s_sys)
-                                s_sys.start()
-
                     logger.info("🎙️ Audio Hardware Successfully Synchronized.")
                     break
                 except Exception as e:

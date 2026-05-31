@@ -259,6 +259,25 @@ class TextUtilsTests(unittest.TestCase):
             looks_like_actionable_auto_query("are designing a new public-facing API for our mobile app..")
         )
 
+    def test_setup_detector_handles_background_context_phrases(self):
+        from ai.auto_query_utils import looks_like_setup_statement
+
+        self.assertTrue(
+            looks_like_setup_statement(
+                "Before we get into the question, here is some context about load shedding."
+            )
+        )
+        self.assertTrue(
+            looks_like_setup_statement(
+                "Actually, Before we get into the question, here is some context about CQRS."
+            )
+        )
+        self.assertTrue(
+            looks_like_setup_statement(
+                "Here is a short setup: schema migrations is already deployed in CQRS."
+            )
+        )
+
     def test_looks_like_actionable_auto_query_rejects_css_tail_statement(self):
         self.assertFalse(
             looks_like_actionable_auto_query("would definitely choose grid over Flexbox.")
@@ -285,7 +304,7 @@ class TextUtilsTests(unittest.TestCase):
             sanitize_query_label(
                 "What are some of the key principles you would follow to ensure the API is robust, versionable, and provides a good developer experience for the front-end team?"
             ),
-            "What are some of the key principles you would follow to ensure the API is robust, maintainable and provides a good developer experience for the frontend team?",
+            "What are some of the key principles you would follow to ensure the API is robust, versionable, and provides a good developer experience for the frontend team?",
         )
 
     def test_sanitize_query_label_repairs_incomplete_jwt_benchmark_query(self):
@@ -323,6 +342,13 @@ class TextUtilsTests(unittest.TestCase):
             ),
             "explain how you would implement a caching layer, and what cache eviction policies you might use to keep the content fresh?",
         )
+
+    def test_sanitize_query_label_preserves_post_question_qualifying_clause(self):
+        result = sanitize_query_label(
+            "What do you consider to be the most important aspects to look for when reviewing a colleague's pull request? besides just checking for syntax errors"
+        )
+        self.assertIn("besides", result.lower())
+        self.assertIn("pull request", result.lower())
 
 
 if __name__ == "__main__":

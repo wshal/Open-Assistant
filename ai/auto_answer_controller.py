@@ -15,6 +15,64 @@ from utils.text_utils import (
     sanitize_query_label,
 )
 
+# Lazy-loaded intent classifier (embedding-based)
+_intent_classifier = None
+_intent_classifier_loaded = False
+
+
+def _get_intent_classifier():
+    """Lazy singleton accessor for the embedding-based IntentClassifier."""
+    global _intent_classifier, _intent_classifier_loaded
+    if _intent_classifier_loaded:
+        return _intent_classifier
+    try:
+        from ai.intent_classifier import IntentClassifier
+        _intent_classifier = IntentClassifier()
+        _intent_classifier_loaded = True
+    except Exception:
+        _intent_classifier = None
+        _intent_classifier_loaded = True
+    return _intent_classifier
+
+
+def _auto_learn(text: str, intent: str, *, scores=None, app=None) -> None:
+    """Teach the intent classifier from a live session outcome.
+
+    Only learns when:
+      1. Learning is enabled in config (ai.intent_classifier.learning_enabled)
+      2. The embedding classifier is available
+      3. Regex and embeddings agree on the classification
+    """
+    # Check config; learning is opt-in, off by default.
+    if app is not None:
+        config = getattr(app, "config", None)
+        if config and not bool(config.get("ai.intent_classifier.learning_enabled", False)):
+            return
+
+    classifier = _get_intent_classifier()
+    if classifier is None:
+        return
+    try:
+        confidence = 0.0
+        if scores is not None:
+            best = scores.best_intent
+            if best == intent and scores.is_confident:
+                confidence = scores.best_score
+            else:
+                return
+        else:
+            scores = classifier.classify(text)
+            if scores is None:
+                return
+            if scores.best_intent == intent and scores.is_confident:
+                confidence = scores.best_score
+            else:
+                return
+
+        classifier.learn(text, intent, confidence=confidence, source="auto")
+    except Exception as e:
+        logger.debug("Auto-learn failed: %s", e)
+
 if TYPE_CHECKING:
     from core.app import OpenAssistApp
 
@@ -192,12 +250,19 @@ def _is_actionable_auto_query(app: "OpenAssistApp", text: str) -> bool:
     if not text:
         return False
     clause = text.rstrip("?").strip()
-    return bool(
+    regex_says = bool(
         app._looks_question_like_transcript(text)
         or looks_like_actionable_auto_query(text)
         or _looks_like_auto_query_clause(clause)
         or "?" in text
     )
+
+    # Use embedding classifier to augment regex decision
+    classifier = _get_intent_classifier()
+    if classifier is not None:
+        return classifier.is_likely_question(text, regex_says_question=regex_says)
+
+    return regex_says
 
 
 def _recent_auto_dispatch_matches(app: "OpenAssistApp", candidate: str, window_s: float = 8.0) -> bool:
@@ -620,12 +685,24 @@ def handle_auto_final_transcription(
 
     candidate = _candidate_from_context(app, cleaned)
     actionable = _is_actionable_auto_query(app, candidate)
-    setup_only = bool(looks_like_setup_statement(cleaned) and not actionable)
+    setup_only_regex = bool(looks_like_setup_statement(cleaned))
+
+    # Use embedding classifier to refine setup vs question decision
+    classifier = _get_intent_classifier()
+    if classifier is not None:
+        setup_only = classifier.is_likely_setup(
+            cleaned, regex_says_setup=(setup_only_regex and not actionable)
+        )
+    else:
+        setup_only = setup_only_regex and not actionable
 
     if setup_only or not actionable:
         app.overlay.update_transcript(raw)
         app._pending_incomplete_audio_query = candidate or cleaned
         app._pending_incomplete_audio_at = time.time()
+        # Learn: this transcript was identified as setup context
+        if setup_only_regex and setup_only:
+            _auto_learn(cleaned, "setup", app=app)
         logger.info(
             "[%s] Auto Mode kept transcript for context only | actionable=%s text=%r",
             session_id,
@@ -651,6 +728,9 @@ def handle_auto_final_transcription(
     if _should_defer_for_followup(raw, candidate):
         _schedule_final_dispatch(app, candidate, raw, session_id, request_metadata)
         return True
+
+    # Learn: this transcript is being dispatched as a question
+    _auto_learn(candidate, "question", app=app)
 
     _dispatch_auto_query(
         app,
