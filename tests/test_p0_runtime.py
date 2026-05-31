@@ -170,15 +170,15 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         self.assertEqual(close_calls, ["close"])
         self.assertEqual(start_calls, ["start"])
 
-    def test_find_system_audio_source_prefers_wasapi_loopback_over_stereo_mix(self):
+    def test_find_system_audio_source_prefers_virtual_cable_over_stereo_mix(self):
         audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
 
         fake_devices = [
             {
-                "name": "Speakers (Realtek(R) Audio)",
+                "name": "CABLE Output (VB-Audio Virtual Cable)",
                 "hostapi": 0,
-                "max_input_channels": 0,
-                "max_output_channels": 2,
+                "max_input_channels": 2,
+                "max_output_channels": 0,
             },
             {
                 "name": "Stereo Mix (Realtek(R) Audio)",
@@ -187,15 +187,82 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
                 "max_output_channels": 0,
             },
         ]
-        fake_hostapis = [{"name": "Windows WASAPI"}]
-
-        with patch("sounddevice.query_devices", return_value=fake_devices), patch(
-            "sounddevice.query_hostapis", return_value=fake_hostapis
-        ):
+        with patch("sounddevice.query_devices", return_value=fake_devices):
             self.assertEqual(
                 audio._find_system_audio_source(),
-                (0, "Speakers (Realtek(R) Audio)", True),
+                (0, "CABLE Output (VB-Audio Virtual Cable)", False),
             )
+
+    def test_soundcard_loopback_source_prefers_default_speaker_loopback(self):
+        audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
+
+        speaker = SimpleNamespace(id="speaker-1")
+        loopback = SimpleNamespace(id="speaker-1", name="Speakers", isloopback=True)
+        other = SimpleNamespace(id="other", name="Other", isloopback=True)
+        fake_sc = SimpleNamespace(
+            default_speaker=Mock(return_value=speaker),
+            all_microphones=Mock(return_value=[other, loopback]),
+        )
+
+        with patch.dict(sys.modules, {"soundcard": fake_sc}):
+            self.assertIs(audio._soundcard_loopback_source(), loopback)
+
+    def test_system_audio_prefers_pyaudiowpatch_before_soundcard(self):
+        audio = AudioCapture(
+            ConfigStub({"capture.audio.mode": "system", "capture.audio.enabled": True})
+        )
+        audio._running = True
+        audio._process_thread = SimpleNamespace(is_alive=lambda: True)
+
+        def open_pyaudio():
+            audio._running = False
+            return True
+
+        with patch.object(
+            audio, "_start_pyaudiowpatch_loopback", side_effect=open_pyaudio
+        ) as pyaudio_loopback, patch.object(
+            audio, "_start_soundcard_loopback", return_value=True
+        ) as soundcard_loopback:
+            audio._capture_loop()
+
+        pyaudio_loopback.assert_called_once()
+        soundcard_loopback.assert_not_called()
+
+    def test_soundcard_start_failure_does_not_close_existing_streams(self):
+        audio = AudioCapture(ConfigStub({"capture.audio.mode": "both"}))
+
+        class ExistingStream:
+            def __init__(self):
+                self.closed = False
+
+            def stop(self):
+                self.closed = True
+
+            def close(self):
+                self.closed = True
+
+        existing = ExistingStream()
+        audio._active_streams.append(existing)
+        audio._last_system_audio_error = ""
+
+        class FakeRecorder:
+            def __enter__(self):
+                raise RuntimeError("recorder failed")
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        fake_loopback = SimpleNamespace(
+            name="Speakers",
+            recorder=Mock(return_value=FakeRecorder()),
+        )
+
+        with patch.object(audio, "_soundcard_loopback_source", return_value=fake_loopback):
+            self.assertFalse(audio._start_soundcard_loopback())
+
+        self.assertFalse(existing.closed)
+        self.assertEqual(audio._active_streams, [existing])
+        self.assertIn("soundcard WASAPI failed", audio._last_system_audio_error)
 
     def test_system_audio_sources_do_not_use_microphone_as_desktop_source(self):
         audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
@@ -207,11 +274,7 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
                 "max_output_channels": 0,
             }
         ]
-        fake_hostapis = [{"name": "Windows WASAPI"}]
-
-        with patch("sounddevice.query_devices", return_value=fake_devices), patch(
-            "sounddevice.query_hostapis", return_value=fake_hostapis
-        ):
+        with patch("sounddevice.query_devices", return_value=fake_devices):
             self.assertEqual(audio._system_audio_sources(), [])
 
     def test_system_audio_sources_use_stereo_mix_as_last_default_system_source(self):
@@ -224,11 +287,7 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
                 "max_output_channels": 0,
             }
         ]
-        fake_hostapis = [{"name": "Windows WASAPI"}]
-
-        with patch("sounddevice.query_devices", return_value=fake_devices), patch(
-            "sounddevice.query_hostapis", return_value=fake_hostapis
-        ):
+        with patch("sounddevice.query_devices", return_value=fake_devices):
             self.assertEqual(
                 audio._system_audio_sources(),
                 [(0, "Stereo Mix (Realtek(R) Audio)", False)],
@@ -251,11 +310,7 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
                 "max_output_channels": 0,
             }
         ]
-        fake_hostapis = [{"name": "Windows WASAPI"}]
-
-        with patch("sounddevice.query_devices", return_value=fake_devices), patch(
-            "sounddevice.query_hostapis", return_value=fake_hostapis
-        ):
+        with patch("sounddevice.query_devices", return_value=fake_devices):
             self.assertEqual(audio._system_audio_sources(), [])
 
     def test_system_audio_falls_back_to_default_input_when_only_source_is_invalid(self):
@@ -280,7 +335,6 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
                 "default_samplerate": 48000,
             }
         ]
-        fake_hostapis = [{"name": "Windows WASAPI"}]
         default_input = {"name": "Microphone Array", "default_samplerate": 16000}
         opened = []
 
@@ -311,8 +365,12 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
             return FakeStream(**kwargs)
 
         with patch("sounddevice.query_devices", side_effect=fake_query_devices), patch(
-            "sounddevice.query_hostapis", return_value=fake_hostapis
-        ), patch("sounddevice.InputStream", side_effect=fake_input_stream):
+            "sounddevice.InputStream", side_effect=fake_input_stream
+        ), patch.object(
+            audio, "_start_pyaudiowpatch_loopback", return_value=False
+        ), patch.object(
+            audio, "_start_soundcard_loopback", return_value=False
+        ):
             audio._capture_loop()
 
         self.assertEqual(len(opened), 1)
@@ -341,7 +399,6 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
                 "default_samplerate": 48000,
             }
         ]
-        fake_hostapis = [{"name": "Windows WASAPI"}]
         opened = []
 
         def fake_query_devices(device=None, kind=None):
@@ -356,8 +413,12 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
             raise RuntimeError("Invalid device [PaErrorCode -9996]")
 
         with patch("sounddevice.query_devices", side_effect=fake_query_devices), patch(
-            "sounddevice.query_hostapis", return_value=fake_hostapis
-        ), patch("sounddevice.InputStream", side_effect=fake_input_stream):
+            "sounddevice.InputStream", side_effect=fake_input_stream
+        ), patch.object(
+            audio, "_start_pyaudiowpatch_loopback", return_value=False
+        ), patch.object(
+            audio, "_start_soundcard_loopback", return_value=False
+        ):
             audio._capture_loop()
 
         self.assertGreaterEqual(len(opened), 1)

@@ -17,6 +17,7 @@ mss>=9.0.0
 winrt-Windows.Media.Ocr>=3.2.0
 winrt-Windows.Graphics.Imaging>=3.2.0
 winrt-Windows.Globalization>=3.2.0
+winrt-Windows.Storage.Streams>=3.2.0
 
 # EasyOCR - cross-platform OCR (fallback for Python 3.14/Linux)
 easyocr>=1.7.0
@@ -25,6 +26,7 @@ rapidocr_onnxruntime>=1.4.4
 
 # -- Audio & Speech-to-Text --------------------------------------------
 sounddevice>=0.4.0
+PyAudioWPatch>=0.2.12; sys_platform == 'win32'
 soundcard>=0.4.3
 numpy>=1.24.0
 faster-whisper>=1.0.0

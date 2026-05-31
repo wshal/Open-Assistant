@@ -537,6 +537,48 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertEqual(app.audio.start_calls, 0)
 
+    def test_background_warmup_waits_for_whisper_before_ready(self):
+        app = self._build_app()
+        updates = []
+        order = []
+
+        class SignalStub:
+            def emit(self, message, progress, ready):
+                updates.append((message, progress, ready))
+                if ready:
+                    order.append("ready")
+
+        class ImmediateThread:
+            def __init__(self, target=None, daemon=None, name=None):
+                self.target = target
+
+            def start(self):
+                if self.target:
+                    self.target()
+
+            def join(self):
+                return None
+
+        app.warmup_status_update = SignalStub()
+        app.screen = SimpleNamespace(initialize=lambda: order.append("vision"))
+        app.ai.warmup = lambda: order.append("brain")
+        app.ai.ensure_health_monitor = lambda loop: None
+        app._continuous_capture_loop = lambda: object()
+        app.audio._effective_transcription_provider = lambda is_final=True: "groq"
+        app.audio._ensure_whisper_loaded = lambda: order.append("whisper")
+        app.rag.add_directory = lambda path: None
+
+        with patch("core.app.threading.Thread", ImmediateThread), patch(
+            "core.app.asyncio.run_coroutine_threadsafe", return_value=None
+        ), patch("knowledge.ingest.ingest_all", lambda rag, path: order.append("rag")):
+            OpenAssistApp._background_warmup(app)
+
+        self.assertIn("whisper", order)
+        self.assertIn(("Cloud + Local STT Ready", 90, False), updates)
+        self.assertEqual(updates[-1], ("✅ READY", 100, True))
+        self.assertLess(order.index("whisper"), order.index("ready"))
+        self.assertEqual(app.audio.start_calls, 0)
+
     def test_history_sync_uses_dict_entries_for_mini_overlay(self):
         """_sync_history_ui should push state to both HUDs when session is active."""
         app = self._build_app(mini_mode=True)
