@@ -7,7 +7,7 @@ P2.7: Added provenance strip on each entry card.
 
 import datetime
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -25,6 +25,27 @@ from ui.markdown_renderer import MarkdownRenderer
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+
+class _SessionCard(QFrame):
+    """Click-aware QFrame for a single session row.
+
+    H-4: Subclassed instead of overriding ``mousePressEvent`` per-instance with
+    a lambda capturing ``self``. The lambda assignment (a) silently dropped the
+    QWidget super-call and (b) created a strong reference cycle between the
+    view and each card that prevented prompt garbage collection.
+    """
+
+    clicked = pyqtSignal(object)
+
+    def __init__(self, session_id, parent=None):
+        super().__init__(parent)
+        self._session_id = session_id
+
+    def mousePressEvent(self, event):  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._session_id)
+        super().mousePressEvent(event)
 
 
 class HistoryFeedView(QWidget):
@@ -139,7 +160,7 @@ class HistoryFeedView(QWidget):
             return
 
         for session in sessions:
-            card = QFrame()
+            card = _SessionCard(session["id"])
             card.setStyleSheet("""
                 QFrame { background: rgba(30,30,50,180); border-radius: 8px;
                     border: 1px solid rgba(80,80,150,30); }
@@ -163,7 +184,7 @@ class HistoryFeedView(QWidget):
             snip.setWordWrap(True)
             cl.addWidget(snip)
 
-            card.mousePressEvent = (lambda e, sid=session["id"]: self.show_session_detail(sid))
+            card.clicked.connect(self.show_session_detail)
             card.setCursor(Qt.CursorShape.PointingHandCursor)
             self.content_layout.insertWidget(self.content_layout.count() - 1, card)
 

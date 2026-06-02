@@ -73,11 +73,12 @@ def toggle_auto_mode(app) -> bool:
         if new_state:
             start_auto_mode(app)
         else:
+            reset_auto_mode_turn_state(app)
             if hasattr(app.audio, "set_standard_transcription_suspended"):
                 app.audio.set_standard_transcription_suspended(False, "auto-mode-off")
             app.overlay.update_transcript(
-                "Auto Mode disabled - using standard audio pipeline.",
-                state="idle",
+                "Listening for context...",
+                state="listening",
             )
     update = getattr(getattr(app, "overlay", None), "update_auto_mode_state", None)
     if callable(update):

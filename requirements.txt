@@ -14,9 +14,12 @@ mss>=9.0.0
 
 # -- OCR ----------------------------------------------------------------
 # Windows Native OCR (Primary Engine)
+winrt-Windows.Foundation>=3.2.0
+winrt-Windows.Foundation.Collections>=3.2.0
 winrt-Windows.Media.Ocr>=3.2.0
 winrt-Windows.Graphics.Imaging>=3.2.0
 winrt-Windows.Globalization>=3.2.0
+winrt-Windows.Storage>=3.2.0
 winrt-Windows.Storage.Streams>=3.2.0
 
 # EasyOCR - cross-platform OCR (fallback for Python 3.14/Linux)

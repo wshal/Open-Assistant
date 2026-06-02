@@ -123,6 +123,25 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
 
         self.assertFalse(audio._running)
 
+    def test_start_recreates_transcription_pools_after_stop(self):
+        audio = AudioCapture(
+            ConfigStub({"capture.audio.mode": "system", "capture.audio.enabled": True})
+        )
+
+        audio.stop()
+        self.assertIsNone(audio._transcribe_pool)
+        self.assertIsNone(audio._cloud_stt_pool)
+        self.assertIsNone(audio._interim_pool)
+
+        with patch("capture.audio.threading.Thread.start", return_value=None):
+            audio.start()
+
+        self.assertIsNotNone(audio._transcribe_pool)
+        self.assertIsNotNone(audio._cloud_stt_pool)
+        self.assertIsNotNone(audio._interim_pool)
+        self.assertTrue(audio._submit_transcription_job(lambda: None))
+        audio.stop()
+
     def test_hardware_suspended_capture_is_healthy_for_injected_benchmark_frames(self):
         audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
         audio._running = True
@@ -1398,6 +1417,9 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         )
         audio._whisper_device = "cpu"
         audio._cloud_stt_session_blocked = True
+        # Set the failed key to match the current key so the "key changed"
+        # bypass (M-A6) doesn't reset the block — we're testing the block itself.
+        audio._cloud_stt_failed_key = "gsk_test_key_1234567890"
 
         with patch("capture.audio.time.time", return_value=12.0):
             provider = audio._effective_transcription_provider(
@@ -1651,8 +1673,8 @@ class PromptBuilderSpeechTests(unittest.TestCase):
         self.assertNotIn("(Origin: Audio. Fix ASR errors.)", prompt)
         self.assertNotIn("[AUDIO]", prompt)
         self.assertNotIn("[ENVIRONMENT]", prompt)
-        self.assertIn("silently correct them before answering", prompt)
-        self.assertIn("Do not mention audio context, ASR", prompt)
+        self.assertIn("Silently correct any ASR errors", prompt)
+
 
     def test_speech_session_context_prompt_disallows_direct_screen_access_claims(self):
         prompt = PromptBuilder().user(
@@ -2060,6 +2082,9 @@ class ConfigResetTests(unittest.TestCase):
 
             self.assertFalse(config.get("onboarding.completed", True))
             self.assertEqual(config.get("ai.vision.allow_paid_fallback", None), False)
+            self.assertFalse(config.get("capture.screen.enabled", True))
+            self.assertTrue(config.get("capture.audio.enabled", False))
+            self.assertFalse(config.get("capture.audio.muted", True))
             self.assertEqual(config.secrets.get_api_key("groq"), "")
 
         if config_path.exists():
@@ -2126,6 +2151,7 @@ class HotkeyMatchingTests(unittest.TestCase):
 class ScreenCaptureContextTests(unittest.TestCase):
     def test_capture_context_uses_pipeline_result(self):
         capture = ScreenCapture.__new__(ScreenCapture)
+        capture._enabled = True
         capture._last_text = "old text"
 
         async def fake_capture():
@@ -2139,6 +2165,7 @@ class ScreenCaptureContextTests(unittest.TestCase):
 
     def test_capture_context_falls_back_to_last_text_when_debounced(self):
         capture = ScreenCapture.__new__(ScreenCapture)
+        capture._enabled = True
         capture._last_text = "cached text"
 
         async def fake_capture():
@@ -2149,6 +2176,20 @@ class ScreenCaptureContextTests(unittest.TestCase):
         result = asyncio.run(ScreenCapture.capture_context(capture))
 
         self.assertEqual(result, "cached text")
+
+    def test_capture_context_returns_empty_when_vision_disabled(self):
+        capture = ScreenCapture.__new__(ScreenCapture)
+        capture._enabled = False
+        capture._last_text = "stale screen text"
+
+        async def fake_capture():
+            raise AssertionError("disabled vision must not capture or return cached OCR")
+
+        capture.capture = fake_capture
+
+        result = asyncio.run(ScreenCapture.capture_context(capture))
+
+        self.assertEqual(result, "")
 
 
 class OllamaProviderTests(unittest.TestCase):

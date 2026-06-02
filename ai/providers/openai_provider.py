@@ -63,13 +63,15 @@ class OpenAIProvider(BaseProvider):
 
             response = await self.client.chat.completions.create(**kwargs)
 
+            if not response.choices:
+                raise Exception(f"OpenAI returned empty choices list (model={model})")
             text = response.choices[0].message.content or ""
             tok = response.usage.total_tokens if response.usage else len(text) // 4
             self.stats.record(tok, time.time() - t0)
             return text
 
         except Exception as e:
-            self.stats.errors += 1
+            self.stats.record_error()
             raise self._handle_error(e)
 
     async def generate_stream(
@@ -103,7 +105,7 @@ class OpenAIProvider(BaseProvider):
             self.stats.record(tok, time.time() - t0)
 
         except Exception as e:
-            self.stats.errors += 1
+            self.stats.record_error()
             raise self._handle_error(e)
 
     @staticmethod
@@ -180,12 +182,14 @@ class OpenAIProvider(BaseProvider):
                 kwargs["temperature"] = 0.4
 
             response = await self.client.chat.completions.create(**kwargs)
+            if not response.choices:
+                raise Exception(f"OpenAI returned empty choices list (model={model})")
             text = response.choices[0].message.content or ""
             tok = response.usage.total_tokens if response.usage else len(text) // 4
             self.stats.record(tok, time.time() - t0)
             return text
         except Exception as e:
-            self.stats.errors += 1
+            self.stats.record_error()
             raise self._handle_error(e)
 
     def supports_vision_stream(self) -> bool:
@@ -246,5 +250,5 @@ class OpenAIProvider(BaseProvider):
 
             self.stats.record(tok, time.time() - t0)
         except Exception as e:
-            self.stats.errors += 1
+            self.stats.record_error()
             raise self._handle_error(e)

@@ -185,8 +185,25 @@ _NOISE_SYMBOLS: Set[str] = {
 }
 
 
+# M-10: OCR text re-runs through the same N regex patterns every prefetch tick
+# even when the screen has not actually changed (the upstream dedupe is
+# hash-based but rounds to a coarse perceptual hash). Memoise by content hash
+# with a small bounded LRU; for unchanged screens the call collapses to a dict
+# lookup.
+_EXTRACT_SYMBOLS_CACHE: Dict[int, list[str]] = {}
+_EXTRACT_SYMBOLS_CACHE_ORDER: list[int] = []
+_EXTRACT_SYMBOLS_CACHE_MAX = 32
+
+
 def _extract_symbols(text: str) -> list[str]:
     """Extract unique code symbol names from OCR screen text."""
+    if not text:
+        return []
+    key = hash(text)
+    cached = _EXTRACT_SYMBOLS_CACHE.get(key)
+    if cached is not None:
+        return list(cached)
+
     seen: Set[str] = set()
     results = []
     for pat in _SYMBOL_PATTERNS:
@@ -199,6 +216,12 @@ def _extract_symbols(text: str) -> list[str]:
             ):
                 seen.add(name)
                 results.append(name)
+
+    _EXTRACT_SYMBOLS_CACHE[key] = list(results)
+    _EXTRACT_SYMBOLS_CACHE_ORDER.append(key)
+    if len(_EXTRACT_SYMBOLS_CACHE_ORDER) > _EXTRACT_SYMBOLS_CACHE_MAX:
+        old = _EXTRACT_SYMBOLS_CACHE_ORDER.pop(0)
+        _EXTRACT_SYMBOLS_CACHE.pop(old, None)
     return results
 
 

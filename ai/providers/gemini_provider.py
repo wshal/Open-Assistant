@@ -152,12 +152,18 @@ class GeminiProvider(BaseProvider):
                 model=model, contents=contents,
                 config=types.GenerateContentConfig(**cfg_kwargs)
             )
-            text = r.text
-            tok = r.usage_metadata.total_token_count if r.usage_metadata else len(text) // 4
+            text = r.text or ""
+            if not text:
+                # Diagnose safety/filter blocks
+                candidate = (r.candidates or [None])[0]
+                reason = str(getattr(candidate, 'finish_reason', '') or '')
+                if reason and reason not in ("STOP", "1"):
+                    raise Exception(f"Gemini blocked response (finish_reason={reason})")
+            tok = r.usage_metadata.total_token_count if r.usage_metadata else max(1, len(text) // 4)
             self.stats.record(tok, time.time() - t0)
             return text
         except Exception as e:
-            self.stats.errors += 1
+            self.stats.record_error()
             raise
 
     async def generate_stream(self, system: str, user: str, tier: str = None) -> AsyncGenerator[str, None]:
@@ -177,11 +183,14 @@ class GeminiProvider(BaseProvider):
             )
             async for chunk in stream:
                 if chunk.text:
-                    tok += len(chunk.text) // 4
+                    tok += max(1, len(chunk.text) // 4)
                     yield chunk.text
             self.stats.record(tok, time.time() - t0)
         except Exception as e:
-            self.stats.errors += 1
+            self.stats.record_error()
+            # Still record partial timing for latency tracking
+            if tok > 0:
+                self.stats.record(tok, time.time() - t0)
             raise
 
     # ── Vision ────────────────────────────────────────────────────────────────
@@ -229,8 +238,8 @@ class GeminiProvider(BaseProvider):
             )
             self.stats.record(tok, time.time() - t0)
             return text
-        except Exception as e:
-            self.stats.errors += 1
+        except Exception:
+            self.stats.record_error()
             raise
 
     def supports_vision_stream(self) -> bool:
@@ -273,6 +282,6 @@ class GeminiProvider(BaseProvider):
                     tok += len(chunk.text) // 4
                     yield chunk.text
             self.stats.record(tok, time.time() - t0)
-        except Exception as e:
-            self.stats.errors += 1
+        except Exception:
+            self.stats.record_error()
             raise

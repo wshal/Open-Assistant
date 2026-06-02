@@ -26,10 +26,74 @@ from utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
+# Issue #9: Allowlist of hosts trusted to serve update assets. GitHub release
+# binaries are served from objects.githubusercontent.com via a redirect from
+# github.com release URLs, so both are required.
+_UPDATE_ALLOWED_HOSTS = {"github.com", "objects.githubusercontent.com"}
+
+
+def _safe_update_destination(dest_dir, asset_name: str):
+    """Return a path inside ``dest_dir`` for ``asset_name`` after rejecting any
+    name that contains path separators, relative components, or is empty.
+
+    Issue #9: Server-provided asset names must not be allowed to escape the
+    update directory.
+    """
+    from pathlib import Path
+
+    safe_name = Path(asset_name).name
+    if not safe_name or safe_name != asset_name:
+        raise ValueError(f"Unsafe update asset name: {asset_name!r}")
+    dest_dir = Path(dest_dir)
+    dest = (dest_dir / safe_name).resolve()
+    if dest_dir.resolve() not in dest.parents:
+        raise ValueError("Update destination escaped update directory")
+    return dest
+
+
+def _download_verified_asset(url: str, dest, expected_sha256: str = "") -> None:
+    """Stream ``url`` to ``dest``, verifying host allowlist and optional digest.
+
+    Issue #9: Refuses non-HTTPS or off-allowlist hosts, streams to a ``.tmp``
+    file, optionally validates a SHA-256 digest before renaming into place, and
+    cleans up the temp file on failure.
+    """
+    from pathlib import Path
+    from urllib.parse import urlparse
+    import hashlib
+    import urllib.request
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in _UPDATE_ALLOWED_HOSTS:
+        raise ValueError(f"Untrusted update host: {parsed.hostname!r}")
+
+    dest = Path(dest)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    digest = hashlib.sha256()
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response, open(tmp, "wb") as fh:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                fh.write(chunk)
+        if expected_sha256 and digest.hexdigest().lower() != expected_sha256.lower():
+            raise ValueError("Downloaded update checksum mismatch")
+        tmp.replace(dest)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
 class StandbyView(QWidget):
     start_clicked = pyqtSignal()
     mode_selected = pyqtSignal(str)
     audio_source_changed = pyqtSignal(str)
+    _ui_call_requested = pyqtSignal(object)
 
     HERO_ICON = "\U0001F9E0"
     MODE_OPTIONS = [
@@ -128,6 +192,7 @@ class StandbyView(QWidget):
         self._boot_sync_scheduled = False
         self._boot_sync_logged = False
         self._warmup_done = False  # Latch: once True, no signal can revert READY state
+        self._ui_call_requested.connect(lambda fn: fn())
 
         self._init_ui()
         self._connect_state()
@@ -390,8 +455,7 @@ class StandbyView(QWidget):
                     local_ver = "0.0.0"
 
                 if is_newer(latest_tag, local_ver):
-                    # Update badge text on main thread via QTimer trick
-                    QTimer.singleShot(0, lambda: self._show_update_badge(info))
+                    self._call_on_ui_thread(lambda: self._show_update_badge(info))
             except Exception:
                 pass  # Non-fatal — silently ignore (offline, rate limit, etc.)
 
@@ -435,27 +499,59 @@ class StandbyView(QWidget):
             pass
 
     def _download_update(self):
-        """Best-effort download of latest release asset (does not self-install)."""
+        """Best-effort download of latest release asset (does not self-install).
+
+        Issue #9: Verify host allowlist, sanitise asset name to prevent path
+        traversal, stream the download to a .tmp file, and only swap into place
+        after the optional SHA-256 digest matches.
+        """
         import threading
 
         info = getattr(self, "_latest_release", None)
         url = getattr(info, "asset_url", "") if info else ""
         name = getattr(info, "asset_name", "") if info else ""
+        expected_sha256 = (getattr(info, "asset_sha256", "") or "") if info else ""
         if not url or not name:
             self._open_releases()
             return
+        # C-1: Refuse to download an unverified asset by default. If the release
+        # publisher did not include a SHA-256 (either in release body or sibling
+        # asset), fall back to opening the releases page so the user can verify
+        # manually. The opt-out (`updates.allow_unverified=true`) exists only for
+        # development / internal builds and is logged on every use.
+        if not expected_sha256:
+            try:
+                allow = False
+                cfg = getattr(self, "config", None)
+                if cfg is not None and hasattr(cfg, "get"):
+                    allow = bool(cfg.get("updates.allow_unverified", False))
+                if not allow:
+                    logger.warning(
+                        "Update download refused: no SHA-256 digest available for asset %r",
+                        name,
+                    )
+                    self._open_releases()
+                    return
+                logger.warning(
+                    "Proceeding with UNVERIFIED update download for asset %r (updates.allow_unverified=true)",
+                    name,
+                )
+            except Exception:
+                self._open_releases()
+                return
 
         def _do():
             try:
                 from pathlib import Path
-                import urllib.request
 
                 dest_dir = Path("data") / "updates"
                 dest_dir.mkdir(parents=True, exist_ok=True)
-                dest = dest_dir / name
+                dest = _safe_update_destination(dest_dir, name)
 
-                QTimer.singleShot(0, lambda: self._update_badge.setText("DOWNLOADING UPDATE..."))
-                urllib.request.urlretrieve(url, dest)  # nosec B310 (trusted GitHub asset URL)
+                self._call_on_ui_thread(
+                    lambda: self._update_badge.setText("DOWNLOADING UPDATE...")
+                )
+                _download_verified_asset(url, dest, expected_sha256)
 
                 def _open():
                     try:
@@ -466,11 +562,14 @@ class StandbyView(QWidget):
                     except Exception:
                         self._open_releases()
 
-                QTimer.singleShot(0, _open)
+                self._call_on_ui_thread(_open)
             except Exception:
-                QTimer.singleShot(0, self._open_releases)
+                self._call_on_ui_thread(self._open_releases)
 
         threading.Thread(target=_do, daemon=True, name="update-download").start()
+
+    def _call_on_ui_thread(self, fn) -> None:
+        self._ui_call_requested.emit(fn)
 
     # ── Provider status bar ──────────────────────────────────────────────────
 

@@ -438,16 +438,16 @@ class TestActionExecutor(unittest.TestCase):
     # --- Intent detection ---
 
     def test_detects_run_pytest(self):
+        # run_pytest was removed (audit Issue #1 — arbitrary test runner execution)
         ae = self._make()
         r = ae.detect("run pytest now")
-        self.assertIsNotNone(r)
-        self.assertEqual(r[0], "run_pytest")
+        self.assertIsNone(r, "run_pytest must be blocked after security hardening")
 
     def test_detects_run_tests(self):
+        # run_tests was removed (audit Issue #1)
         ae = self._make()
         r = ae.detect("run all tests")
-        self.assertIsNotNone(r)
-        self.assertIn(r[0], {"run_tests", "run_pytest"})
+        self.assertIsNone(r, "run_tests must be blocked after security hardening")
 
     def test_detects_git_status(self):
         ae = self._make()
@@ -517,52 +517,52 @@ class TestActionExecutor(unittest.TestCase):
         self.assertEqual(r[0], "npm_version")
 
     def test_detects_npm_install(self):
+        # npm install was removed (audit Issue #1 — package-execution surface)
         ae = self._make()
         r = ae.detect("npm install")
-        self.assertIsNotNone(r)
-        self.assertEqual(r[0], "npm_install")
+        self.assertIsNone(r, "npm install must be blocked after security hardening")
 
     def test_detects_npm_start(self):
+        # npm start was removed (audit Issue #1)
         ae = self._make()
         r = ae.detect("npm run start")
-        self.assertIsNotNone(r)
-        self.assertEqual(r[0], "npm_start")
+        self.assertIsNone(r, "npm run start must be blocked after security hardening")
 
     def test_detects_npm_build(self):
+        # npm build was removed (audit Issue #1)
         ae = self._make()
         r = ae.detect("npm run build")
-        self.assertIsNotNone(r)
-        self.assertEqual(r[0], "npm_build")
+        self.assertIsNone(r, "npm run build must be blocked after security hardening")
 
     def test_detects_start_dev_server_natural(self):
+        # dev-server intents were removed (audit Issue #1)
         ae = self._make()
         r = ae.detect("start the dev server")
-        self.assertIsNotNone(r)
-        self.assertEqual(r[0], "npm_dev")
+        self.assertIsNone(r, "dev-server intent must be blocked after security hardening")
 
     def test_detects_build_frontend_natural(self):
+        # build intents were removed (audit Issue #1)
         ae = self._make()
         r = ae.detect("build the frontend")
-        self.assertIsNotNone(r)
-        self.assertEqual(r[0], "npm_build")
+        self.assertIsNone(r, "build intent must be blocked after security hardening")
 
     def test_detects_npm_test(self):
+        # npm test was removed (audit Issue #1)
         ae = self._make()
         r = ae.detect("npm test")
-        self.assertIsNotNone(r)
-        self.assertEqual(r[0], "npm_test")
+        self.assertIsNone(r, "npm test must be blocked after security hardening")
 
     def test_detects_run_python_file(self):
+        # run_python_file was removed (audit Issue #1 — arbitrary script exec)
         ae = self._make()
         r = ae.detect("run main.py")
-        self.assertIsNotNone(r)
-        self.assertEqual(r[0], "run_python_file")
+        self.assertIsNone(r, "run_python_file must be blocked after security hardening")
 
     def test_detects_run_node_file(self):
+        # run_node_file was removed (audit Issue #1)
         ae = self._make()
         r = ae.detect("run server.js")
-        self.assertIsNotNone(r)
-        self.assertEqual(r[0], "run_node_file")
+        self.assertIsNone(r, "run_node_file must be blocked after security hardening")
 
     def test_detects_which_command(self):
         ae = self._make()
@@ -572,16 +572,16 @@ class TestActionExecutor(unittest.TestCase):
         self.assertIsNotNone(r[0])
 
     def test_detects_scan_errors(self):
+        # scan_errors was removed (audit Issue #1)
         ae = self._make()
         r = ae.detect("show all errors")
-        self.assertIsNotNone(r)
-        self.assertEqual(r[0], "scan_errors")
+        self.assertIsNone(r, "scan_errors must be blocked after security hardening")
 
     def test_detects_find_exceptions(self):
+        # scan_errors (find exceptions) was removed (audit Issue #1)
         ae = self._make()
         r = ae.detect("find exceptions in code")
-        self.assertIsNotNone(r)
-        self.assertEqual(r[0], "scan_errors")
+        self.assertIsNone(r, "scan_errors (exceptions) must be blocked after security hardening")
 
     # --- Safety block ---
 
@@ -857,54 +857,58 @@ class TestTier3AsyncPersist(unittest.TestCase):
 
 
 class TestTier3DevServerIntents(unittest.TestCase):
-    """Q19: npm run dev / yarn dev / next dev / vite dev intents."""
+    """Q19: npm run dev / yarn dev / next dev / vite dev intents.
+
+    NOTE: These action patterns were REMOVED by the security audit (Issue #1).
+    The dev-server commands execute arbitrary project scripts from spoken/OCR
+    prompts and could run untrusted code. The tests now verify they are blocked.
+    """
 
     def _detect(self, query):
         from ai.actions import ActionExecutor
         import unittest.mock as mock
-        # ActionExecutor requires a config; mock it minimally
+        # Provide proper string defaults so Path(cwd) doesn't receive a float.
         cfg = mock.MagicMock()
-        cfg.get.return_value = 15.0
+        cfg.get.side_effect = lambda key, default=None: {
+            "ai.actions.enabled": True,
+            "ai.actions.timeout_s": 10.0,
+            "ai.actions.cwd": ".",
+        }.get(key, default)
         ae = ActionExecutor(cfg)
         return ae.detect(query)
 
     def test_npm_run_dev(self):
+        # Removed: audit Issue #1 — arbitrary script execution
         result = self._detect("npm run dev")
-        self.assertIsNotNone(result)
-        self.assertEqual(result[0], "npm_dev")
-        self.assertEqual(result[1], ["npm", "run", "dev"])
+        self.assertIsNone(result, "npm run dev must be blocked after security hardening")
 
     def test_start_dev_server_phrase(self):
         result = self._detect("start the development server")
-        self.assertIsNotNone(result)
-        self.assertEqual(result[0], "npm_dev")
+        self.assertIsNone(result, "dev-server phrase must be blocked after security hardening")
 
     def test_hot_reload(self):
         result = self._detect("enable hot reload")
-        self.assertIsNotNone(result)
-        self.assertEqual(result[0], "npm_dev")
+        self.assertIsNone(result, "hot reload must be blocked after security hardening")
 
     def test_yarn_dev(self):
+        # Removed: audit Issue #1
         result = self._detect("yarn dev")
-        self.assertIsNotNone(result)
-        self.assertEqual(result[0], "yarn_dev")
-        self.assertEqual(result[1], ["yarn", "dev"])
+        self.assertIsNone(result, "yarn dev must be blocked after security hardening")
 
     def test_next_dev(self):
+        # Removed: audit Issue #1
         result = self._detect("next.js dev")
-        self.assertIsNotNone(result)
-        self.assertEqual(result[0], "next_dev")
+        self.assertIsNone(result, "next dev must be blocked after security hardening")
 
     def test_vite_dev(self):
+        # Removed: audit Issue #1
         result = self._detect("launch vite")
-        self.assertIsNotNone(result)
-        self.assertEqual(result[0], "vite_dev")
-        self.assertEqual(result[1], ["npx", "vite"])
+        self.assertIsNone(result, "vite dev must be blocked after security hardening")
 
     def test_run_in_dev_mode(self):
+        # Removed: audit Issue #1
         result = self._detect("run in development mode")
-        self.assertIsNotNone(result)
-        self.assertIn(result[0], ("npm_dev", "yarn_dev"))
+        self.assertIsNone(result, "run in dev mode must be blocked after security hardening")
 
 
 if __name__ == "__main__":

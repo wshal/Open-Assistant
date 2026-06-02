@@ -52,6 +52,10 @@ class RAGEngine:
 
         self._cache = {}
         self._cache_ttl = config.get("rag.cache_ttl", 60)
+        # M-1: Cap the cache and evict expired entries on every miss so a
+        # long-running session cannot grow it without bound. 256 keys at ~5
+        # short docs each is ~1MB worst case, fine for an in-process LRU.
+        self._cache_max = int(config.get("rag.cache_max", 256))
 
     def _ensure_loaded(self):
         """Hardened lazy-loader with concurrency protection."""
@@ -122,6 +126,16 @@ class RAGEngine:
         cache_key = text.strip().lower()
         if cache_key in self._cache and now < self._cache[cache_key][1]:
             return self._cache[cache_key][0]
+        # M-1: Opportunistic eviction on miss. Drop expired entries first; if
+        # still over the cap, drop the oldest-expiring entries.
+        if len(self._cache) >= self._cache_max:
+            expired = [k for k, (_, exp) in self._cache.items() if exp <= now]
+            for k in expired:
+                self._cache.pop(k, None)
+            if len(self._cache) >= self._cache_max:
+                ordered = sorted(self._cache.items(), key=lambda kv: kv[1][1])
+                for k, _ in ordered[: max(1, len(self._cache) - self._cache_max + 1)]:
+                    self._cache.pop(k, None)
 
         try:
             emb = self._embed_fn([text])

@@ -524,6 +524,18 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertIn("Audio capture unavailable", app.overlay.transcript_updates[-1])
 
+    def test_start_new_session_allows_audio_explicitly_disabled(self):
+        app = self._build_app()
+        app.config.set("capture.audio.enabled", False)
+        app.config.set("capture.audio.muted", False)
+
+        OpenAssistApp.start_new_session(app)
+
+        self.assertTrue(app.session_active)
+        self.assertFalse(app.state.is_muted)
+        self.assertEqual(app.audio.ensure_session_ready_calls, 0)
+        self.assertIn("Listening for context...", app.overlay.transcript_updates)
+
     def test_run_warms_runtime_without_starting_audio_capture(self):
         app = self._build_app()
         app._async_thread = SimpleNamespace(start=lambda: None)
@@ -1038,7 +1050,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertEqual(len(dispatched), 1)
         self.assertEqual(len(session_contexts), 1)
-        self.assertIn("[RECENT SPOKEN CONTEXT]", session_contexts[0])
+        self.assertIn("[SPOKEN CONTEXT]", session_contexts[0])
         self.assertIn("strict backwards compatibility", session_contexts[0])
         self.assertTrue(app._pending_request_metadata["preserve_session_context"])
 
@@ -1085,6 +1097,56 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
                 app,
                 "Explain how you would implement a caching layer, and what cache eviction policies you might use.",
                 "explain how you would implement a caching layer, and what cache eviction policies you might use?",
+            ),
+            900,
+        )
+        self.assertEqual(
+            _final_dispatch_delay_ms(
+                app,
+                "Explain how you would implement a caching layer,",
+                "explain how you would implement a caching layer?",
+            ),
+            5200,
+        )
+        self.assertTrue(
+            _should_defer_for_followup(
+                "If you are traversing a binary search tree to find a specific node,",
+                "I'd like to ask a quick algorithmic question. If you are traversing a binary search tree to find a specific node",
+            )
+        )
+        self.assertEqual(
+            _final_dispatch_delay_ms(
+                app,
+                "If you are traversing a binary search tree to find a specific node,",
+                "I'd like to ask a quick algorithmic question. If you are traversing a binary search tree to find a specific node",
+            ),
+            5200,
+        )
+        self.assertEqual(
+            _final_dispatch_delay_ms(
+                app,
+                (
+                    "If you are traversing a binary search tree to find a specific node, "
+                    "What is the expected time complexity in big O notation,"
+                ),
+                (
+                    "What is the expected time complexity in big O notation"
+                ),
+            ),
+            5200,
+        )
+        self.assertEqual(
+            _final_dispatch_delay_ms(
+                app,
+                (
+                    "If you are traversing a binary search tree to find a specific node, "
+                    "What is the expected time complexity in big O notation, "
+                    "And what is the worst case scenario if the tree is unbalanced?"
+                ),
+                (
+                    "What is the expected time complexity in big O notation? "
+                    "And what is the worst case scenario if the tree is unbalanced?"
+                ),
             ),
             900,
         )
@@ -1201,6 +1263,42 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         OpenAssistApp.toggle_auto_mode(app)
 
         self.assertTrue(app.config.get("ai.auto_mode.enabled"))
+
+    def test_toggle_auto_mode_off_restores_standard_transcription_path(self):
+        app = self._build_app()
+        app.session_active = True
+        app.config.set("ai.auto_mode.enabled", True)
+        app._auto_final_pending_query = "stale auto question"
+        app._auto_final_pending_raw = "stale auto raw"
+        app._auto_answer_context = "stale setup"
+        generated = []
+        app.generate_response = lambda *args, **kwargs: generated.append((args, kwargs))
+        app.nexus = SimpleNamespace(push=lambda source, value: None, get_snapshot=lambda: {})
+        app.audio = SimpleNamespace(
+            get_last_transcription_metrics=lambda: {},
+            set_standard_transcription_suspended=lambda *_args: None,
+        )
+        app.ai.detector = SimpleNamespace(
+            question_prefixes=["what ", "how ", "why ", "can "],
+            question_patterns=["what is", "how do", "can you"],
+            detect_with_confidence=lambda text, source="audio": SimpleNamespace(
+                triggered=True,
+                confidence=1.0,
+                detected_text=text,
+                should_auto_respond=lambda: True,
+            ),
+        )
+
+        OpenAssistApp.toggle_auto_mode(app)
+        OpenAssistApp._on_transcription(app, "What is React context?")
+
+        self.assertFalse(app.config.get("ai.auto_mode.enabled"))
+        self.assertEqual(app._auto_answer_context, "")
+        self.assertIn("Listening for context...", app.overlay.transcript_updates)
+        self.assertEqual(
+            generated[0][0],
+            ("What is React context?", "speech", {"audio": "What is React context?"}),
+        )
 
     def test_non_question_audio_does_not_prime_request_metadata(self):
         app = self._build_app()
@@ -1567,6 +1665,24 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertIsNotNone(app._current_response_start_time)
 
+    def test_manual_screen_prompt_routes_to_one_shot_vision_analysis(self):
+        app = self._build_app()
+        app.session_active = True
+        app._ai_lock_ready = SimpleNamespace(wait=lambda timeout=2: True)
+        app.ai = SimpleNamespace(detector=SimpleNamespace(learn_from_query=lambda q: None))
+        routed = []
+        app.analyze_current_screen = lambda query_override="": routed.append(query_override)
+
+        OpenAssistApp.generate_response(
+            app,
+            "Analyze the screen and give me the output of the current code present on the screen",
+            "manual",
+            None,
+        )
+
+        self.assertEqual(len(routed), 1)
+        self.assertIn("current code", routed[0].lower())
+
 
     def test_reset_benchmark_fixture_runtime_clears_auto_mode_turn_state(self):
         app = self._build_app()
@@ -1687,6 +1803,47 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertTrue(req_meta["suppress_rag_context"])
         self.assertTrue(req_meta["suppress_response_cache"])
 
+    def test_process_ai_suppresses_stale_screen_context_when_vision_disabled(self):
+        app = self._build_app()
+        app._ai_lock = asyncio.Lock()
+        app._generation_epoch = 9
+        app.screen = SimpleNamespace(
+            _enabled=False,
+            last_img_hash="stale-screen-hash",
+            capture_context=Mock(side_effect=AssertionError("vision disabled must not capture")),
+        )
+        app.audio = SimpleNamespace(get_transcript=lambda: "live audio")
+        app.context_builder = SimpleNamespace(build=Mock(side_effect=AssertionError("screen context should be skipped")))
+        app.context_pruner = SimpleNamespace(prune=Mock(side_effect=AssertionError("screen pruning should be skipped")))
+        app.memory = SimpleNamespace(is_ready=lambda: False)
+        app.nexus = SimpleNamespace(
+            push=Mock(side_effect=AssertionError("stale screen should not be pushed")),
+            get_snapshot=Mock(return_value={"latest_ocr": "stale OCR", "full_audio_history": "old audio"}),
+        )
+        captured = {}
+
+        async def _capture_generate_response(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        app.ai = SimpleNamespace(generate_response=_capture_generate_response)
+
+        asyncio.run(
+            OpenAssistApp._process_ai(
+                app,
+                "What is dependency injection?",
+                "manual",
+                None,
+                9,
+                {},
+            )
+        )
+
+        self.assertEqual(captured["kwargs"]["screen_context"], "")
+        self.assertEqual(captured["kwargs"]["screen_hash"], "")
+        self.assertEqual(captured["args"][1]["latest_ocr"], "")
+        self.assertTrue(captured["kwargs"]["request_metadata"]["suppress_screen_context"])
+
     def test_screen_analysis_badge_updates_during_flow(self):
         app = self._build_app()
         app.session_active = True
@@ -1707,6 +1864,45 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             app.overlay.analysis_badges[-1],
             {"provider": "groq", "pending": False},
         )
+
+    def test_analyze_screen_surfaces_failure_when_vision_and_ocr_fail(self):
+        app = self._build_app()
+        app.session_active = True
+        app._generation_epoch = 0
+        app.loop = object()
+        app.audio = SimpleNamespace(get_transcript=lambda: "")
+        app.nexus = SimpleNamespace(
+            get_snapshot=lambda: {"latest_ocr": "", "full_audio_history": ""},
+            push=Mock(side_effect=AssertionError("empty OCR must not be pushed")),
+        )
+
+        async def fake_capture_image_bytes(for_analysis=False):
+            return b"jpeg-bytes"
+
+        async def fake_extract_text_from_image_bytes(_image_bytes):
+            return ""
+
+        async def fake_analyze_image_response(*_args, **_kwargs):
+            raise Exception("No vision-capable provider available")
+
+        app.screen = SimpleNamespace(
+            capture_image_bytes=fake_capture_image_bytes,
+            extract_text_from_image_bytes=fake_extract_text_from_image_bytes,
+        )
+        app.ai = SimpleNamespace(analyze_image_response=fake_analyze_image_response)
+        generated = []
+        app.generate_response = lambda *args: generated.append(args)
+
+        with patch(
+            "core.app.asyncio.run_coroutine_threadsafe",
+            side_effect=lambda coro, loop: __import__("asyncio").run(coro),
+        ):
+            OpenAssistApp.analyze_current_screen(app)
+
+        self.assertFalse(app._screen_analysis_pending)
+        self.assertEqual(generated, [])
+        self.assertIn("analysis could not read it", app.overlay.completed[-1][0])
+        self.assertEqual(app.overlay.analysis_badges[-1], {"provider": None, "pending": False})
 
     def test_history_navigation_switches_settings_tabs_when_settings_open(self):
         app = self._build_app()

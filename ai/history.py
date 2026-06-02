@@ -146,6 +146,12 @@ class ResponseHistory:
             latency=latency,
             metadata=metadata or {},
         )
+        # Capture what needs to be saved; hold lock only for in-memory mutations.
+        # I/O (encrypted disk write) happens OUTSIDE the lock so UI calls to
+        # get_last() are never blocked while a slow write is in progress.
+        sessions_snapshot = None
+        entries_snapshot = None
+
         with self._lock:
             self._ensure_current_session_meta()
             self.entries.append(entry)
@@ -168,33 +174,52 @@ class ResponseHistory:
                     s["entry_count"] = len(self.entries)
                     break
 
-            self.index_storage.set("sessions_index", self.sessions)
-            self._save_unlocked()
+            # Snapshot data needed for I/O while still under lock
+            sessions_snapshot = list(self.sessions)
+            entries_snapshot = [asdict(e) for e in self.entries]
+
+        # Perform all disk I/O outside the lock
+        try:
+            self.index_storage.set("sessions_index", sessions_snapshot)
+        except Exception as _e:
+            logger.error("Failed to save session index: %s", _e)
+        try:
+            self.current_storage.set("history_data", entries_snapshot)
+        except Exception as _e:
+            logger.error("Failed to save history entries: %s", _e)
 
     def move_prev(self) -> bool:
         """Moves current_index back one entry. Returns True if index changed."""
-        if self.current_index > 0:
-            self.current_index -= 1
-            return True
-        return False
+        with self._lock:
+            if self.current_index > 0:
+                self.current_index -= 1
+                return True
+            return False
 
     def move_next(self) -> bool:
         """Moves current_index forward one entry. Returns True if index changed."""
-        if self.current_index < len(self.entries) - 1:
-            self.current_index += 1
-            return True
-        return False
+        with self._lock:
+            if self.current_index < len(self.entries) - 1:
+                self.current_index += 1
+                return True
+            return False
 
     def get_state(self):
         """Returns (index, total, entry) for UI synchronization."""
-        entry = self.get_at(self.current_index) if self.current_index >= 0 else None
-        return self.current_index, len(self.entries), entry
+        with self._lock:
+            entry = (
+                asdict(self.entries[self.current_index])
+                if 0 <= self.current_index < len(self.entries)
+                else None
+            )
+            return self.current_index, len(self.entries), entry
 
     def get_at(self, index: int) -> Optional[dict]:
         """Convert dataclass to dict for UI consumption."""
-        if 0 <= index < len(self.entries):
-            return asdict(self.entries[index])
-        return None
+        with self._lock:
+            if 0 <= index < len(self.entries):
+                return asdict(self.entries[index])
+            return None
 
     def get_last(self, n: int = 10) -> List[HistoryEntry]:
         with self._lock:
@@ -289,10 +314,23 @@ class ResponseHistory:
             return []
 
         valid_fields = set(inspect.signature(HistoryEntry).parameters.keys())
+        _required = {"query", "response", "provider"}
         entries = []
         for e in data:
+            if not isinstance(e, dict):
+                continue
+            # Skip entries missing required fields to avoid TypeError on construction
+            if not _required.issubset(e.keys()):
+                logger.warning(
+                    "Skipping malformed history entry (missing required fields: %s)",
+                    _required - e.keys(),
+                )
+                continue
             filtered = {k: v for k, v in e.items() if k in valid_fields}
-            entries.append(HistoryEntry(**filtered))
+            try:
+                entries.append(HistoryEntry(**filtered))
+            except TypeError as exc:
+                logger.warning("Failed to reconstruct HistoryEntry: %s", exc)
         return entries
 
     @staticmethod
@@ -319,9 +357,10 @@ class ResponseHistory:
 
     def clear(self):
         """Emergency Wipe: Purge memory and ALL session files from disk."""
-        self.entries.clear()
-        self.current_index = -1
-        self.screen_analyses = []
+        with self._lock:
+            self.entries.clear()
+            self.current_index = -1
+            self.screen_analyses = []
 
         # RESTORATION: Total Disk Purge logic
         logger.warning("🚨 EMERGENCY DISK PURGE INITIATED")
@@ -335,12 +374,13 @@ class ResponseHistory:
                     logger.error(f"Failed to remove {enc_file}: {e}")
 
             # 2. Re-initialize empty state
-            self.sessions = []
+            with self._lock:
+                self.sessions = []
+                self.current_session_id = self._new_session_id()
+                self.current_storage = SecureStorage(
+                    str(self.history_dir / f"{self.current_session_id}.enc")
+                )
             self.index_storage.set("sessions_index", [])
-            self.current_session_id = self._new_session_id()
-            self.current_storage = SecureStorage(
-                str(self.history_dir / f"{self.current_session_id}.enc")
-            )
 
         except Exception as e:
             logger.error(f"Global purge failed: {e}")
@@ -349,13 +389,16 @@ class ResponseHistory:
 
     def search(self, keyword: str) -> List[HistoryEntry]:
         kw = keyword.lower()
-        return [
-            e for e in self.entries if kw in e.query.lower() or kw in e.response.lower()
-        ]
+        with self._lock:
+            return [
+                e for e in self.entries if kw in e.query.lower() or kw in e.response.lower()
+            ]
 
     def export_markdown(self, filepath: str):
         lines = ["# OpenAssist AI — Response History\n"]
-        for e in self.entries:
+        with self._lock:
+            entries = list(self.entries)
+        for e in entries:
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.timestamp))
             lines.append(f"## {ts} [{e.mode}] via {e.provider}\n")
             lines.append(f"**Q:** {e.query}\n")

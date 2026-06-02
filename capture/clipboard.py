@@ -20,7 +20,11 @@ class ClipboardMonitor(QObject):
     
     def start(self):
         self._running = True
-        self._last_content = pyperclip.paste() or ""
+        try:
+            self._last_content = pyperclip.paste() or ""
+        except Exception as e:
+            logger.warning(f"Clipboard read at startup failed: {e}")
+            self._last_content = ""
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._thread.start()
     

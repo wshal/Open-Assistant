@@ -1,5 +1,7 @@
 """Mode manager — loads all built-in modes and exposes them as ModeProfiles."""
 
+import re
+
 from modes.base import Mode
 from modes.general import GeneralMode
 from modes.interview import InterviewMode
@@ -72,18 +74,33 @@ class ModeManager:
 
     # ── Auto-detection ────────────────────────────────────────────────────────
 
+    _AUTO_DETECT_PATTERNS = {
+        "coding": [re.compile(p) for p in (
+            r"\bdef\s+\w+\s*\(", r"\bclass\s+\w+\s*[:\(]",
+            r"\bimport\s+\w+", r"\btraceback\b", r"\berror\s*:",
+        )],
+        "exam": [re.compile(p) for p in (
+            r"\bmultiple\s+choice\b", r"\banswer\s*:",
+            r"\bquiz(?:zes)?\b", r"\bexam\b",
+        )],
+        "interview": [re.compile(p) for p in (
+            r"\binterview\b", r"\btell\s+me\s+about\b",
+            r"\bstrengths?\b", r"\bcareer\b",
+        )],
+        "meeting": [re.compile(p) for p in (
+            r"\bagenda\b", r"\bmeeting\b",
+            r"\baction\s+items?\b", r"\bstand[\s-]?up\b",
+        )],
+        "writing": [re.compile(p) for p in (
+            r"\bparagraph\b", r"\bessay\b", r"\barticle\b", r"\bdraft\b",
+        )],
+    }
+
     def auto_detect(self, screen_text="", audio_text="", window_category="") -> str | None:
         """Heuristic mode detection from live context. Returns mode name or None."""
         text = (screen_text + " " + audio_text + " " + window_category).lower()
-        hints = {
-            "interview": ["interview", "tell me about", "strengths", "career"],
-            "coding":    ["def ", "class ", "import ", "error:", "traceback"],
-            "exam":      ["multiple choice", "answer:", "exam", "quiz"],
-            "meeting":   ["agenda", "meeting", "action items", "standup"],
-            "writing":   ["paragraph", "essay", "article", "draft"],
-        }
-        for mode_name, keywords in hints.items():
-            if any(kw in text for kw in keywords):
+        for mode_name, patterns in self._AUTO_DETECT_PATTERNS.items():
+            if any(p.search(text) for p in patterns):
                 return mode_name
         return None
 

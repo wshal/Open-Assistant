@@ -83,7 +83,21 @@ class AudioCapture(QObject):
         self.transcripts = collections.deque(
             maxlen=config.get("performance.max_history", 50)
         )
-        self.sr = config.get("capture.audio.sample_rate", 16000)
+        # H-A3: WebRTC VAD only accepts 8/16/32/48 kHz.  Faster-Whisper also expects
+        # 16 kHz.  Clamp any out-of-range config value to the closest legal rate
+        # so misconfiguration cannot crash the VAD loop downstream.
+        _configured_sr = int(config.get("capture.audio.sample_rate", 16000) or 16000)
+        _legal_sr = (8000, 16000, 32000, 48000)
+        if _configured_sr in _legal_sr:
+            self.sr = _configured_sr
+        else:
+            self.sr = min(_legal_sr, key=lambda r: abs(r - _configured_sr))
+            logger.warning(
+                "Audio: configured sample_rate=%d is not 8/16/32/48 kHz; "
+                "clamped to %d to keep WebRTC VAD valid.",
+                _configured_sr,
+                self.sr,
+            )
         self.capture_mode = config.get("capture.audio.mode", "system")
         self.last_mode = self.capture_mode
 
@@ -124,6 +138,17 @@ class AudioCapture(QObject):
         self._ambient_calib_remaining = self._ambient_calib_blocks
         self._ambient_rms_samples: list = []
         self._dynamic_rms_floor = 0.0  # 0 = disabled until first calibration completes
+        # H-A2: Hard wall-clock deadline so calibration cannot be starved indefinitely
+        # if the user begins speaking immediately on session start.  Once this elapses
+        # without a successful sample-based calibration we fall back to a fixed floor.
+        self._ambient_calib_started_at = 0.0
+        self._ambient_calib_deadline_ms = max(
+            _calib_ms,
+            int(config.get("capture.audio.ambient_calibration_deadline_ms", 5000) or 5000),
+        )
+        self._ambient_calib_fallback_floor = float(
+            config.get("capture.audio.ambient_calibration_fallback_floor", 0.0025) or 0.0025
+        )
 
         self.model = None
         self._model_name = config.get("capture.audio.whisper_model", "small.en")
@@ -410,6 +435,9 @@ class AudioCapture(QObject):
         self._cloud_stt_session_blocked = False
         self._cloud_stt_failed_key = ""
         self._whisper_device = "cpu"
+        # H-A4: dynamic endpointing hint — set by interim transcript consumers
+        # when the partial transcript already looks like a complete question.
+        self._question_complete_hint = False
 
         if state is None:
             from core.state import AppState
@@ -422,10 +450,27 @@ class AudioCapture(QObject):
         self._paused = self._muted
         self._capture_chunk_buffer = np.empty((0, 1), dtype=np.float32)
 
+    def _ensure_executor_pools(self) -> None:
+        """Recreate transcription executors after stop()/restart()."""
+        pools = (
+            ("_transcribe_pool", 1, "whisper"),
+            ("_cloud_stt_pool", 3, "cloud-stt"),
+            ("_interim_pool", 1, "whisper-live"),
+        )
+        for attr, max_workers, prefix in pools:
+            pool = getattr(self, attr, None)
+            if pool is None or bool(getattr(pool, "_shutdown", False)):
+                setattr(
+                    self,
+                    attr,
+                    ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=prefix),
+                )
+
     def _on_state_mute_changed(self, muted: bool):
         logger.debug(f"Audio: State sync -> Muted={muted}")
-        self._muted = muted
-        self._paused = muted
+        with self._lock:
+            self._muted = muted
+            self._paused = muted
         if not muted:
             self._drain_queue()
             logger.debug("Audio: Buffer flushed on unmute.")
@@ -434,6 +479,7 @@ class AudioCapture(QObject):
         self._ambient_calib_remaining = self._ambient_calib_blocks
         self._ambient_rms_samples = []
         self._dynamic_rms_floor = 0.0
+        self._ambient_calib_started_at = 0.0
 
     def _session_capture_active(self) -> bool:
         state = getattr(self, "_state", None)
@@ -517,20 +563,21 @@ class AudioCapture(QObject):
     _DEFAULT_MODEL_NAME = "small.en"
 
     @staticmethod
-    def _probe_gpu() -> tuple[str, str, str]:
-        """Return (device, compute_type, model_override_or_empty).
+    def _probe_gpu() -> tuple[str, str, float, str]:
+        """Return (device, compute_type, free_vram_gb, gpu_name).
 
         Probes CUDA availability and free VRAM.  Returns:
-        - device      : "cuda" | "cpu"
-        - compute     : "float16" | "int8"
-        - model_hint  : suggested model name, or "" if no upgrade is warranted
+        - device       : "cuda" | "cpu"
+        - compute      : "float16" | "int8"
+        - free_vram_gb : free VRAM in GB (0.0 on CPU)
+        - gpu_name     : human-readable GPU name ("" on CPU)
         """
         try:
             import torch
             if not torch.cuda.is_available():
-                return "cpu", "int8", ""
+                return "cpu", "int8", 0.0, ""
         except ImportError:
-            return "cpu", "int8", ""
+            return "cpu", "int8", 0.0, ""
 
         # Try to get free VRAM via pynvml (most accurate)
         free_gb = 0.0
@@ -650,6 +697,7 @@ class AudioCapture(QObject):
                 logger.info("Audio capture disabled in config, skipping start")
                 return
 
+            self._ensure_executor_pools()
             self.capture_mode = self.config.get("capture.audio.mode", self.capture_mode)
             self.last_mode = self.capture_mode
             self._running = True
@@ -658,6 +706,7 @@ class AudioCapture(QObject):
             self._ambient_calib_remaining = self._ambient_calib_blocks
             self._ambient_rms_samples = []
             self._dynamic_rms_floor = 0.0
+            self._ambient_calib_started_at = 0.0
             # Reset session chunk accumulator
             with self._session_parts_lock:
                 self._session_transcript_parts = []
@@ -688,16 +737,34 @@ class AudioCapture(QObject):
             self._running = False
             self._close_streams()
             self._drain_queue()
-            logger.info("🎙️ Audio Capture Stopped.")
+
+        # Shut down thread pools outside the lock to avoid deadlock if pool
+        # workers are currently trying to acquire self._lock.
+        for _pool_attr in ("_transcribe_pool", "_cloud_stt_pool", "_interim_pool"):
+            _pool = getattr(self, _pool_attr, None)
+            if _pool is not None:
+                try:
+                    _pool.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    # cancel_futures requires Python 3.9+; graceful fallback
+                    _pool.shutdown(wait=False)
+                except Exception as _e:
+                    logger.debug("Audio: error shutting down %s: %s", _pool_attr, _e)
+                finally:
+                    setattr(self, _pool_attr, None)
+
+        logger.info("🎙️ Audio Capture Stopped.")
 
     def toggle(self) -> bool:
         """Toggle muted state and return the new mute status."""
-        self._muted = not self._muted
-        self._paused = self._muted
-        if not self._muted:
+        with self._lock:
+            self._muted = not self._muted
+            self._paused = self._muted
+            muted = self._muted
+        if not muted:
             self._drain_queue()
-        logger.info(f"🎤 Audio {'Muted' if self._muted else 'Unmuted'}")
-        return self._muted
+        logger.info(f"🎤 Audio {'Muted' if muted else 'Unmuted'}")
+        return muted
 
     def restart(self):
         """
@@ -1368,6 +1435,17 @@ class AudioCapture(QObject):
             self._base_silence_ms = ms
             logger.info(f"🎙️ VAD silence window updated → {ms}ms ({new_blocks} blocks)")
 
+    def set_question_complete_hint(self, hint: bool) -> None:
+        """H-A4: Allow upstream interim-transcript consumers (auto-mode controller,
+        question detector) to signal that the current utterance already looks
+        like a complete question.  The VAD loop then uses a tighter silence
+        window so endpointing latency drops for fully-formed prompts without
+        affecting users mid-sentence.
+
+        The hint is automatically cleared when the next utterance starts.
+        """
+        self._question_complete_hint = bool(hint)
+
     def _required_silence_blocks(self, speech_started_at, had_mid_utterance_slice: bool = False) -> int:
         """Choose a silence window based on utterance shape.
 
@@ -1383,16 +1461,22 @@ class AudioCapture(QObject):
         short_blocks = self._short_silence_blocks
         if str(getattr(self, "capture_mode", "")).lower() == "system":
             short_blocks = max(short_blocks, self._system_short_silence_blocks)
+        base = self.silence_blocks
         if not had_mid_utterance_slice and elapsed <= self._ultra_short_utterance_max_s:
-            return max(short_blocks, self._ultra_short_silence_blocks)
-        if not had_mid_utterance_slice and elapsed <= self._phrase_utterance_max_s:
-            return max(short_blocks, self._phrase_silence_blocks)
-        if had_mid_utterance_slice and elapsed <= self._short_utterance_max_s:
+            base = max(short_blocks, self._ultra_short_silence_blocks)
+        elif not had_mid_utterance_slice and elapsed <= self._phrase_utterance_max_s:
+            base = max(short_blocks, self._phrase_silence_blocks)
+        elif had_mid_utterance_slice and elapsed <= self._short_utterance_max_s:
             # New chunk is still short — use aggressive post-chunk tail.
-            return min(self.silence_blocks, self._post_chunk_silence_blocks)
-        if elapsed <= self._short_utterance_max_s:
-            return min(self.silence_blocks, short_blocks)
-        return self.silence_blocks
+            base = min(self.silence_blocks, self._post_chunk_silence_blocks)
+        elif elapsed <= self._short_utterance_max_s:
+            base = min(self.silence_blocks, short_blocks)
+        # H-A4: If the interim transcript looks like a complete question, allow
+        # an even tighter tail.  Floor at `_post_chunk_silence_blocks` so we
+        # never go below the configured minimum (typically 500ms ≈ 16 blocks).
+        if getattr(self, "_question_complete_hint", False):
+            return max(self._post_chunk_silence_blocks, min(base, self._short_silence_blocks))
+        return base
 
     def _detect_speech(self, block: np.ndarray, rms: float) -> tuple[bool, str]:
         """Choose the best available local speech detector."""
@@ -1575,10 +1659,18 @@ class AudioCapture(QObject):
         provider = str(getattr(self, "_transcription_provider", "local") or "local").lower()
         if provider != "groq":
             return "local"
-        if getattr(self, "_cloud_stt_session_blocked", False):
-            return "local"
         groq_key = self._groq_api_key()
         failed_key = str(getattr(self, "_cloud_stt_failed_key", "") or "")
+        # M-A6: If a session block was raised due to a bad/missing key but the
+        # user has since configured a *different* key, allow the cloud provider
+        # to be retried instead of permanently downgrading the session.
+        if getattr(self, "_cloud_stt_session_blocked", False):
+            if groq_key and groq_key != failed_key:
+                self._cloud_stt_session_blocked = False
+                self._cloud_stt_unavailable_logged = False
+                logger.info("[Groq STT] API key changed since last failure; re-enabling cloud STT.")
+            else:
+                return "local"
         if failed_key and groq_key and failed_key == groq_key:
             return "local"
         if not groq_key:
@@ -1737,20 +1829,59 @@ class AudioCapture(QObject):
 
             # ── Phase 2: Adaptive Ambient Calibration ─────────────────────────
             # Consume the first N blocks as a silent noise floor sample.
-            if self._ambient_calib_remaining > 0 and not is_speaking and not raw_has_speech:
-                self._ambient_rms_samples.append(rms)
-                self._ambient_calib_remaining -= 1
-                if self._ambient_calib_remaining == 0 and self._ambient_rms_samples:
-                    mean_rms = float(np.mean(self._ambient_rms_samples))
-                    std_rms  = float(np.std(self._ambient_rms_samples))
-                    # Floor = mean + 2σ ensures even a noisy room doesn't false-trigger
-                    self._dynamic_rms_floor = mean_rms + 2.0 * std_rms
+            # H-A2: also enforce a wall-clock deadline so a user who starts
+            # speaking immediately on session start cannot starve calibration
+            # forever (the original gate required `not is_speaking`).
+            if self._ambient_calib_remaining > 0:
+                # Fast-path: when hardware capture is suspended (benchmark injected
+                # audio mode), frames are always-on so we will never collect quiet
+                # samples.  Immediately apply the fallback floor and mark done so
+                # we stop paying the deadline timeout and don't emit a WARNING.
+                if getattr(self, "_hardware_capture_suspended", False):
+                    self._dynamic_rms_floor = float(self._ambient_calib_fallback_floor)
+                    self._ambient_calib_remaining = 0
                     logger.info(
-                        f"[Phase2 VAD] Ambient calibration done — "
-                        f"floor={self._dynamic_rms_floor:.5f} "
-                        f"(mean={mean_rms:.5f}, std={std_rms:.5f})"
+                        "[Phase2 VAD] Injected-audio mode — using preset floor=%.5f",
+                        self._dynamic_rms_floor,
                     )
-                continue  # don't process calibration frames as speech
+                    # Fall through: process this block normally (don't skip).
+                else:
+                    now_ts = time.time()
+                    if self._ambient_calib_started_at == 0.0:
+                        self._ambient_calib_started_at = now_ts
+                    deadline_hit = (
+                        (now_ts - self._ambient_calib_started_at) * 1000.0
+                        >= self._ambient_calib_deadline_ms
+                    )
+                    if not is_speaking and not raw_has_speech:
+                        self._ambient_rms_samples.append(rms)
+                        self._ambient_calib_remaining -= 1
+                    if self._ambient_calib_remaining == 0 or deadline_hit:
+                        if self._ambient_rms_samples:
+                            mean_rms = float(np.mean(self._ambient_rms_samples))
+                            std_rms  = float(np.std(self._ambient_rms_samples))
+                            # Floor = mean + 2σ ensures even a noisy room doesn't false-trigger
+                            self._dynamic_rms_floor = mean_rms + 2.0 * std_rms
+                            logger.info(
+                                f"[Phase2 VAD] Ambient calibration done — "
+                                f"floor={self._dynamic_rms_floor:.5f} "
+                                f"(mean={mean_rms:.5f}, std={std_rms:.5f})"
+                            )
+                        else:
+                            # Deadline elapsed without a single quiet block — fall back
+                            # to a conservative fixed floor so RMS gating is non-zero.
+                            self._dynamic_rms_floor = float(self._ambient_calib_fallback_floor)
+                            logger.warning(
+                                "[Phase2 VAD] Ambient calibration deadline elapsed "
+                                "with no quiet samples; using fallback floor=%.5f",
+                                self._dynamic_rms_floor,
+                            )
+                        self._ambient_calib_remaining = 0
+                    if not is_speaking and not raw_has_speech:
+                        continue  # don't process calibration frames as speech
+                    # If we exited due to deadline-while-speaking, fall through and
+                    # process this block normally so we don't drop the user's words.
+
 
             # Speech detection:
             # - Prefer Silero VAD when available.
@@ -1946,6 +2077,9 @@ class AudioCapture(QObject):
                     utterance_started_at = None
                     utterance_id = ""
                     had_mid_utterance_slice = False
+                    # H-A4: clear question-complete hint between utterances so it
+                    # cannot leak into a new prompt the user is still forming.
+                    self._question_complete_hint = False
                     # Reset session accumulator for the NEXT utterance only after
                     # _emit_accumulated has been called (it clears parts itself).
                     # No reset here — emit_accumulated handles it atomically.
@@ -2350,7 +2484,13 @@ class AudioCapture(QObject):
         transcribe_started_at = time.time()
 
         def _build_wav(buf) -> tuple:
-            """Encode buffer to 16 kHz/16-bit/mono WAV bytes. Returns (wav_bytes, n_samples)."""
+            """Encode buffer to 16 kHz/16-bit/mono WAV bytes.
+
+            Issue #15: Return the *post-resample* sample count and the encoded
+            sample rate so callers can compute audio duration correctly when
+            self.sr != 16_000.
+            Returns (wav_bytes, n_samples, encoded_sr).
+            """
             audio = np.concatenate(buf, axis=0).flatten()
             audio = self._apply_gain_normalization(audio)
             TARGET_SR = 16_000
@@ -2366,7 +2506,7 @@ class AudioCapture(QObject):
                 wf.setframerate(TARGET_SR)
                 pcm = np.clip(audio, -1.0, 1.0)
                 wf.writeframes((pcm * 32767).astype(np.int16).tobytes())
-            return wav_buf.getvalue(), len(audio)
+            return wav_buf.getvalue(), len(audio), TARGET_SR
 
         groq_key = ""
         try:
@@ -2408,7 +2548,7 @@ class AudioCapture(QObject):
             return str(response.json().get("text", "") or "").strip()
 
         try:
-            wav_bytes, n_samples = _build_wav(buffer)
+            wav_bytes, n_samples, encoded_sr = _build_wav(buffer)
 
             if not is_final:
                 # ── Non-final chunk: submit concurrently, store future ───────
@@ -2486,7 +2626,9 @@ class AudioCapture(QObject):
                 )
 
             transcribe_finished_at = time.time()
-            audio_duration_ms = (n_samples / float(max(self.sr, 1))) * 1000.0
+            # Issue #15: n_samples is post-resample, so divide by the *encoded*
+            # sample rate (16 kHz), not the capture self.sr.
+            audio_duration_ms = (n_samples / float(max(encoded_sr, 1))) * 1000.0
             logger.info(
                 "[Groq STT] %d chunk(s) transcribed in %.0fms | model=%s",
                 len(chunk_texts),
@@ -2547,19 +2689,48 @@ class AudioCapture(QObject):
 
     # Known Whisper hallucination patterns — text generated when there is silence or
     # very quiet audio.  These appear consistently across model sizes and languages.
-    _HALL_PATTERNS = [
-        "thank you", "watching", "\u266a", "[music]",
-        "subtitles", "transcribed by", "subscribe",
-        "www.", ".com", "[silence]", "[blank_audio]",
-        "amara.org", "dotsub",
-    ]
+    #
+    # H-A1: Two-tier matching so we don't eat real speech.
+    #   * `_HALL_WHOLE_UTTERANCE_PATTERNS` are matched against the *entire*
+    #     normalised utterance (anchored, punctuation/articles stripped).  A
+    #     50-word answer that contains "thank you" mid-sentence is preserved.
+    #   * `_HALL_HARD_SUBSTRINGS` are URL/tag artefacts that are never legitimate
+    #     in conversational speech and can be matched anywhere.
+    _HALL_WHOLE_UTTERANCE_PATTERNS = (
+        "thank you",
+        "thanks for watching",
+        "thank you for watching",
+        "please subscribe",
+        "subscribe",
+        "subtitles by",
+        "subtitles",
+        "transcribed by",
+    )
+    _HALL_HARD_SUBSTRINGS = (
+        "\u266a", "[music]", "[silence]", "[blank_audio]",
+        "www.", ".com", "amara.org", "dotsub",
+    )
+    # Strip leading/trailing punctuation when comparing whole-utterance matches.
+    _HALL_STRIP_CHARS = " \t\r\n.,!?;:\"'()[]{}-—–…"
 
     def _is_hall(self, t: str) -> bool:
-        """Return True if this segment text matches a known hallucination pattern."""
+        """Return True if this segment text matches a known hallucination pattern.
+
+        Whole-utterance match: the segment must consist (after stripping
+        punctuation/whitespace) of *only* the hallucination phrase.  This
+        preserves legitimate speech that happens to contain the phrase as a
+        substring (e.g. "thank you for that explanation of caching").
+        """
         tl = (t or "").lower().strip()
         if not tl:
             return True
-        return any(pat in tl for pat in self._HALL_PATTERNS)
+        for hard in self._HALL_HARD_SUBSTRINGS:
+            if hard in tl:
+                return True
+        # Normalise: strip outer punctuation and collapse internal whitespace.
+        stripped = tl.strip(self._HALL_STRIP_CHARS)
+        normalised = " ".join(stripped.split())
+        return normalised in self._HALL_WHOLE_UTTERANCE_PATTERNS
 
     def _segment_passes_confidence(self, seg) -> bool:
         """Return True if the segment's confidence metrics look like real speech.

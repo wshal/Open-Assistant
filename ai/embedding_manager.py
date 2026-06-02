@@ -59,6 +59,13 @@ class EmbeddingManager:
             except Exception as e:
                 logger.debug(f"fastembed unavailable: {e}")
 
+            # L-3: Two-stage SentenceTransformer fallback. The first attempt
+            # uses the ONNX runtime backend (fast, no torch dep); only if that
+            # specifically fails do we fall back to the default PyTorch
+            # backend. These are NOT redundant: a user with sentence-
+            # transformers installed but no onnxruntime will hit the second
+            # branch. The first exception is logged at debug so the chain is
+            # visible without spamming a warning on every cold start.
             try:
                 from sentence_transformers import SentenceTransformer
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -69,8 +76,8 @@ class EmbeddingManager:
                 self._embed_fn = lambda x: self._model.encode(x)
                 logger.info("✅ Shared EmbeddingManager loaded via sentence-transformers (ONNX backend)")
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"sentence-transformers ONNX backend unavailable: {e}")
 
             try:
                 from sentence_transformers import SentenceTransformer

@@ -1058,3 +1058,16 @@ class OnboardingWizard(QWidget):
                 "usable": bool(info.get("usable", True)),
             }
         self.app.overlay.standby_view.set_provider_statuses(statuses)
+
+    def closeEvent(self, event):  # noqa: N802 - Qt API
+        # M-5: Join any in-flight provider-test QThread before the wizard is
+        # torn down; otherwise the worker can call back into a destroyed
+        # Python wrapper.
+        try:
+            w = getattr(self, "_provider_test_worker", None)
+            if w is not None and w.isRunning():
+                w.quit()
+                w.wait(2000)
+        except Exception:
+            pass
+        super().closeEvent(event)

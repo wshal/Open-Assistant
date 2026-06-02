@@ -235,6 +235,8 @@ class EmbeddingTier:
         self._persist_lock = threading.Lock()
         self._persist_timer: threading.Timer = None
         self._persist_thread: Optional[threading.Thread] = None
+        # Issue #11: Tracks shutdown so the self-rescheduling timer can stop.
+        self._closed = False
 
         # In-memory index: parallel lists for fast numpy batch cosine similarity
         self._vectors: List[np.ndarray] = []   # each shape (384,) float32
@@ -375,7 +377,15 @@ class EmbeddingTier:
         thread.start()
 
     def _schedule_persist_timer(self, interval: float = 30.0) -> None:
-        """Q18: Periodic background persist every 30s — restarts itself."""
+        """Q18: Periodic background persist every 30s — restarts itself.
+
+        Issue #11: Skip rescheduling once close() has flipped ``_closed``,
+        otherwise the timer chain keeps the process alive in tests and leaks
+        threads across repeated engine creations.
+        """
+        if self._closed:
+            return
+
         def _tick():
             try:
                 self._persist()
@@ -384,6 +394,20 @@ class EmbeddingTier:
         self._persist_timer = threading.Timer(interval, _tick)
         self._persist_timer.daemon = True
         self._persist_timer.start()
+
+    def close(self) -> None:
+        """Issue #11: Cancel the rescheduling timer and flush one last time."""
+        self._closed = True
+        timer = self._persist_timer
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        try:
+            self._persist()
+        except Exception:
+            pass
 
     def _load_persisted(self) -> None:
         try:
@@ -472,15 +496,37 @@ class ShortQueryCache:
             self._embed_worker.start()
 
     def _embed_worker_loop(self) -> None:
+        # Issue #10: Pull get() outside the try so a None sentinel cleanly exits
+        # the loop, and task_done() is only called when get() actually returned
+        # an item (previously a get() that raised would still trigger task_done
+        # and raise ValueError: task_done() called too many times, killing the
+        # worker thread).
         while True:
+            item = self._embed_queue.get()
             try:
-                query, rec = self._embed_queue.get()
+                if item is None:
+                    return  # shutdown sentinel from close()
+                query, rec = item
                 if self._embed:
                     self._embed.add(query, rec)
             except Exception as e:
                 logger.debug(f"Embed indexing error: {e}")
             finally:
                 self._embed_queue.task_done()
+
+    def close(self) -> None:
+        """Issue #11: Stop the embed worker and the EmbeddingTier timer."""
+        q = getattr(self, "_embed_queue", None)
+        if q is not None:
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
+        if self._embed is not None:
+            try:
+                self._embed.close()
+            except Exception:
+                pass
 
     def warmup(self) -> None:
         """Pre-load the embedding model during app warmup — zero cold-start latency."""

@@ -5,6 +5,13 @@ from typing import Any, Optional, List, Dict, Union
 
 from utils.text_utils import normalize_transcript
 
+# ── Prompt injection guard ──────────────────────────────────────────────────
+_MAX_SESSION_CONTEXT_LEN = 2000
+_INJECTION_PATTERN = re.compile(
+    r'(?i)(ignore|disregard|forget|override).{0,40}(previous|prior|above|instruction|system|prompt)',
+)
+
+
 
 class ContextRanker:
     """
@@ -242,6 +249,23 @@ For MCQ: state correct answer first.""",
         )
         return len(q.split()) <= 10 and any(marker in q for marker in generic_markers)
 
+    @staticmethod
+    def _sanitize_session_context(ctx: str) -> str:
+        """Sanitize user-supplied session context before injecting into system prompt.
+
+        Prevents prompt injection via the session_context field (e.g., 'ignore
+        all previous instructions...'). Injection patterns are replaced with a
+        placeholder; the context is capped at _MAX_SESSION_CONTEXT_LEN chars.
+        """
+        ctx = (ctx or "").strip()[:_MAX_SESSION_CONTEXT_LEN]
+        if _INJECTION_PATTERN.search(ctx):
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Potential prompt injection detected in session_context — sanitizing."
+            )
+            ctx = _INJECTION_PATTERN.sub("[filtered]", ctx)
+        return ctx
+
     def system(self, mode=None, session_context: str = "") -> str:
         """Build the system prompt, optionally prepended with the user's session context.
 
@@ -259,11 +283,11 @@ For MCQ: state correct answer first.""",
         if mode and hasattr(mode, "custom_instructions") and mode.custom_instructions:
             base += f"\n\nCustom: {mode.custom_instructions}"
 
-        if session_context:
+        safe_ctx = self._sanitize_session_context(session_context)
+        if safe_ctx:
             return (
-                f"[SESSION CONTEXT — FOLLOW THESE INSTRUCTIONS ABOVE ALL ELSE]\n"
-                f"{session_context}\n\n"
-                f"---\n"
+                f"[CONTEXT]\n"
+                f"{safe_ctx}\n\n"
                 f"{base}"
             )
         return base
@@ -322,24 +346,18 @@ For MCQ: state correct answer first.""",
         if origin == "speech":
             if suppress_session_context:
                 parts.append(
-                    "[TASK]\nAnswer the spoken question directly from general knowledge. "
-                    "If the transcript has minor ASR mistakes, silently correct them before answering. "
-                    "Do not mention audio context, ASR, transcription mistakes, or that you corrected the wording."
+                    "[TASK]\nAnswer the spoken question directly. "
+                    "Silently correct any ASR errors in the transcript."
                 )
             else:
-                # Only include the screen-reference note when there is actual screen content;
-                # omitting it when screen is empty prevents the LLM from echoing the phrase
-                # "captured screen/OCR context" as a literal answer artefact.
                 has_screen = bool((screen or "").strip())
                 screen_ref = (
-                    "If you refer to anything visible, describe it as captured screen/OCR context rather than direct screen access. "
+                    "Describe visible content as captured screen/OCR context. "
                     if has_screen else ""
                 )
                 parts.append(
-                    "[TASK]\nAnswer the spoken question using the live session context when it is relevant. "
-                    f"{screen_ref}"
-                    "If the transcript has minor ASR mistakes, silently correct them before answering. "
-                    "Do not mention audio context, ASR, transcription mistakes, or that you corrected the wording unless the user asks."
+                    f"[TASK]\nAnswer using the live session context when relevant. "
+                    f"{screen_ref}Silently correct any ASR errors."
                 )
         elif origin == "screen_analysis":
             parts.append(
@@ -377,8 +395,11 @@ For MCQ: state correct answer first.""",
 
         # P3.3: Inject command output so AI can interpret and explain it
         if action_output:
+            # Sanitize: strip control characters that could confuse the model or
+            # be used in agentic loop injection; relabel as [TOOL RESULT].
+            safe_output = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', action_output)[:2000]
             parts.append(
-                f"[COMMAND OUTPUT — executed on user's machine]\n{action_output[:3000]}"
+                f"[TOOL RESULT]\n{safe_output}"
             )
 
         # P2.4: Inject long-term memory before the query if available

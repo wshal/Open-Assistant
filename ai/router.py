@@ -66,9 +66,12 @@ class SmartRouter:
             return p, self._selected_tier(p, tier or "fast")
 
         if self.strategy == "roundrobin":
+            # Issue #12: Index first, then advance, so the very first request
+            # actually goes to names[0] instead of names[1] (the previous code
+            # incremented before indexing and skipped the first provider).
             names = list(avail.keys())
+            provider = avail[names[self._rr % len(names)]]
             self._rr = (self._rr + 1) % len(names)
-            provider = avail[names[self._rr]]
             return provider, self._selected_tier(provider, tier or "balanced")
 
         if self.strategy == "fallback":

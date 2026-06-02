@@ -37,8 +37,8 @@ class CohereProvider(BaseProvider):
             tok = (r.usage.tokens.input_tokens + r.usage.tokens.output_tokens) if r.usage else len(text) // 4
             self.stats.record(tok, time.time() - t0)
             return text
-        except Exception as e:
-            self.stats.errors += 1
+        except Exception:
+            self.stats.record_error()
             raise
 
     async def generate_stream(self, system: str, user: str, tier: str = None) -> AsyncGenerator[str, None]:
@@ -59,6 +59,6 @@ class CohereProvider(BaseProvider):
                         tok += 1
                         yield c
             self.stats.record(tok, time.time() - t0)
-        except Exception as e:
-            self.stats.errors += 1
+        except Exception:
+            self.stats.record_error()
             raise

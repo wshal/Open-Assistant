@@ -3,6 +3,7 @@ Stealth Input Simulator — v5.1 (Direct-to-IDE Injection).
 Uses Windows WM_CHAR messages for background-safe, stealthy typing.
 """
 
+import sys
 import time
 import ctypes
 import threading
@@ -23,9 +24,19 @@ class InputSimulator:
         self.typing_speed = config.get("stealth.typing_delay_ms", 20) / 1000.0
         self._is_typing = False
         self._stop_requested = False
+        self._available = sys.platform == "win32"
+        if not self._available:
+            logger.info(
+                f"Sim: stealth typing disabled (non-Windows platform: {sys.platform})"
+            )
 
     def type_text(self, text: str, target_hwnd: int):
         """Asynchronously types text into a specific window HWND."""
+        if not self._available:
+            logger.warning(
+                f"Sim: type_text() ignored — not supported on {sys.platform}"
+            )
+            return
         if not target_hwnd or not text:
             logger.warning("Sim: No target window or text provided.")
             return
@@ -88,4 +99,6 @@ class InputSimulator:
     @staticmethod
     def get_foreground_window() -> int:
         """Helper to capture the current active window handle."""
+        if sys.platform != "win32":
+            return 0
         return ctypes.windll.user32.GetForegroundWindow()

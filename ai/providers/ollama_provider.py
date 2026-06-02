@@ -5,6 +5,7 @@ import base64
 import json
 import time
 from typing import AsyncGenerator, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -12,6 +13,12 @@ from ai.providers.base import BaseProvider
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+# Issue #8: Hosts considered local for Ollama. Anything else requires explicit opt-in
+# via ai.providers.ollama.allow_remote_endpoint=true so prompts/screenshots can't be
+# silently exfiltrated to a remote host.
+_OLLAMA_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+_OLLAMA_DEFAULT_ENDPOINT = "http://localhost:11434"
 
 
 class OllamaProvider(BaseProvider):
@@ -35,18 +42,8 @@ class OllamaProvider(BaseProvider):
 
     def __init__(self, config):
         super().__init__("ollama", config)
-        self.endpoint = (
-            self.pcfg.get("endpoint")
-            or self.config.get_api_key("ollama")
-            or "http://localhost:11434"
-        )
-        if not self.endpoint.startswith("http"):
-            logger.warning(
-                f"  Ollama endpoint looks invalid: {self.endpoint!r}. "
-                "Falling back to http://localhost:11434"
-            )
-            self.endpoint = "http://localhost:11434"
-
+        # Initialize all instance attributes BEFORE calling _validated_endpoint
+        # so that no attribute is ever missing regardless of call order.
         self.enabled = True  # Assume available until proven otherwise
         self._state = self.STATE_UNKNOWN
         self._available_models = []
@@ -56,15 +53,61 @@ class OllamaProvider(BaseProvider):
         self._resolved_vision_model = ""
         self._session: Optional[aiohttp.ClientSession] = None
         self._connector: Optional[aiohttp.TCPConnector] = None
+        self._session_lock: asyncio.Lock = asyncio.Lock()  # Prevents concurrent session creation
+
+        raw_endpoint = (
+            self.pcfg.get("endpoint")
+            or self.config.get_api_key("ollama")
+            or _OLLAMA_DEFAULT_ENDPOINT
+        )
+        # Issue #8: Validate scheme, netloc, and host. Remote endpoints are blocked
+        # unless ai.providers.ollama.allow_remote_endpoint is explicitly set to true.
+        self.endpoint = self._validated_endpoint(raw_endpoint)
+
+    def _validated_endpoint(self, endpoint: str) -> str:
+        raw = (endpoint or _OLLAMA_DEFAULT_ENDPOINT).strip().rstrip("/")
+        try:
+            parsed = urlparse(raw)
+        except Exception:
+            logger.warning(
+                f"  Ollama endpoint could not be parsed: {raw!r}. "
+                f"Falling back to {_OLLAMA_DEFAULT_ENDPOINT}"
+            )
+            return _OLLAMA_DEFAULT_ENDPOINT
+
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            logger.warning(
+                f"  Ollama endpoint has unsupported scheme or empty host: {raw!r}. "
+                f"Falling back to {_OLLAMA_DEFAULT_ENDPOINT}"
+            )
+            return _OLLAMA_DEFAULT_ENDPOINT
+
+        host = (parsed.hostname or "").lower()
+        allow_remote = bool(
+            self.config.get("ai.providers.ollama.allow_remote_endpoint", False)
+        )
+        if host not in _OLLAMA_LOCAL_HOSTS and not allow_remote:
+            logger.warning(
+                f"  Ollama remote endpoint blocked (host={host!r}). "
+                "Set ai.providers.ollama.allow_remote_endpoint=true to opt in. "
+                f"Falling back to {_OLLAMA_DEFAULT_ENDPOINT}"
+            )
+            return _OLLAMA_DEFAULT_ENDPOINT
+        return raw
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Reuse a single aiohttp session to avoid per-request TCP overhead."""
-        if self._session and not self._session.closed:
+        """Reuse a single aiohttp session to avoid per-request TCP overhead.
+
+        Lock prevents two concurrent callers from each finding self._session=None
+        and both creating a new session, which would leak the overwritten one.
+        """
+        async with self._session_lock:
+            if self._session and not self._session.closed:
+                return self._session
+            if self._connector is None or self._connector.closed:
+                self._connector = aiohttp.TCPConnector(keepalive_timeout=30, limit=8)
+            self._session = aiohttp.ClientSession(connector=self._connector)
             return self._session
-        if self._connector is None or self._connector.closed:
-            self._connector = aiohttp.TCPConnector(keepalive_timeout=30, limit=8)
-        self._session = aiohttp.ClientSession(connector=self._connector)
-        return self._session
 
     async def close(self):
         """Best-effort cleanup (optional)."""
@@ -457,7 +500,9 @@ class OllamaProvider(BaseProvider):
                     tok += 1
                     yield chunk
 
-        self.stats.record(tok, time.time() - t0)
+            t_end = time.time()  # Capture INSIDE context manager for accurate latency
+
+        self.stats.record(tok, t_end - t0)
 
     async def health_check(self) -> bool:
         """Quick health check."""
@@ -575,6 +620,8 @@ class OllamaProvider(BaseProvider):
 
         last_error = None
         for idx, m in enumerate(attempt_models):
+            tok = 0                   # Reset per attempt so fallback stats are accurate
+            t0_attempt = time.time()
             async with session.post(
                 f"{self.endpoint}/api/chat",
                 json={
@@ -611,10 +658,12 @@ class OllamaProvider(BaseProvider):
                         tok += 1
                         yield chunk
 
-                self.stats.record(tok, time.time() - t0)
-                if m != model:
-                    self._resolved_vision_model = m
-                    logger.warning(f"  Ollama: downgraded vision model -> {m}")
-                return
+                t_end_attempt = time.time()  # Capture INSIDE context manager for accurate latency
+
+            self.stats.record(tok, t_end_attempt - t0_attempt)
+            if m != model:
+                self._resolved_vision_model = m
+                logger.warning(f"  Ollama: downgraded vision model -> {m}")
+            return
 
         raise last_error or Exception("Ollama vision stream failed")

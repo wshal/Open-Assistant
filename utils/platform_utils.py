@@ -244,6 +244,10 @@ class ProcessUtils:
     """Process and system utilities."""
 
     @staticmethod
+    def is_openassist_window_title(title: str) -> bool:
+        return "openassist" in str(title or "").replace(" ", "").lower()
+
+    @staticmethod
     def get_active_window_title() -> str:
         """Get the title of the currently active/focused window."""
         try:
@@ -290,6 +294,8 @@ class ProcessUtils:
         Prefer get_active_client_rect() for OCR — it strips the chrome.
         """
         try:
+            if ProcessUtils.is_openassist_window_title(ProcessUtils.get_active_window_title()):
+                return None
             if PlatformInfo.IS_WINDOWS:
                 import ctypes
 
@@ -318,6 +324,36 @@ class ProcessUtils:
         return None
 
     @staticmethod
+    def get_window_behind(hwnd: int) -> int:
+        """Return the first visible non-OpenAssist window below hwnd in Z-order."""
+        if not PlatformInfo.IS_WINDOWS or not hwnd:
+            return 0
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            GW_HWNDNEXT = 2
+
+            def _title_for(window):
+                length = user32.GetWindowTextLengthW(window)
+                if length <= 0:
+                    return ""
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(window, buf, length + 1)
+                return buf.value
+
+            current = user32.GetWindow(hwnd, GW_HWNDNEXT)
+            while current:
+                if user32.IsWindowVisible(current):
+                    title = _title_for(current)
+                    if title and not ProcessUtils.is_openassist_window_title(title):
+                        return int(current)
+                current = user32.GetWindow(current, GW_HWNDNEXT)
+        except Exception as exc:
+            logger.debug("get_window_behind failed: %s", exc)
+        return 0
+
+    @staticmethod
     def get_active_client_rect() -> Optional[Tuple[int, int, int, int]]:
         """Get (x, y, width, height) of the active window *content* region.
 
@@ -336,6 +372,9 @@ class ProcessUtils:
         Falls back to get_active_window_rect() on any error so nothing breaks.
         Non-Windows platforms return the outer window rect (no chrome info).
         """
+        if ProcessUtils.is_openassist_window_title(ProcessUtils.get_active_window_title()):
+            return None
+
         if not PlatformInfo.IS_WINDOWS:
             return ProcessUtils.get_active_window_rect()
 

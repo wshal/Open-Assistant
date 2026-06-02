@@ -1,6 +1,13 @@
 import json
+from pathlib import Path
 
-data = json.loads(open(r'C:\Users\Vishal\Desktop\Open Assist\benchmarks\audio_asr_matrix_sweep.json').read())
+# Issue #18: Resolve paths relative to this file so the script works on any
+# checkout. The previous absolute Windows path failed on every other machine.
+_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_SWEEP = _ROOT / "benchmarks" / "audio_asr_matrix_sweep.json"
+_FIXTURE_DIR = _ROOT / "tests" / "fixtures" / "audio_ground_truth"
+
+data = json.loads(_DEFAULT_SWEEP.read_text(encoding="utf-8"))
 
 # Focus: fixtures that had missing-intro-word pattern
 target_fixtures = [
@@ -38,12 +45,13 @@ for run in data['runs']:
 
 # Load expected transcripts
 import os, json as json2
-fixture_dir = r'C:\Users\Vishal\Desktop\Open Assist\tests\fixtures\audio_ground_truth'
-for f in os.listdir(fixture_dir):
-    if f.endswith('.wav.json'):
-        meta = json2.loads(open(os.path.join(fixture_dir, f)).read())
-        fn = f.replace('.json', '')
-        fixture_ground_truth[fn] = meta.get('expected_transcript', meta.get('transcript', ''))
+fixture_dir = _FIXTURE_DIR
+if fixture_dir.exists():
+    for f in os.listdir(fixture_dir):
+        if f.endswith('.wav.json'):
+            meta = json2.loads((fixture_dir / f).read_text(encoding="utf-8"))
+            fn = f.replace('.json', '')
+            fixture_ground_truth[fn] = meta.get('expected_transcript', meta.get('transcript', ''))
 
 print("=== BEFORE/AFTER: Missing-Intro-Word Fixtures ===\n")
 print("NOTE: Previous run (sweep 2) transcripts shown for comparison where known\n")

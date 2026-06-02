@@ -145,21 +145,34 @@ class ContextStore:
             self._data = {"presets": {}, "last_context": ""}
 
     def _persist(self):
+        # Issue #23: Atomic write. A crash or kill during write_text() leaves a
+        # truncated JSON file, and _load() then silently reverts to defaults,
+        # wiping the user's saved presets. Use tmp + os.replace().
         try:
-            self._path.write_text(
-                json.dumps(self._data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            import os as _os
+
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(self._data, indent=2, ensure_ascii=False)
+            tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp_path.write_text(payload, encoding="utf-8")
+            _os.replace(str(tmp_path), str(self._path))
         except Exception as e:
             logger.error(f"ContextStore save failed: {e}")
 
 
 # Module-level singleton — shared across all callers
 _store: ContextStore | None = None
+_store_lock = threading.Lock()
 
 
 def get_store() -> ContextStore:
+    # Issue #22: Double-checked init guarded by a module-level lock so two
+    # concurrent callers (UI + background) can't construct two stores and race
+    # their _load()/_persist() against each other.
     global _store
-    if _store is None:
-        _store = ContextStore()
-    return _store
+    if _store is not None:
+        return _store
+    with _store_lock:
+        if _store is None:
+            _store = ContextStore()
+        return _store

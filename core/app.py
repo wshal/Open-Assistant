@@ -56,6 +56,7 @@ logger = setup_logger(__name__)
 
 class OpenAssistApp(QObject):
     warmup_status_update = pyqtSignal(str, int, bool)
+    run_on_ui_thread = pyqtSignal(object)
 
     def __init__(self, config: Config, mini_mode: bool = False):
         super().__init__()
@@ -202,6 +203,14 @@ class OpenAssistApp(QObject):
         self.ai.response_complete.connect(self._on_response_complete)
         self.ai.error_occurred.connect(self._on_ai_error)
         self.state.stealth_changed.connect(lambda _: self._apply_ui_only())
+        self.run_on_ui_thread.connect(lambda callback: callback())
+
+    def _call_on_ui_thread(self, callback) -> None:
+        """Execute a callable on Qt's UI thread."""
+        try:
+            self.run_on_ui_thread.emit(callback)
+        except Exception:
+            logger.debug("Failed to schedule UI-thread callback", exc_info=True)
 
     def _on_response_complete(self, full_text: str):
         """Mark when response generation completes and is ready to display."""
@@ -445,6 +454,7 @@ class OpenAssistApp(QObject):
             provider or "",
         )
 
+
     def _carry_forward_incomplete_audio_query(self, text: str) -> bool:
         cleaned = " ".join((text or "").split()).strip()
         if not cleaned:
@@ -519,7 +529,46 @@ class OpenAssistApp(QObject):
         """Pull persisted config back into AppState before async subsystems catch up."""
         self.state.mode = self.config.get("ai.mode", "general")
         self.state.audio_source = self.config.get("capture.audio.mode", "system")
+        self.state.is_muted = bool(self.config.get("capture.audio.muted", False))
         self.state.is_stealth = self.config.get("stealth.enabled", True)
+        screen_enabled = bool(self.config.get("capture.screen.enabled", True))
+        if hasattr(self, "screen") and self.screen and hasattr(self.screen, "set_enabled"):
+            self.screen.set_enabled(screen_enabled)
+        if hasattr(self, "overlay") and self.overlay and hasattr(self.overlay, "update_vision_state"):
+            self.overlay.update_vision_state(reset_to_master=False)
+
+    @staticmethod
+    def _looks_like_explicit_screen_request(text: str) -> bool:
+        """True when a typed/manual prompt explicitly asks to inspect the screen."""
+        q = " ".join((text or "").lower().split())
+        if not q:
+            return False
+        screen_terms = (
+            "screen",
+            "screenshot",
+            "current code",
+            "code on the screen",
+            "visible code",
+            "this code",
+            "attached screenshot",
+            "shown in the screenshot",
+            "present on the screen",
+        )
+        action_terms = (
+            "analyze",
+            "analyse",
+            "read",
+            "look",
+            "inspect",
+            "explain",
+            "output",
+            "run",
+            "result",
+            "what does",
+            "what is",
+            "give me",
+        )
+        return any(term in q for term in screen_terms) and any(term in q for term in action_terms)
 
     def _poll_nexus_context(self):
         """Polls environmental signals for the ContextNexus."""
@@ -779,6 +828,10 @@ class OpenAssistApp(QObject):
         if hasattr(self.ai, "detector") and hasattr(self.ai.detector, "learn_from_query"):
             self.ai.detector.learn_from_query(q)
 
+        if s == "manual" and c is None and self.session_active and OpenAssistApp._looks_like_explicit_screen_request(q):
+            self.analyze_current_screen(query_override=q)
+            return
+
         # Background session-triggered queries should never outlive the session.
         if s in {"speech", "auto"} and not self.session_active:
             return
@@ -811,6 +864,12 @@ class OpenAssistApp(QObject):
         # SNAP-LOCK: Capture target window HWND at moment of query
         if s in ["manual", "speech", "quick"]:
             hwnd = self.simulator.get_foreground_window()
+            try:
+                title = ProcessUtils.get_active_window_title()
+                if hwnd and title and "OpenAssist" in title and hasattr(ProcessUtils, "get_window_behind"):
+                    hwnd = ProcessUtils.get_window_behind(hwnd) or hwnd
+            except Exception:
+                pass
             if hwnd:
                 self.state.target_window_id = hwnd
                 logger.info(f"🔒 Snap-Lock: Target set to HWND {hwnd}")
@@ -917,6 +976,7 @@ class OpenAssistApp(QObject):
                     sc = ""
                     sc_hash = ""
                     au = self.audio.get_transcript()
+                    request_metadata.setdefault("suppress_screen_context", True)
                     logger.debug("[Vision OFF] Screen capture skipped — AI using audio-only context")
                 else:
                     # Fire both concurrently — capture_context is a coroutine,
@@ -1024,6 +1084,13 @@ class OpenAssistApp(QObject):
                 request_metadata["long_term_memory"] = memory_ctx
 
             snapshot = {} if isolate_context else self.nexus.get_snapshot()
+            if (
+                not isolate_context
+                and request_metadata.get("suppress_screen_context")
+                and isinstance(snapshot, dict)
+            ):
+                snapshot = dict(snapshot)
+                snapshot["latest_ocr"] = ""
             if request_epoch != self._generation_epoch:
                 return
             await self.ai.generate_response(
@@ -1169,7 +1236,7 @@ class OpenAssistApp(QObject):
             # Use a green-ish info toast (reuse the toast widget with a positive message)
             pass  # update_transcript is sufficient
 
-    def analyze_current_screen(self):
+    def analyze_current_screen(self, query_override: str = ""):
         if not self.session_active:
             self.start_new_session()
             return
@@ -1182,6 +1249,8 @@ class OpenAssistApp(QObject):
             self.overlay.set_analysis_provider_badge(pending=True)
         self._screen_analysis_pending = True
         request_epoch = self._generation_epoch
+        query_override_text = " ".join((query_override or "").split()).strip()
+        logger.info("[AnalyzeScreen] Manual screen analysis requested")
 
         async def _capture_and_analyze():
             if request_epoch != self._generation_epoch:
@@ -1191,14 +1260,45 @@ class OpenAssistApp(QObject):
                 return
             if not image_bytes:
                 self._screen_analysis_pending = False
-                self.overlay.update_transcript("Screen capture failed.")
-                if hasattr(self.overlay, "set_analysis_provider_badge"):
-                    self.overlay.set_analysis_provider_badge()
+                OpenAssistApp._call_on_ui_thread(
+                    self,
+                    lambda: (
+                        self.overlay.update_transcript("Screen capture failed."),
+                        self.overlay.set_analysis_provider_badge()
+                        if hasattr(self.overlay, "set_analysis_provider_badge")
+                        else None,
+                    ),
+                )
                 return
+            logger.info("[AnalyzeScreen] Captured screenshot bytes=%d", len(image_bytes))
 
             audio_text = self.audio.get_transcript()
             snapshot = self.nexus.get_snapshot()
             ocr_task = asyncio.create_task(self.screen.extract_text_from_image_bytes(image_bytes))
+            fallback_query = query_override_text or (
+                "Analyze the current screen and answer using the visible content "
+                "and live session context."
+            )
+            query = fallback_query
+            self._last_query = fallback_query
+
+            def _surface_analysis_failure(message: str, detail: str = "") -> None:
+                self._screen_analysis_pending = False
+                response = message if not detail else f"{message}\n\n{detail}"
+
+                def _ui_failure():
+                    if hasattr(self.overlay, "set_analysis_provider_badge"):
+                        self.overlay.set_analysis_provider_badge()
+                    if hasattr(self.overlay, "show_error_toast"):
+                        self.overlay.show_error_toast(message)
+                    self.overlay.update_transcript(message, state="error")
+                    if hasattr(self.overlay, "on_complete"):
+                        self.overlay.on_complete(response, query=fallback_query, provider="vision")
+                    if hasattr(self.mini_overlay, "on_complete"):
+                        self.mini_overlay.on_complete(response, query=fallback_query, provider="vision")
+
+                OpenAssistApp._call_on_ui_thread(self, _ui_failure)
+
             try:
                 # P0: Start vision immediately (don't block on OCR).
                 # We only use OCR if it's ready fast; otherwise we proceed with
@@ -1246,8 +1346,14 @@ class OpenAssistApp(QObject):
                     # Fallback: the longest non-noise line (often the prompt)
                     return max(cleaned, key=lambda s: len(s), default="")
 
-                task = _extract_task(screen_text)
-                if task:
+                task = "" if query_override_text else _extract_task(screen_text)
+                if query_override_text:
+                    query = (
+                        f"{query_override_text}\n\n"
+                        "Use the provided screenshot as the source of truth. "
+                        "If code is visible, reason from the visible code and provide the output/result."
+                    )
+                elif task:
                     query = (
                         "Complete the on-screen task.\n\n"
                         f"Task: {task}\n\n"
@@ -1283,18 +1389,20 @@ class OpenAssistApp(QObject):
                     if request_epoch != self._generation_epoch:
                         return
                     self._screen_analysis_pending = False
-                    if hasattr(self.overlay, "set_analysis_provider_badge"):
-                        self.overlay.set_analysis_provider_badge()
                     logger.warning(f"Vision analysis exhausted providers: {exc}")
-                    if hasattr(self.overlay, "show_error_toast"):
-                        self.overlay.show_error_toast(
-                            "Image analysis failed — using OCR/text fallback."
+                    def _ui_fallback_notice():
+                        if hasattr(self.overlay, "set_analysis_provider_badge"):
+                            self.overlay.set_analysis_provider_badge()
+                        if hasattr(self.overlay, "show_error_toast"):
+                            self.overlay.show_error_toast(
+                                "Image analysis failed - using OCR/text fallback."
+                            )
+                        self.overlay.update_transcript(
+                            "Screen captured, but image analysis failed. Using OCR/text fallback...",
+                            state="error",
                         )
-                    self.overlay.update_transcript(
-                        "Screen captured, but image analysis failed. Using OCR/text fallback...",
-                        state="error",
-                    )
 
+                    OpenAssistApp._call_on_ui_thread(self, _ui_fallback_notice)
                     # Fall back to OCR/text routing (best-effort).
                     try:
                         screen_text_fb = await asyncio.wait_for(ocr_task, timeout=2.0)
@@ -1302,10 +1410,19 @@ class OpenAssistApp(QObject):
                         screen_text_fb = ""
                     if screen_text_fb:
                         self.nexus.push("screen", screen_text_fb)
-                    self.generate_response(
-                        query,
-                        "screen_analysis",
-                        {"screen": screen_text_fb, "audio": audio_text},
+                    if not screen_text_fb.strip():
+                        _surface_analysis_failure(
+                            "Screen captured, but analysis could not read it.",
+                            "No vision provider completed successfully, and OCR is unavailable or returned no text. Check your vision provider settings or install the missing WinRT OCR runtime dependency.",
+                        )
+                        return
+                    OpenAssistApp._call_on_ui_thread(
+                        self,
+                        lambda q=query, text=screen_text_fb, audio=audio_text: self.generate_response(
+                            q,
+                            "screen_analysis",
+                            {"screen": text, "audio": audio},
+                        ),
                     )
                     return
             except Exception:
@@ -1318,10 +1435,19 @@ class OpenAssistApp(QObject):
                     screen_text = ""
                 if screen_text:
                     self.nexus.push("screen", screen_text)
-                self.generate_response(
-                    query if "query" in locals() else "Analyze the current screen and answer using the visible content and live session context.",
-                    "screen_analysis",
-                    {"screen": screen_text, "audio": audio_text},
+                if not screen_text.strip():
+                    _surface_analysis_failure(
+                        "Screen captured, but analysis could not read it.",
+                        "The screenshot was captured, but both image analysis and OCR fallback failed before producing usable screen text.",
+                    )
+                    return
+                OpenAssistApp._call_on_ui_thread(
+                    self,
+                    lambda q=query, text=screen_text, audio=audio_text: self.generate_response(
+                        q,
+                        "screen_analysis",
+                        {"screen": text, "audio": audio},
+                    ),
                 )
 
         asyncio.run_coroutine_threadsafe(_capture_and_analyze(), self.loop)
@@ -1394,8 +1520,16 @@ class OpenAssistApp(QObject):
             self._start_auto_mode()
 
     def toggle_audio(self):
+        config = getattr(self, "config", None)
         muted = self.audio.toggle()
         self.state.is_muted = muted
+        if config is not None:
+            self.config.set("capture.audio.muted", muted)
+        if config is not None and hasattr(self.config, "save"):
+            try:
+                self.config.save()
+            except Exception as e:
+                logger.debug(f"Audio mute config save skipped: {e}")
 
     def scroll_up(self):
         if (
@@ -1591,13 +1725,16 @@ class OpenAssistApp(QObject):
         self.ai.cancel()
         self.nexus.clear()
         self.history.start_new_session()
-        self.state.is_muted = False
+        audio_enabled = bool(self.config.get("capture.audio.enabled", True))
+        self.state.is_muted = bool(self.config.get("capture.audio.muted", False))
         self._screen_analysis_pending = False
         self.audio.clear()
         if hasattr(self.audio, "set_trace_context"):
             self.audio.set_trace_context(session_id, session_start_time)
         audio_ready = True
-        if hasattr(self.audio, "ensure_session_ready"):
+        if not audio_enabled:
+            logger.info("[%s] Audio capture is disabled; starting session with mic off.", session_id)
+        elif hasattr(self.audio, "ensure_session_ready"):
             audio_start = time.time()
             audio_ready = bool(self.audio.ensure_session_ready())
             audio_elapsed = (time.time() - audio_start) * 1000
@@ -2150,6 +2287,14 @@ class OpenAssistApp(QObject):
                 except Exception as e:
                     logger.debug("Intent classifier warmup skipped: %s", e)
                 self.ai.ensure_health_monitor(self.loop)
+                # Opportunistically pre-warm Groq's TCP/TLS connection so the
+                # first real user prompt may hit an already-open socket. READY
+                # does not wait for this. Periodic keepalive is config-gated
+                # because each ping is still a Groq API request.
+                if hasattr(self.ai, "warm_groq_connection"):
+                    self.ai.warm_groq_connection(self.loop)
+                if hasattr(self.ai, "start_groq_keepalive"):
+                    self.ai.start_groq_keepalive(self.loop)
                 asyncio.run_coroutine_threadsafe(
                     self._continuous_capture_loop(), self.loop
                 )

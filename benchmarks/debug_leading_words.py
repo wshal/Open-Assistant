@@ -5,7 +5,12 @@ and print timestamps + text for each segment to see exactly
 what Whisper is doing at the start.
 """
 import sys, os, wave, numpy as np, time
-sys.path.insert(0, r'C:\Users\Vishal\Desktop\Open Assist')
+from pathlib import Path
+
+# L-5: Repo-relative paths so this script works on any developer's machine,
+# not only Windows under C:\Users\Vishal\Desktop\Open Assist.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT))
 
 from capture.audio import AudioCapture
 from core.config import Config
@@ -14,7 +19,7 @@ cfg = Config()
 cap = AudioCapture(cfg)
 cap._ensure_whisper_loaded()
 
-FIXTURE_DIR = r'C:\Users\Vishal\Desktop\Open Assist\tests\fixtures\audio_ground_truth'
+FIXTURE_DIR = str(_REPO_ROOT / "tests" / "fixtures" / "audio_ground_truth")
 
 TARGETS = {
     "js_closure_different_values_01.wav":           "what is happening in this javascript closure example and why does each function remember a different value",
