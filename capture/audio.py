@@ -434,6 +434,8 @@ class AudioCapture(QObject):
         self._submitted_final_seq = 0
         self._cloud_stt_session_blocked = False
         self._cloud_stt_failed_key = ""
+        self._groq_http_session = None
+        self._groq_http_session_lock = threading.Lock()
         self._whisper_device = "cpu"
         # H-A4: dynamic endpointing hint — set by interim transcript consumers
         # when the partial transcript already looks like a complete question.
@@ -465,6 +467,35 @@ class AudioCapture(QObject):
                     attr,
                     ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=prefix),
                 )
+
+    def _groq_session(self):
+        """Return a shared HTTP session for Groq STT requests.
+
+        Using a persistent session keeps TCP/TLS warm across transcriptions,
+        which reduces variance and avoids paying connection setup on every
+        chunk.
+        """
+        session = getattr(self, "_groq_http_session", None)
+        if session is not None:
+            return session
+        with self._groq_http_session_lock:
+            session = getattr(self, "_groq_http_session", None)
+            if session is not None:
+                return session
+            try:
+                import requests
+                from requests.adapters import HTTPAdapter
+
+                session = requests.Session()
+                adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0, pool_block=True)
+                session.mount("https://", adapter)
+                session.mount("http://", adapter)
+                self._groq_http_session = session
+            except Exception as exc:
+                logger.debug("Audio: failed to create Groq HTTP session, falling back to one-shot requests: %s", exc)
+                self._groq_http_session = None
+                return None
+        return self._groq_http_session
 
     def _on_state_mute_changed(self, muted: bool):
         logger.debug(f"Audio: State sync -> Muted={muted}")
@@ -752,6 +783,14 @@ class AudioCapture(QObject):
                     logger.debug("Audio: error shutting down %s: %s", _pool_attr, _e)
                 finally:
                     setattr(self, _pool_attr, None)
+        session = getattr(self, "_groq_http_session", None)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+            finally:
+                self._groq_http_session = None
 
         logger.info("🎙️ Audio Capture Stopped.")
 
@@ -2530,16 +2569,14 @@ class AudioCapture(QObject):
 
         def _call_groq(wav_bytes: bytes) -> str:
             """POST wav_bytes to Groq and return transcript text (empty on error)."""
-            import requests
-
             data = {"model": _groq_stt_model}
             if _language:
                 data["language"] = _language
-            response = requests.post(
+            session = self._groq_session()
+            request_fn = session.post if session is not None else __import__("requests").post
+            response = request_fn(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={
-                    "Authorization": f"Bearer {groq_key}",
-                },
+                headers={"Authorization": f"Bearer {groq_key}"},
                 data=data,
                 files={"file": ("audio.wav", wav_bytes, "audio/wav")},
                 timeout=(min(2.0, _groq_stt_timeout_s), _groq_stt_timeout_s),

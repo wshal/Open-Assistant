@@ -1690,6 +1690,8 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         app._auto_interim_pending_query = "half-heard question"
         app._auto_final_pending_query = "pending open-ended prompt"
         app._pending_incomplete_audio_query = "incomplete carry-forward"
+        app.ai._session_context = "stale session context"
+        app.ai.set_session_context = lambda ctx: setattr(app.ai, "_session_context", ctx)
         app.overlay.response_area = SimpleNamespace(clear=lambda: None)
 
         OpenAssistApp.reset_benchmark_fixture_runtime(app)
@@ -1698,6 +1700,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(app._auto_interim_pending_query, "")
         self.assertEqual(app._auto_final_pending_query, "")
         self.assertEqual(app._pending_incomplete_audio_query, "")
+        self.assertEqual(app.ai._session_context, "")
 
     def test_reset_benchmark_fixture_runtime_clears_pending_audio_followup_state(self):
         app = self._build_app()

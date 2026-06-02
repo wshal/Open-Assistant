@@ -922,6 +922,14 @@ class AIEngine(QObject):
                 _mode_arg,
                 session_context="" if request_metadata.get("suppress_session_context") else getattr(self, "_session_context", ""),
             )
+            if request_metadata.get("benchmark_auto_mode"):
+                sys_prompt += (
+                    "\n\nBENCHMARK MODE: keep the answer short and tightly scoped. "
+                    "Default to 3-5 bullets or 2-4 sentences, with no long preamble, "
+                    "no repeated restatement of the question, and no extended examples "
+                    "unless the user explicitly asks for them. If the question is open-ended, "
+                    "answer with the minimum useful detail needed to be correct."
+                )
 
             # Strict Output Cap for Cloud Background Fallback
             if request_metadata.get("suppress_history_context"):

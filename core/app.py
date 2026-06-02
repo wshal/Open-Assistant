@@ -1923,6 +1923,8 @@ class OpenAssistApp(QObject):
     def reset_benchmark_fixture_runtime(self):
         """Reset transient per-fixture state without ending the active benchmark session."""
         self.ai.cancel()
+        if hasattr(self.ai, "set_session_context"):
+            self.ai.set_session_context("")
         self._screen_analysis_pending = False
         self._reset_turn_local_state("benchmark-fixture-reset")
         reset_auto_mode_turn_state(self)
