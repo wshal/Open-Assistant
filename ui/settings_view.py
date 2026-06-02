@@ -436,15 +436,6 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
         )
         hdr.addWidget(t)
         hdr.addStretch()
-
-        close_btn = QPushButton("✕")
-        close_btn.setFixedSize(30, 30)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setStyleSheet(
-            "color: #667; border: none; font-size: 18px; background: transparent;"
-        )
-        close_btn.clicked.connect(self.closed.emit)
-        hdr.addWidget(close_btn)
         layout.addLayout(hdr)
 
         self.tabs = QTabWidget()

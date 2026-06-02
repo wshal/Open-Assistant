@@ -536,6 +536,53 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(app.audio.ensure_session_ready_calls, 0)
         self.assertIn("Listening for context...", app.overlay.transcript_updates)
 
+    def test_close_request_from_settings_returns_to_standby(self):
+        app = self._build_app()
+        quits = []
+        app.qt_app.quit = lambda: quits.append(True)
+        app.overlay.current_widget = app.overlay.settings_view
+
+        OpenAssistApp.request_close_surface(app, "overlay")
+
+        self.assertEqual(app.overlay.current_widget, app.overlay.standby_view)
+        self.assertEqual(app.overlay.refresh_calls[-1], {"mode": None, "audio": None})
+        self.assertEqual(quits, [])
+
+    def test_close_request_from_standby_quits_when_idle(self):
+        app = self._build_app()
+        quits = []
+        app.qt_app.quit = lambda: quits.append(True)
+        app.overlay.current_widget = app.overlay.standby_view
+
+        OpenAssistApp.request_close_surface(app, "overlay")
+
+        self.assertEqual(quits, [True])
+
+    def test_close_request_hides_active_surface_during_session(self):
+        app = self._build_app()
+        quits = []
+        app.qt_app.quit = lambda: quits.append(True)
+        app.session_active = True
+        app.overlay.current_widget = app.overlay.standby_view
+
+        OpenAssistApp.request_close_surface(app, "overlay")
+
+        self.assertEqual(app.overlay.hide_calls, 1)
+        self.assertEqual(quits, [])
+
+    def test_close_request_restores_mini_surface_after_settings(self):
+        app = self._build_app(mini_mode=True)
+        quits = []
+        app.qt_app.quit = lambda: quits.append(True)
+        app.overlay.current_widget = app.overlay.settings_view
+
+        OpenAssistApp.request_close_surface(app, "overlay")
+
+        self.assertEqual(app.overlay.current_widget, app.overlay.standby_view)
+        self.assertEqual(app.overlay.hide_calls, 1)
+        self.assertEqual(app.mini_overlay.show_calls, 1)
+        self.assertEqual(quits, [])
+
     def test_run_warms_runtime_without_starting_audio_capture(self):
         app = self._build_app()
         app._async_thread = SimpleNamespace(start=lambda: None)

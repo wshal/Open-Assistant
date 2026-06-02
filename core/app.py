@@ -785,6 +785,52 @@ class OpenAssistApp(QObject):
         view = self._active_view()
         return self._present_window(view, focus=self._hud_focus_enabled())
 
+    def _restore_standby_surface(self, focus: bool = False):
+        """Return to the standby surface for the current HUD mode."""
+        self.overlay.show_standby_view()
+        self.overlay.refresh_standby_state()
+
+        if self.mini_mode:
+            self.overlay.hide()
+            return self._present_window(self.mini_overlay, focus=focus)
+
+        return self._present_window(self.overlay, focus=focus)
+
+    def request_close_surface(self, source: str = "overlay"):
+        """Handle close requests from the overlay or mini HUD.
+
+        Active sessions are hidden to background only when the user is already on
+        the main standby/chat surface. Navigation surfaces always collapse back
+        to standby first so the close button behaves like a context-aware dismiss.
+        """
+        current = getattr(getattr(self.overlay, "stack", None), "currentWidget", lambda: None)()
+        standby = getattr(self.overlay, "standby_view", None)
+        settings = getattr(self.overlay, "settings_view", None)
+        onboarding = getattr(self.overlay, "onboarding_wizard", None)
+        history = getattr(self.overlay, "history_feed", None)
+        timeline = getattr(self.overlay, "timeline_view", None)
+        menu_views = {settings, onboarding, history, timeline}
+
+        if current in menu_views:
+            logger.info("Close request from %s -> returning to standby surface", source)
+            return OpenAssistApp._restore_standby_surface(self, focus=False)
+
+        if getattr(self, "session_active", False):
+            active_view = self._active_view()
+            if active_view and hasattr(active_view, "hide"):
+                logger.info("Close request from %s -> backgrounding active surface", source)
+                active_view.hide()
+            return "hidden"
+
+        if current is not None and current is not standby:
+            logger.info("Close request from %s -> restoring standby surface", source)
+            return OpenAssistApp._restore_standby_surface(self, focus=False)
+
+        logger.info("Close request from %s -> quitting application", source)
+        if hasattr(self.qt_app, "quit"):
+            self.qt_app.quit()
+        return "quit"
+
     def open_settings(self):
         if self.mini_mode:
             self.mini_overlay.hide()

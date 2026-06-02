@@ -175,6 +175,18 @@ class MiniOverlay(QMainWindow):
         )
         self.expand_btn.clicked.connect(self._toggle_expand)
         bl.addWidget(self.expand_btn)
+
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedSize(22, 22)
+        self.close_btn.setToolTip("Close or background the app")
+        self.close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_btn.setStyleSheet(
+            "QPushButton { background: rgba(255,255,255,12); color: #cbd5e1; border: none; "
+            "border-radius: 11px; font-size: 11px; padding: 0px; margin: 0px; } "
+            "QPushButton:hover { background: rgba(248,113,113,35); color: #fecaca; }"
+        )
+        self.close_btn.clicked.connect(self._request_close)
+        bl.addWidget(self.close_btn)
         self.ml.addWidget(self.bar)
 
         from ui.markdown_renderer import MarkdownRenderer
@@ -222,6 +234,10 @@ class MiniOverlay(QMainWindow):
         _, _, entry = self.app.history.get_state()
         if entry and entry.get("response"):
             self.on_complete(entry.get("response", ""), entry.get("query", ""))
+
+    def _request_close(self):
+        if hasattr(self.app, "request_close_surface"):
+            self.app.request_close_surface("mini")
 
     def _send(self):
         q = self.input.text().strip()
@@ -697,6 +713,16 @@ class MiniOverlay(QMainWindow):
 
     def mouseReleaseEvent(self, e):
         self._drag = False
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            if getattr(self.app, "session_active", False):
+                event.ignore()
+                return
+            self._request_close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _check_gaze(self):
         """Neural UX: Fades the mini-overlay if mouse is near/over it.

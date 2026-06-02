@@ -349,10 +349,15 @@ class OverlayWindow(QMainWindow):
         hl.addWidget(btn_set)
 
         btn_close = QPushButton("✕")
+        btn_close.setToolTip("Close or background the app")
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.setFixedSize(22, 22)
         btn_close.setStyleSheet(
-            "color: #667; border: none; font-size: 14px; background: transparent;"
+            "QPushButton { color: #667; border: none; background: transparent; "
+            "padding: 0px; margin: 0px; font-size: 11px; }"
+            "QPushButton:hover { color: #f87171; }"
         )
-        btn_close.clicked.connect(self.hide)
+        btn_close.clicked.connect(self._request_close)
         hl.addWidget(btn_close)
         box_layout.addWidget(self.header)
 
@@ -1184,21 +1189,41 @@ class OverlayWindow(QMainWindow):
         if hasattr(self.app, "screen") and hasattr(self.app.screen, "_debounce"):
             new_interval = self.app.config.get("capture.screen.interval_ms", 500) / 1000.0
             self.app.screen._debounce = new_interval
-        self.refresh_standby_state()
-        if self._prev_stack_widget is not None:
-            self.stack.setCurrentWidget(self._prev_stack_widget)
+        if hasattr(self.app, "request_close_surface"):
+            self.app.request_close_surface("overlay")
         else:
-            self.stack.setCurrentIndex(self._prev_stack_index)
+            self.show_standby_view()
+            self.refresh_standby_state()
+
+    def _request_close(self):
+        if hasattr(self.app, "request_close_surface"):
+            self.app.request_close_surface("overlay")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            if getattr(self.app, "session_active", False):
+                event.ignore()
+                return
+            self._request_close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _on_onboarding_finished(self):
         """Handle onboarding completion - go to standby."""
-        self.show_standby_view()
-        self.refresh_standby_state()
+        if hasattr(self.app, "request_close_surface"):
+            self.app.request_close_surface("overlay")
+        else:
+            self.show_standby_view()
+            self.refresh_standby_state()
 
     def _on_onboarding_skipped(self):
         """Handle onboarding skip - go to standby."""
-        self.show_standby_view()
-        self.refresh_standby_state()
+        if hasattr(self.app, "request_close_surface"):
+            self.app.request_close_surface("overlay")
+        else:
+            self.show_standby_view()
+            self.refresh_standby_state()
 
     def show_onboarding(self):
         """Show the onboarding wizard, resetting it to step 0."""
