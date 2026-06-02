@@ -1030,6 +1030,13 @@ class OnboardingWizard(QWidget):
             "details": details,
         }
 
+        try:
+            ai = getattr(self.app, "ai", None)
+            if ai and hasattr(ai, "set_provider_health"):
+                ai.set_provider_health(provider_id, bool(success), reason=detail_text, source="onboarding_test")
+        except Exception:
+            pass
+
         if self.wizard_state.get("provider") == provider_id:
             self._apply_provider_test_state(provider_id)
 

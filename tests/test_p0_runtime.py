@@ -3,6 +3,7 @@ import shutil
 import sys
 import unittest
 import os
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch
 from types import SimpleNamespace
@@ -2089,6 +2090,106 @@ class ConfigResetTests(unittest.TestCase):
 
         if config_path.exists():
             config_path.unlink()
+
+
+class ProviderInitTests(unittest.TestCase):
+    def test_init_providers_skips_cloud_providers_without_keys(self):
+        from ai.providers import init_providers
+
+        class FakeProvider:
+            def __init__(self, name):
+                self.name = name
+                self.enabled = True
+
+        class FakeConfig:
+            def get(self, path, default=None):
+                if path == "ai.providers.validate_on_init":
+                    return False
+                if path == "ai.providers.health_check_timeout":
+                    return 1
+                return default
+
+            def get_api_key(self, provider):
+                return ""
+
+        groq_ctor = Mock(side_effect=AssertionError("groq should be skipped"))
+        gemini_ctor = Mock(side_effect=AssertionError("gemini should be skipped"))
+        cerebras_ctor = Mock(side_effect=AssertionError("cerebras should be skipped"))
+        mistral_ctor = Mock(side_effect=AssertionError("mistral should be skipped"))
+        cohere_ctor = Mock(side_effect=AssertionError("cohere should be skipped"))
+        openai_compat_ctor = Mock(side_effect=AssertionError("openai-compat should be skipped"))
+        openai_ctor = Mock(side_effect=AssertionError("openai should be skipped"))
+        anthropic_ctor = Mock(side_effect=AssertionError("anthropic should be skipped"))
+
+        with patch("ai.providers.groq_provider.GroqProvider", groq_ctor), \
+             patch("ai.providers.gemini_provider.GeminiProvider", gemini_ctor), \
+             patch("ai.providers.cerebras_provider.CerebrasProvider", cerebras_ctor), \
+             patch("ai.providers.mistral_provider.MistralProvider", mistral_ctor), \
+             patch("ai.providers.cohere_provider.CohereProvider", cohere_ctor), \
+             patch("ai.providers.openai_compat.OpenAICompatProvider", openai_compat_ctor), \
+             patch("ai.providers.openai_provider.OpenAIProvider", openai_ctor), \
+             patch("ai.providers.anthropic_provider.AnthropicProvider", anthropic_ctor), \
+             patch("ai.providers.ollama_provider.OllamaProvider", lambda config: FakeProvider("ollama")):
+            providers = init_providers(FakeConfig())
+
+        self.assertEqual(list(providers.keys()), ["ollama"])
+        groq_ctor.assert_not_called()
+        gemini_ctor.assert_not_called()
+        cerebras_ctor.assert_not_called()
+        mistral_ctor.assert_not_called()
+        cohere_ctor.assert_not_called()
+        openai_compat_ctor.assert_not_called()
+        openai_ctor.assert_not_called()
+        anthropic_ctor.assert_not_called()
+
+    def test_poll_provider_health_uses_cached_state_without_network_probe(self):
+        engine = AIEngine(ConfigStub(), HistoryStub())
+
+        class CachedProvider:
+            def __init__(self, name, state="active"):
+                self.name = name
+                self.enabled = True
+                self._health_state = state
+
+            def is_disabled(self):
+                return False
+
+            def check_rate(self):
+                return True
+
+            def disabled_reason(self):
+                return ""
+
+            def cooldown_remaining_s(self):
+                return 0
+
+            def health_state(self):
+                return self._health_state
+
+            def check_availability(self):
+                raise AssertionError("poll_provider_health should not probe the network")
+
+        engine._providers = {
+            "groq": CachedProvider("groq", "active"),
+            "gemini": CachedProvider("gemini", "down"),
+            "ollama": CachedProvider("ollama", "active"),
+        }
+        engine._provider_health_cache = {
+            "groq": {"state": "active", "reason": "", "updated_at": time.time()},
+            "gemini": {"state": "down", "reason": "probe failed", "updated_at": time.time()},
+            "ollama": {"state": "active", "reason": "", "updated_at": time.time()},
+        }
+
+        captured = []
+        engine.provider_status.connect(lambda payload: captured.append(payload))
+
+        asyncio.run(engine.poll_provider_health())
+
+        self.assertTrue(captured, "provider status snapshot should be emitted")
+        snapshot = captured[-1]
+        self.assertEqual(snapshot["groq"]["state"], "active")
+        self.assertEqual(snapshot["gemini"]["state"], "down")
+        self.assertEqual(snapshot["ollama"]["state"], "active")
 
 
 class HotkeyMatchingTests(unittest.TestCase):

@@ -285,3 +285,26 @@ class GeminiProvider(BaseProvider):
         except Exception:
             self.stats.record_error()
             raise
+
+    async def health_check(self) -> bool:
+        """Verify the API key and model access with a minimal prompt."""
+        try:
+            model = self.get_model("fast")
+            if not model:
+                return False
+            from google.genai import types
+
+            contents, sys_instr = self._build_contents(model, "Health check.", "Hi")
+            cfg_kwargs = self._build_config_kwargs(model, temperature=0.0, types_module=types)
+            if sys_instr:
+                cfg_kwargs["system_instruction"] = sys_instr
+
+            response = await self.client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(**cfg_kwargs),
+            )
+            return bool(getattr(response, "text", "") or getattr(response, "candidates", None))
+        except Exception as e:
+            logger.debug("Gemini health check failed: %s", e)
+            return False

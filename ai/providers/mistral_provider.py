@@ -1,7 +1,8 @@
-"""Mistral â Great for coding (Codestral)."""
+"""Mistral - Great for coding (Codestral)."""
 
 import time
 from typing import AsyncGenerator
+
 from ai.providers.base import BaseProvider
 from utils.logger import setup_logger
 
@@ -15,12 +16,27 @@ class MistralProvider(BaseProvider):
         if not key:
             self.enabled = False
             return
+
         try:
-            from mistralai import Mistral
+            # Mistral's SDK has used both import paths across versions. The
+            # docs now show `from mistralai.client import Mistral`, while some
+            # quickstarts still show the top-level import. Try both so the app
+            # works across installed SDK revisions.
+            try:
+                from mistralai.client import Mistral
+            except ImportError:
+                from mistralai import Mistral
+
             self.client = Mistral(api_key=key)
             logger.info("  [OK] Mistral ready (Codestral)")
+        except ImportError as e:
+            logger.warning(
+                "  [ERR] Mistral SDK import failed: %s. Install or upgrade with `pip install -U mistralai`.",
+                e,
+            )
+            self.enabled = False
         except Exception as e:
-            logger.warning(f"  â Mistral: {e}")
+            logger.warning(f"  [ERR] Mistral: {e}")
             self.enabled = False
 
     async def generate(self, system: str, user: str, tier: str = None) -> str:
@@ -31,7 +47,8 @@ class MistralProvider(BaseProvider):
             r = await self.client.chat.complete_async(
                 model=model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                max_tokens=self.max_tokens, temperature=0.7
+                max_tokens=self.max_tokens,
+                temperature=0.7,
             )
             if not r.choices:
                 raise Exception(f"Mistral returned empty choices list (model={model})")
@@ -52,7 +69,8 @@ class MistralProvider(BaseProvider):
             stream = await self.client.chat.stream_async(
                 model=model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                max_tokens=self.max_tokens, temperature=0.7
+                max_tokens=self.max_tokens,
+                temperature=0.7,
             )
             async for event in stream:
                 choices = getattr(getattr(event, "data", None), "choices", None) or []
@@ -67,3 +85,20 @@ class MistralProvider(BaseProvider):
         except Exception:
             self.stats.record_error()
             raise
+
+    async def health_check(self) -> bool:
+        """Verify the key can complete a tiny chat request."""
+        try:
+            model = self.get_model("fast")
+            if not model:
+                return False
+            r = await self.client.chat.complete_async(
+                model=model,
+                messages=[{"role": "user", "content": "Hi"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+            return bool(getattr(r, "choices", None))
+        except Exception as e:
+            logger.debug("Mistral health check failed: %s", e)
+            return False

@@ -618,21 +618,16 @@ class StandbyView(QWidget):
             self.model_bar_layout.addWidget(badge)
             return
 
-        ready_statuses = [
-            (pid, info)
-            for pid, info in statuses.items()
-            if info.get("usable") or info.get("state") in {"active", "cooldown"}
-        ]
-
-        if not ready_statuses:
-            badge = QLabel("NO PROVIDERS READY")
+        provider_rows = list(statuses.items())
+        if not provider_rows:
+            badge = QLabel("NO PROVIDERS CONFIGURED")
             badge.setStyleSheet(
                 "color: #3b4266; font-size: 8px; font-weight: 900;"
             )
             self.model_bar_layout.addWidget(badge)
             return
 
-        for pid, info in ready_statuses:
+        for pid, info in provider_rows:
             state = info.get("state", "unknown")
             selected = bool(info.get("selected"))
             color = (
@@ -640,6 +635,8 @@ class StandbyView(QWidget):
                 if state == "active"
                 else "#f59e0b"
                 if state == "cooldown"
+                else "#60a5fa"
+                if state == "configured"
                 else "#ef4444"
             )
             label = f"\u25cf {pid.upper()}" if selected else pid.upper()
@@ -652,6 +649,18 @@ class StandbyView(QWidget):
                     tip += f"\nReason: {reason}"
                 if remaining > 0:
                     tip += f"\nRemaining: ~{remaining}s"
+                badge.setToolTip(tip)
+            elif state == "configured":
+                reason = str(info.get("reason", "") or "").strip()
+                tip = "Configured in settings"
+                if reason:
+                    tip += f"\nStatus: {reason}"
+                badge.setToolTip(tip)
+            elif state == "down":
+                reason = str(info.get("reason", "") or "").strip()
+                tip = "Provider unavailable"
+                if reason:
+                    tip += f"\nReason: {reason}"
                 badge.setToolTip(tip)
             if selected:
                 badge.setStyleSheet(
@@ -772,8 +781,13 @@ class StandbyView(QWidget):
             logger.debug(f"Post-READY warmup signal ignored: {message}")
             return
 
+        current_progress = int(self.progress_bar.value() or 0)
+        next_progress = int(progress or 0)
+        if not ready and next_progress < current_progress:
+            next_progress = current_progress
+
         self.subtitle.setText(message.upper())
-        self.progress_bar.setValue(progress)
+        self.progress_bar.setValue(next_progress)
         self.start_btn.setEnabled(ready)
         if ready:
             self._warmup_done = True

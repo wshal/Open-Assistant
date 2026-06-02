@@ -251,8 +251,13 @@ class Config:
         self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("enabled", True)
         self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("stability_ms", 650)
         self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("delay_ms", 250)
-
         self._data["ai"].setdefault("providers", {})
+        # Keep boot light: provider availability is shown from configuration,
+        # and live health checks are only run on explicit test or background
+        # request failure. This avoids quota churn from probing every provider
+        # at startup.
+        self._data["ai"]["providers"].setdefault("validate_on_init", False)
+        self._data["ai"]["providers"].setdefault("health_check_timeout", 4)
         self._data["ai"]["providers"].setdefault("groq", {})
         # Periodic pings can reduce first-token latency after idle gaps, but
         # each ping is still a Groq API request and can consume free-tier RPM.
@@ -722,6 +727,12 @@ class Config:
         from core.constants import PROVIDERS
         env_key = PROVIDERS.get(provider, {}).get("env_key", "")
         return os.environ.get(env_key, "") if env_key else ""
+
+    def has_provider_key(self, provider: str) -> bool:
+        """Return True when the provider has a usable key or local endpoint."""
+        if str(provider).lower() == "ollama":
+            return True
+        return bool((self.get_api_key(provider) or "").strip())
 
     @property
     def data(self):

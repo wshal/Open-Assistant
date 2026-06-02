@@ -63,6 +63,9 @@ class BaseProvider(ABC):
         self._disabled_until = 0.0
         self._disabled_reason = ""
         self._disabled_at = 0.0
+        self._health_state = "unknown"
+        self._health_reason = ""
+        self._health_checked_at = 0.0
         self.failure_cooldown = self.pcfg.get("failure_cooldown", 30)
         # Issue #13: serialise _req_times mutations across parallel/race callers.
         self._rate_lock = threading.Lock()
@@ -109,6 +112,26 @@ class BaseProvider(ABC):
 
     def disabled_reason(self) -> str:
         return str(self._disabled_reason or "").strip()
+
+    def health_state(self) -> str:
+        return str(self._health_state or "unknown")
+
+    def health_reason(self) -> str:
+        return str(self._health_reason or "").strip()
+
+    def health_checked_at(self) -> float:
+        return float(self._health_checked_at or 0.0)
+
+    def set_health_state(self, state: str, reason: str = "") -> None:
+        state = (state or "unknown").strip().lower()
+        if state not in {"active", "down", "cooldown", "unknown"}:
+            state = "unknown"
+        self._health_state = state
+        self._health_reason = str(reason or "").strip()
+        self._health_checked_at = time.time()
+
+    def is_available(self) -> bool:
+        return self.enabled and not self.is_disabled() and self.health_state() != "down"
 
     def disable(self, seconds: int = None, reason: str = ""):
         duration = seconds if seconds is not None else self.failure_cooldown

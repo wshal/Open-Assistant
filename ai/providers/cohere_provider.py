@@ -62,3 +62,28 @@ class CohereProvider(BaseProvider):
         except Exception:
             self.stats.record_error()
             raise
+
+    async def health_check(self) -> bool:
+        """Verify the key can complete a tiny chat request."""
+        try:
+            model = self.get_model("fast")
+            if not model:
+                return False
+            r = await self.client.chat(
+                model=model,
+                messages=[{"role": "user", "content": "Hi"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+            content = getattr(getattr(r, "message", None), "content", None)
+            if isinstance(content, list):
+                for item in content:
+                    if getattr(item, "text", ""):
+                        return True
+                return False
+            if hasattr(content, "text"):
+                return bool(getattr(content, "text", "").strip())
+            return bool(str(content or "").strip())
+        except Exception as e:
+            logger.debug("Cohere health check failed: %s", e)
+            return False

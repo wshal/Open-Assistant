@@ -299,7 +299,7 @@ class OpenAssistApp(QObject):
             available = [
                 p
                 for p, prov in self.ai._providers.items()
-                if hasattr(prov, "enabled") and prov.enabled
+                if getattr(prov, "is_available", lambda: getattr(prov, "enabled", False))()
             ]
 
         capture_active = bool(getattr(self.state, "is_capturing", False))
@@ -666,7 +666,7 @@ class OpenAssistApp(QObject):
                     self.ai.close_providers()
                 except Exception:
                     pass
-                self.ai.warmup()
+                self.ai.warmup(self.loop)
 
                 # 3. UI Synchronization
                 QTimer.singleShot(0, self._apply_ui_only)
@@ -2318,6 +2318,9 @@ class OpenAssistApp(QObject):
 
         def _warm_vision():
             try:
+                if not bool(self.config.get("capture.screen.enabled", True)):
+                    logger.info("Vision warmup skipped: capture.screen.enabled=false")
+                    return
                 self.screen.initialize()
                 self.warmup_status_update.emit("👁️ Vision Ready", 40, False)
             except Exception as e:
@@ -2325,7 +2328,7 @@ class OpenAssistApp(QObject):
 
         def _warm_brain():
             try:
-                self.ai.warmup()
+                self.ai.warmup(self.loop)
                 try:
                     from ai.auto_answer_controller import _get_intent_classifier
 
@@ -2360,6 +2363,9 @@ class OpenAssistApp(QObject):
             STT is selected.  It does not start hardware capture.
             """
             try:
+                if not bool(self.config.get("capture.audio.enabled", True)):
+                    logger.info("Audio warmup skipped: capture.audio.enabled=false")
+                    return
                 provider = "local"
                 if hasattr(self.audio, "_effective_transcription_provider"):
                     provider = self.audio._effective_transcription_provider(is_final=True)
@@ -2382,6 +2388,9 @@ class OpenAssistApp(QObject):
             Does NOT block the READY signal — runs fully in background.
             """
             try:
+                if not bool(self.config.get("rag.enabled", True)):
+                    logger.info("RAG warmup skipped: rag.enabled=false")
+                    return
                 from knowledge.ingest import ingest_all
                 from pathlib import Path
                 from core.constants import DOCS_DIR

@@ -66,6 +66,8 @@ class AIEngine(QObject):
         self._parallel = None
         self._bg_slot = BackgroundGenerationSlot()
         self._foreground_turn_id: str = ""
+        self._provider_health_cache: Dict[str, Dict[str, Any]] = {}
+        self._provider_validation_task = None
 
         # Provider speed ranking (fastest first)
         self._provider_priority = ["groq", "cerebras", "gemini", "together", "ollama"]
@@ -316,6 +318,13 @@ class AIEngine(QObject):
                     provider.disable(seconds=seconds, reason=reason)
                 except TypeError:
                     provider.disable(seconds=seconds)
+            if provider is not None and getattr(provider, "name", ""):
+                self.set_provider_health(
+                    getattr(provider, "name", ""),
+                    False,
+                    reason=reason or str(exc),
+                    source="request_failure",
+                )
         except Exception:
             # Cooldown is best-effort; never fail the request flow due to it.
             pass
@@ -325,8 +334,8 @@ class AIEngine(QObject):
         self._session_context = (text or "").strip()
         logger.debug(f"Session context updated ({len(self._session_context)} chars)")
 
-    def warmup(self):
-        """Initializes AI providers and checks availability."""
+    def warmup(self, loop: asyncio.AbstractEventLoop = None):
+        """Initializes AI providers and starts background availability checks."""
         try:
             # If warmup is called multiple times (e.g. hot-apply settings), ensure
             # we clean up any long-lived network resources (aiohttp sessions, etc.)
@@ -336,6 +345,11 @@ class AIEngine(QObject):
 
             self._providers = init_providers(self.config)
             logger.info(f"AI Engine initialized: {list(self._providers.keys())}")
+
+            # Kick off provider validation immediately so it overlaps with the
+            # rest of warmup instead of waiting until the brain thread finishes.
+            if loop and loop.is_running():
+                self.ensure_provider_validation(loop)
 
             # Initialize router
             self._router = SmartRouter(self.config, self._providers)
@@ -352,14 +366,14 @@ class AIEngine(QObject):
             if (
                 configured
                 and configured in self._providers
-                and self._providers[configured].enabled
+                and getattr(self._providers[configured], "is_available", lambda: self._providers[configured].enabled)()
             ):
                 self._active_provider_id = configured
                 logger.info(f"Using configured provider: {configured}")
             else:
                 # Auto-select: groq > cerebras > gemini based on speed
                 for p in ["groq", "cerebras", "gemini", "together", "ollama"]:
-                    if p in self._providers and self._providers[p].enabled:
+                    if p in self._providers and getattr(self._providers[p], "is_available", lambda: self._providers[p].enabled)():
                         self._active_provider_id = p
                         logger.info(f"Auto-selected provider: {p} (fastest available)")
                         break
@@ -368,8 +382,154 @@ class AIEngine(QObject):
                 self._active_provider_id = list(self._providers.keys())[0]
 
             logger.info(f"Active Provider: {self._active_provider_id}")
+            self.emit_provider_status_snapshot()
         except Exception as e:
             logger.error(f"AI Warmup Error: {e}")
+
+    async def validate_loaded_providers(self, provider_ids: List[str] = None):
+        """Probe loaded providers in the background without blocking app boot."""
+        if not self._providers:
+            return
+
+        timeout = float(self.config.get("ai.providers.health_check_timeout", 5) or 5)
+        concurrency = int(self.config.get("ai.providers.health_check_concurrency", 3) or 3)
+        targets = list(provider_ids or self._providers.keys())
+        seen = set()
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _check_provider(name, prov, priority: int = 0):
+            if name in seen or prov is None or not getattr(prov, "enabled", False):
+                return
+            seen.add(name)
+            if not getattr(prov, "supports_health_check", lambda: False)():
+                self.set_provider_health(name, True, source="startup_skip")
+                return
+
+            async with sem:
+                ok = False
+                last_error = ""
+                attempts = 2 if name in {"groq", "gemini", "ollama"} else 1
+                for attempt in range(1, attempts + 1):
+                    try:
+                        ok = await asyncio.wait_for(prov.health_check(), timeout=timeout)
+                        if ok:
+                            break
+                    except Exception as exc:
+                        last_error = str(exc)
+                        ok = False
+                    if not ok and attempt < attempts:
+                        await asyncio.sleep(min(0.5 * attempt, 0.75))
+
+                self.set_provider_health(
+                    name,
+                    ok,
+                    reason=last_error,
+                    source="startup_probe",
+                )
+                if not ok:
+                    logger.warning("x %s failed background health probe", name)
+
+        ordered = []
+        fixed = str(self.config.get("ai.fixed_provider", "") or "").strip()
+        if fixed:
+            ordered.append(fixed)
+        for pid in self._provider_priority:
+            if pid not in ordered:
+                ordered.append(pid)
+        for pid in targets:
+            if pid not in ordered:
+                ordered.append(pid)
+
+        await asyncio.gather(*[_check_provider(name, self._providers.get(name)) for name in ordered])
+        self.emit_provider_status_snapshot()
+
+    def ensure_provider_validation(self, loop: asyncio.AbstractEventLoop):
+        """Start a non-blocking background probe pass for loaded providers."""
+        if not bool(self.config.get("ai.providers.validate_on_init", False)):
+            return None
+        if not loop or not loop.is_running():
+            return None
+        if self._provider_validation_task and not self._provider_validation_task.done():
+            return self._provider_validation_task
+
+        def _create():
+            if self._provider_validation_task and not self._provider_validation_task.done():
+                return self._provider_validation_task
+            self._provider_validation_task = loop.create_task(self.validate_loaded_providers())
+            return self._provider_validation_task
+
+        async def _spawn():
+            return _create()
+
+        future = asyncio.run_coroutine_threadsafe(_spawn(), loop)
+        try:
+            return future.result(timeout=2)
+        except Exception as e:
+            logger.debug("Failed to start provider validation task: %s", e)
+            return None
+
+    def set_provider_health(self, provider_id: str, healthy: bool, reason: str = "", source: str = "") -> None:
+        """Cache provider health without re-probing the network.
+
+        This is the single source of truth for the standby badge bar and it is
+        updated by startup validation, explicit provider tests, and request
+        failures. We intentionally do not poll live network availability here,
+        because that makes providers appear to flicker in and out of the UI.
+        """
+        pid = str(provider_id or "").strip()
+        if not pid:
+            return
+        state = "active" if healthy else "down"
+        cache = self._provider_health_cache.setdefault(pid, {})
+        cache.update(
+            {
+                "state": state,
+                "reason": str(reason or "").strip(),
+                "source": str(source or "").strip(),
+                "updated_at": time.time(),
+            }
+        )
+        prov = (self._providers or {}).get(pid)
+        if prov is not None and hasattr(prov, "set_health_state"):
+            prov.set_health_state(state, reason)
+        self.emit_provider_status_snapshot()
+
+    def emit_provider_status_snapshot(self):
+        """Emit a lightweight provider-status snapshot without re-probing networks."""
+        results = {
+            "_meta": {
+                "text_local_only": bool(self.config.get("ai.text.local_only", False)),
+                "vision_local_only": bool(self.config.get("ai.vision.local_only", False)),
+            }
+        }
+        for pid, prov in list(self._providers.items()):
+            cached = self._provider_health_cache.get(pid, {})
+            state = str(cached.get("state", "configured") or "configured")
+            if hasattr(prov, "is_disabled") and prov.is_disabled():
+                state = "cooldown"
+            info = {
+                "state": state,
+                "selected": pid == self._active_provider_id,
+                "configured": True,
+                "usable": state in {"active", "cooldown", "configured"},
+            }
+            if state == "cooldown":
+                try:
+                    info["cooldown_reason"] = (
+                        prov.disabled_reason() if hasattr(prov, "disabled_reason") else ""
+                    )
+                    info["cooldown_remaining_s"] = (
+                        prov.cooldown_remaining_s() if hasattr(prov, "cooldown_remaining_s") else 0
+                    )
+                except Exception:
+                    pass
+            elif cached.get("reason"):
+                info["reason"] = cached.get("reason", "")
+                info["updated_at"] = cached.get("updated_at", 0.0)
+            elif state == "configured":
+                info["reason"] = "Configured, not yet live-tested"
+            results[pid] = info
+        self.provider_status.emit(results)
 
     def warm_groq_connection(self, loop: asyncio.AbstractEventLoop) -> None:
         """Fire a non-blocking Groq TCP pre-warm on the async loop.
@@ -1716,7 +1876,7 @@ class AIEngine(QObject):
             if not provider:
                 logger.warning(f"[AnalyzeScreen] Provider {name!r} not found in _providers (keys={list(self._providers.keys())})")
                 continue
-            enabled_ok = provider.enabled
+            enabled_ok = getattr(provider, "is_available", lambda: provider.enabled)()
             rate_ok = provider.check_rate()
             vision_ok = getattr(provider, "supports_vision", lambda: False)()
             logger.info(f"[AnalyzeScreen] Provider {name!r}: enabled={enabled_ok}, rate_ok={rate_ok}, supports_vision={vision_ok}")
@@ -2212,7 +2372,7 @@ class AIEngine(QObject):
         # P2: Local-only mode (Ollama) overrides routing for privacy/offline use.
         if bool(self.config.get("ai.text.local_only", False)):
             provider = self._providers.get("ollama")
-            if provider and getattr(provider, "enabled", False) and provider.check_rate():
+            if provider and getattr(provider, "is_available", lambda: getattr(provider, "enabled", False))() and provider.check_rate():
                 mode_name = mode.name if hasattr(mode, "name") else str(mode or "general")
                 tier = self._router._tier_for_task(mode_name) if self._router else "balanced"
                 return provider, tier
@@ -2241,7 +2401,7 @@ class AIEngine(QObject):
         if strict_preferred:
             for provider_id in preferred:
                 provider = self._providers.get(provider_id)
-                if provider and getattr(provider, "enabled", False) and provider.check_rate():
+                if provider and getattr(provider, "is_available", lambda: getattr(provider, "enabled", False))() and provider.check_rate():
                     resolved_tier = tier_hint or (self._router._tier_for_task(mode_name) if self._router else "balanced")
                     if provider.has_model(resolved_tier):
                         return provider, resolved_tier
@@ -2263,7 +2423,7 @@ class AIEngine(QObject):
             provider = self._providers.get(provider_id)
             if (
                 provider
-                and getattr(provider, "enabled", False)
+                and getattr(provider, "is_available", lambda: getattr(provider, "enabled", False))()
                 and provider_id not in self._session_failed_providers
                 and provider.check_rate()
             ):
@@ -2346,54 +2506,52 @@ class AIEngine(QObject):
             pass
         except Exception as e:
             logger.debug(f"Provider health monitor shutdown error: {e}")
+        val_task = self._provider_validation_task
+        self._provider_validation_task = None
+        if val_task:
+            val_task.cancel()
+            try:
+                await val_task
+            except Exception:
+                pass
 
     async def poll_provider_health(self):
         """Polls providers and emits status to UI badges."""
-        results = self._router.get_provider_health() if self._router else {}
+        results = {}
         results["_meta"] = {
             "text_local_only": bool(self.config.get("ai.text.local_only", False)),
             "vision_local_only": bool(self.config.get("ai.vision.local_only", False)),
         }
         for pid, prov in list(self._providers.items()):
-            info = dict(results.get(pid, {}))
-            state = info.get("state", "unknown")
-            locked_state = state in {"cooldown", "rate_limited", "disabled"}
-            try:
-                # Only call availability checks for providers that explicitly
-                # advertise a health check (avoids expensive/noisy network calls).
-                supports_hc = bool(getattr(prov, "supports_health_check", lambda: False)())
-                if supports_hc and hasattr(prov, "check_availability"):
-                    is_ok = await asyncio.wait_for(prov.check_availability(), timeout=5)
-                    if is_ok and not locked_state:
-                        state = "active"
-                    elif getattr(prov, "state", "") == "missing":
-                        state = "missing"
-                    elif getattr(prov, "state", "") == "unavailable":
-                        state = "down"
-                    elif state not in {"cooldown", "rate_limited", "disabled"}:
-                        state = "down"
+            cached = self._provider_health_cache.get(pid, {})
+            state = str(cached.get("state", "active") or "active")
+            info = {
+                "state": state,
+                "selected": pid == self._active_provider_id,
+                "usable": state in {"active", "cooldown"},
+            }
 
-                # Reflect local cooldown state even without a health check.
-                if not locked_state and hasattr(prov, "is_disabled") and prov.is_disabled():
-                    state = "cooldown"
+            if hasattr(prov, "is_disabled") and prov.is_disabled():
+                state = "cooldown"
+                info["state"] = state
+                try:
+                    info["cooldown_reason"] = (
+                        prov.disabled_reason() if hasattr(prov, "disabled_reason") else ""
+                    )
+                    info["cooldown_remaining_s"] = (
+                        prov.cooldown_remaining_s() if hasattr(prov, "cooldown_remaining_s") else 0
+                    )
+                except Exception:
+                    pass
+            elif state == "cooldown":
+                try:
+                    info["cooldown_reason"] = cached.get("reason", "")
+                    info["cooldown_remaining_s"] = 0
+                except Exception:
+                    pass
 
-                if state == "cooldown":
-                    try:
-                        info["cooldown_reason"] = (
-                            prov.disabled_reason() if hasattr(prov, "disabled_reason") else ""
-                        )
-                        info["cooldown_remaining_s"] = (
-                            prov.cooldown_remaining_s() if hasattr(prov, "cooldown_remaining_s") else 0
-                        )
-                    except Exception:
-                        pass
-            except Exception:
-                if not locked_state:
-                    state = "down"
-
-            info["state"] = state
-            info["selected"] = pid == self._active_provider_id
-            info["usable"] = state in {"active", "cooldown"}
+            if cached.get("reason"):
+                info["reason"] = cached.get("reason", "")
             results[pid] = info
 
         self.provider_status.emit(results)

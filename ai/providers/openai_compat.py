@@ -69,3 +69,20 @@ class OpenAICompatProvider(BaseProvider):
         except Exception:
             self.stats.record_error()
             raise
+
+    async def health_check(self) -> bool:
+        """Verify the API key by completing a tiny chat request."""
+        try:
+            model = self.get_model("fast")
+            if not model:
+                return False
+            r = await self.client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "Hi"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+            return bool(getattr(r, "choices", None))
+        except Exception as e:
+            logger.debug("%s health check failed: %s", self.name, e)
+            return False

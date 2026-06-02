@@ -138,8 +138,9 @@ class AnthropicProvider(BaseProvider):
         try:
             message = await self.client.messages.create(
                 model=self.get_model("fast"),
-                max_tokens=10,
+                max_tokens=1,
                 messages=[{"role": "user", "content": "Say 'ok'"}],
+                temperature=0.0,
             )
             return bool(self._extract_text(message.content))
         except Exception as e:

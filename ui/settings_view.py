@@ -541,6 +541,13 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             self.provider_detail_labels[provider_id].setText(display_msg)
             logger.info("[Q6 Timestamp] %s test result: %s at %s", provider_id, message, ts)
 
+        try:
+            ai = getattr(self.app, "ai", None)
+            if ai and hasattr(ai, "set_provider_health"):
+                ai.set_provider_health(provider_id, bool(success), reason=message, source="settings_test")
+        except Exception:
+            pass
+
         if provider_id != "ollama" or not hasattr(self, "ollama_model_combo"):
             return
 
