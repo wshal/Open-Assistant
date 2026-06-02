@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint
-from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor
+from PyQt6.QtGui import QTextCursor, QTextCharFormat, QTextBlockFormat, QColor
 from ui.markdown_renderer import MarkdownRenderer
 from ui.standby_view import StandbyView
 from ui.settings_view import SettingsView
@@ -38,6 +38,7 @@ class OverlayWindow(QMainWindow):
 
     def __init__(self, config, app):
         super().__init__()
+        self.setWindowTitle("OpenAssist Overlay")
         self.config = config
         self.app = app
         self._drag = False
@@ -348,10 +349,15 @@ class OverlayWindow(QMainWindow):
         hl.addWidget(btn_set)
 
         btn_close = QPushButton("✕")
+        btn_close.setToolTip("Close or background the app")
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.setFixedSize(22, 22)
         btn_close.setStyleSheet(
-            "color: #667; border: none; font-size: 14px; background: transparent;"
+            "QPushButton { color: #667; border: none; background: transparent; "
+            "padding: 0px; margin: 0px; font-size: 11px; }"
+            "QPushButton:hover { color: #f87171; }"
         )
-        btn_close.clicked.connect(self.hide)
+        btn_close.clicked.connect(self._request_close)
         hl.addWidget(btn_close)
         box_layout.addWidget(self.header)
 
@@ -522,6 +528,19 @@ class OverlayWindow(QMainWindow):
         self._active_response_text += text
         self._active_response_streaming = True
 
+    def _response_text_cursor(self) -> QTextCursor:
+        """Position response text on its own block after the query header."""
+        cursor = self.response_area.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if (
+            self.response_area.document().blockCount() <= 1
+            and self.response_area.toPlainText().strip()
+        ):
+            block_fmt = QTextBlockFormat()
+            block_fmt.setTopMargin(8)
+            cursor.insertBlock(block_fmt)
+        return cursor
+
     def restore_active_response_view(self) -> bool:
         query = (self._active_response_query or "").strip()
         text = self._active_response_text or ""
@@ -544,8 +563,7 @@ class OverlayWindow(QMainWindow):
                     f"<b>QUERY:</b> {escape(self._current_query)}</div>"
                 )
             if text:
-                cursor = self.response_area.textCursor()
-                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor = self._response_text_cursor()
                 fmt = QTextCharFormat()
                 fmt.setForeground(QColor("#d0d0e8"))
                 cursor.setCharFormat(fmt)
@@ -589,7 +607,7 @@ class OverlayWindow(QMainWindow):
             if self._current_query:
                 self.response_area.setHtml(
                     f"<div style='color: #64748b; font-size: 10px; margin-bottom: 5px;'>"
-                    f"<b>QUERY:</b> {self._current_query}</div>"
+                    f"<b>QUERY:</b> {escape(self._current_query)}</div>"
                 )
             # Start periodic markdown re-render every 300ms
             self._render_timer.start()
@@ -607,8 +625,7 @@ class OverlayWindow(QMainWindow):
         sb = self.response_area.verticalScrollBar()
         previous_value = sb.value()
         was_scrolling = bool(self._user_is_scrolling)
-        cursor = self.response_area.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor = self._response_text_cursor()
         fmt = QTextCharFormat()
         fmt.setForeground(QColor("#d0d0e8"))
         cursor.setCharFormat(fmt)
@@ -698,11 +715,17 @@ class OverlayWindow(QMainWindow):
         anim.setEasingCurve(QEasingCurve.Type.OutBack)
         anim.start()
         
-        # Store ref to prevent GC
+        # M-6: Bind dismissal timer to ``self`` and auto-purge ``_active_toasts``
+        # via the toast's destroyed signal so the list never accumulates dead
+        # references when the parent is closed before the timer fires.
         if not hasattr(self, "_active_toasts"):
             self._active_toasts = []
         self._active_toasts.append(toast)
-        
+        toast.destroyed.connect(
+            lambda _=None, t=toast: self._active_toasts.remove(t)
+            if t in self._active_toasts else None
+        )
+
         def _dismiss():
             if toast in self._active_toasts:
                 self._active_toasts.remove(toast)
@@ -713,8 +736,11 @@ class OverlayWindow(QMainWindow):
             fade.setEasingCurve(QEasingCurve.Type.InBack)
             fade.finished.connect(toast.deleteLater)
             fade.start()
-            
-        QTimer.singleShot(8000, _dismiss)
+
+        dismiss_timer = QTimer(self)
+        dismiss_timer.setSingleShot(True)
+        dismiss_timer.timeout.connect(_dismiss)
+        dismiss_timer.start(8000)
 
     def update_warmup_status(self, m, p, r):
         self.standby_view.set_warmup_status(m, p, r)
@@ -1040,12 +1066,17 @@ class OverlayWindow(QMainWindow):
 
         # Disable ANALYZE SCREEN when vision is fully off — no point capturing
         if hasattr(self, "btn_analyze_screen"):
-            self.btn_analyze_screen.setEnabled(enabled)
+            self.btn_analyze_screen.setEnabled(True)
             self.btn_analyze_screen.setToolTip(
                 "Capture the current screen and analyze it with live session context"
                 if enabled
                 else "Vision is OFF — enable vision (👁️) to use screen analysis"
             )
+
+            if not enabled:
+                self.btn_analyze_screen.setToolTip(
+                    "Capture the current screen once. Continuous vision is off."
+                )
 
     def _on_standby_mode_selected(self, mode):
         """Update app state when user clicks a mode button on standby screen."""
@@ -1158,21 +1189,41 @@ class OverlayWindow(QMainWindow):
         if hasattr(self.app, "screen") and hasattr(self.app.screen, "_debounce"):
             new_interval = self.app.config.get("capture.screen.interval_ms", 500) / 1000.0
             self.app.screen._debounce = new_interval
-        self.refresh_standby_state()
-        if self._prev_stack_widget is not None:
-            self.stack.setCurrentWidget(self._prev_stack_widget)
+        if hasattr(self.app, "request_close_surface"):
+            self.app.request_close_surface("overlay")
         else:
-            self.stack.setCurrentIndex(self._prev_stack_index)
+            self.show_standby_view()
+            self.refresh_standby_state()
+
+    def _request_close(self):
+        if hasattr(self.app, "request_close_surface"):
+            self.app.request_close_surface("overlay")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            if getattr(self.app, "session_active", False):
+                event.ignore()
+                return
+            self._request_close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _on_onboarding_finished(self):
         """Handle onboarding completion - go to standby."""
-        self.show_standby_view()
-        self.refresh_standby_state()
+        if hasattr(self.app, "request_close_surface"):
+            self.app.request_close_surface("overlay")
+        else:
+            self.show_standby_view()
+            self.refresh_standby_state()
 
     def _on_onboarding_skipped(self):
         """Handle onboarding skip - go to standby."""
-        self.show_standby_view()
-        self.refresh_standby_state()
+        if hasattr(self.app, "request_close_surface"):
+            self.app.request_close_surface("overlay")
+        else:
+            self.show_standby_view()
+            self.refresh_standby_state()
 
     def show_onboarding(self):
         """Show the onboarding wizard, resetting it to step 0."""

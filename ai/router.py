@@ -19,7 +19,7 @@ class SmartRouter:
 
     def _is_offline_available(self) -> bool:
         """Check if local/offline provider is available."""
-        return "ollama" in self.providers and self.providers["ollama"].enabled
+        return "ollama" in self.providers and getattr(self.providers["ollama"], "is_available", lambda: self.providers["ollama"].enabled)()
 
     def select(
         self,
@@ -35,7 +35,7 @@ class SmartRouter:
         avail = {
             n: p
             for n, p in self.providers.items()
-            if p.enabled and p.check_rate() and n not in exclude
+            if getattr(p, "is_available", lambda: p.enabled)() and p.check_rate() and n not in exclude
         }
 
         if not avail:
@@ -66,9 +66,12 @@ class SmartRouter:
             return p, self._selected_tier(p, tier or "fast")
 
         if self.strategy == "roundrobin":
+            # Issue #12: Index first, then advance, so the very first request
+            # actually goes to names[0] instead of names[1] (the previous code
+            # incremented before indexing and skipped the first provider).
             names = list(avail.keys())
+            provider = avail[names[self._rr % len(names)]]
             self._rr = (self._rr + 1) % len(names)
-            provider = avail[names[self._rr]]
             return provider, self._selected_tier(provider, tier or "balanced")
 
         if self.strategy == "fallback":
@@ -168,14 +171,15 @@ class SmartRouter:
     def get_provider_health(self):
         health = {}
         for name, p in self.providers.items():
-            if not p.enabled:
+            if not getattr(p, "enabled", False):
                 state = "disabled"
             elif p.is_disabled():
                 state = "cooldown"
             elif not p.check_rate():
                 state = "rate_limited"
             else:
-                state = "active"
+                health = getattr(p, "health_state", lambda: "unknown")()
+                state = "down" if health == "down" else "active"
 
             health[name] = {
                 "state": state,

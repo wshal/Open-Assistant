@@ -6,10 +6,16 @@ that weren't actually spoken, compare:
 This tells us: how much of our WER floor is a labeling artifact?
 """
 import sys, json, os
-sys.path.insert(0, r'C:\Users\Vishal\Desktop\Open Assist')
+from pathlib import Path
+
+# Issue #18: Resolve paths relative to this file so the script works on any
+# checkout. The previous absolute Windows path failed on every other machine.
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT))
 from benchmarks.audio_asr_benchmark import normalize_eval_text, evaluation_word_error_rate
 
-data = json.loads(open(r'C:\Users\Vishal\Desktop\Open Assist\benchmarks\audio_asr_matrix_sweep.json').read())
+_DEFAULT_SWEEP = _ROOT / "benchmarks" / "audio_asr_matrix_sweep.json"
+data = json.loads(_DEFAULT_SWEEP.read_text(encoding="utf-8"))
 
 # Fixtures confirmed to have leading-word labeling mismatch (from debug_leading_words.py)
 PHANTOM_OPENERS = {
@@ -24,13 +30,14 @@ PHANTOM_OPENERS = {
     "js_difference_var_let_const_01.wav":           "what is",
 }
 
-FIXTURE_DIR = r'C:\Users\Vishal\Desktop\Open Assist\tests\fixtures\audio_ground_truth'
+FIXTURE_DIR = _ROOT / "tests" / "fixtures" / "audio_ground_truth"
 fixture_ground_truth = {}
-for f in os.listdir(FIXTURE_DIR):
-    if f.endswith('.wav.json'):
-        meta = json.loads(open(os.path.join(FIXTURE_DIR, f)).read())
-        fn = f.replace('.json', '')
-        fixture_ground_truth[fn] = meta.get('expected_transcript', meta.get('transcript', ''))
+if FIXTURE_DIR.exists():
+    for f in os.listdir(FIXTURE_DIR):
+        if f.endswith('.wav.json'):
+            meta = json.loads((FIXTURE_DIR / f).read_text(encoding="utf-8"))
+            fn = f.replace('.json', '')
+            fixture_ground_truth[fn] = meta.get('expected_transcript', meta.get('transcript', ''))
 
 # Find best transcript per fixture from sweep
 fixture_best = {}

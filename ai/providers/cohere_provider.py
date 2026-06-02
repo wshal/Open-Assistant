@@ -37,8 +37,8 @@ class CohereProvider(BaseProvider):
             tok = (r.usage.tokens.input_tokens + r.usage.tokens.output_tokens) if r.usage else len(text) // 4
             self.stats.record(tok, time.time() - t0)
             return text
-        except Exception as e:
-            self.stats.errors += 1
+        except Exception:
+            self.stats.record_error()
             raise
 
     async def generate_stream(self, system: str, user: str, tier: str = None) -> AsyncGenerator[str, None]:
@@ -59,6 +59,31 @@ class CohereProvider(BaseProvider):
                         tok += 1
                         yield c
             self.stats.record(tok, time.time() - t0)
-        except Exception as e:
-            self.stats.errors += 1
+        except Exception:
+            self.stats.record_error()
             raise
+
+    async def health_check(self) -> bool:
+        """Verify the key can complete a tiny chat request."""
+        try:
+            model = self.get_model("fast")
+            if not model:
+                return False
+            r = await self.client.chat(
+                model=model,
+                messages=[{"role": "user", "content": "Hi"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+            content = getattr(getattr(r, "message", None), "content", None)
+            if isinstance(content, list):
+                for item in content:
+                    if getattr(item, "text", ""):
+                        return True
+                return False
+            if hasattr(content, "text"):
+                return bool(getattr(content, "text", "").strip())
+            return bool(str(content or "").strip())
+        except Exception as e:
+            logger.debug("Cohere health check failed: %s", e)
+            return False

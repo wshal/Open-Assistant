@@ -6,6 +6,7 @@ FIXED: Active region tracking for Smart Crop (Vision Focus).
 
 import asyncio
 import io
+import sys
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -321,6 +322,8 @@ class ScreenCapture(QObject):
         return ""
 
     async def capture_context(self) -> str:
+        if not self._enabled:
+            return ""
         try:
             if isinstance(self.__dict__.get("_window_states", None), dict):
                 self._activate_window_state(self._get_window_key())
@@ -459,7 +462,8 @@ class ScreenCapture(QObject):
         Phase 2 async tuning: keeping the event loop free during I/O means
         other coroutines (OCR, AI streaming, audio) remain responsive.
         """
-        loop = asyncio.get_event_loop()
+        # asyncio.get_event_loop() is deprecated in Python 3.10+; use get_running_loop()
+        loop = asyncio.get_running_loop()
         try:
             return await loop.run_in_executor(None, self._screenshot)
         except Exception as e:
@@ -508,18 +512,19 @@ class ScreenCapture(QObject):
                     target_monitor = monitors[1]  # fallback: primary
 
                 try:
-                    class _POINT(ctypes.Structure):
-                        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+                    if sys.platform == "win32":
+                        class _POINT(ctypes.Structure):
+                            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
-                    pt = _POINT()
-                    if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
-                        cx, cy = int(pt.x), int(pt.y)
-                        for m in monitors[1:]:
-                            left, top = int(m.get("left", 0)), int(m.get("top", 0))
-                            width, height = int(m.get("width", 0)), int(m.get("height", 0))
-                            if left <= cx < (left + width) and top <= cy < (top + height):
-                                target_monitor = m
-                                break
+                        pt = _POINT()
+                        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+                            cx, cy = int(pt.x), int(pt.y)
+                            for m in monitors[1:]:
+                                left, top = int(m.get("left", 0)), int(m.get("top", 0))
+                                width, height = int(m.get("width", 0)), int(m.get("height", 0))
+                                if left <= cx < (left + width) and top <= cy < (top + height):
+                                    target_monitor = m
+                                    break
                 except Exception:
                     pass
 
@@ -542,21 +547,30 @@ class ScreenCapture(QObject):
             return None
 
     def _has_changed(self, new_text: str) -> bool:
-        """Character-level Jaccard similarity for code-edit sensitivity."""
-        if not self._last_text:
-            return True
-        if not new_text:
+        """Character-level Jaccard similarity for code-edit sensitivity.
+
+        Issue #14: For very short strings (<3 chars) the 3-gram set is empty
+        and union is empty, so a real change like "OK" -> "NO" was treated as
+        unchanged. Fall back to direct equality below the trigram threshold.
+        """
+        old = (self._last_text or "").strip()
+        new = (new_text or "").strip()
+        if not old:
+            return bool(new)
+        if not new:
             return False
+        if len(old) < 3 or len(new) < 3:
+            return old != new
 
         def get_grams(t):
             t = t.lower()
             return set(t[i : i + 3] for i in range(len(t) - 2))
 
-        old_grams = get_grams(self._last_text)
-        new_grams = get_grams(new_text)
+        old_grams = get_grams(old)
+        new_grams = get_grams(new)
         union = old_grams | new_grams
         if not union:
-            return False
+            return old != new
 
         similarity = len(old_grams & new_grams) / len(union)
         return similarity < (1.0 - self._threshold)

@@ -723,17 +723,28 @@ class QuestionDetector:
             "describe", "compare", "walk", "help", "clarify",
         } and len(words) < 5:
             return
+        # M-2: Cap dynamically-learned prefixes. Without a ceiling, a long
+        # session would grow this list unboundedly, slowing every subsequent
+        # prefix match (it is scanned linearly) and bloating memory.
+        max_prefixes = 200
         if len(words) >= 2:
             prefix = " ".join(words[:2]) + " "
             if prefix not in self.question_prefixes:
-                logger.info(f"QuestionDetector: Learned dynamic prefix: '{prefix}'")
-                self.question_prefixes.append(prefix)
-            
+                if len(self.question_prefixes) < max_prefixes:
+                    logger.info(f"QuestionDetector: Learned dynamic prefix: '{prefix}'")
+                    self.question_prefixes.append(prefix)
+                else:
+                    logger.debug(
+                        "QuestionDetector: prefix list at cap (%d); dropping %r",
+                        max_prefixes, prefix,
+                    )
+
             if len(words) >= 3:
                 prefix_3 = " ".join(words[:3]) + " "
                 if prefix_3 not in self.question_prefixes:
-                    logger.info(f"QuestionDetector: Learned dynamic prefix: '{prefix_3}'")
-                    self.question_prefixes.append(prefix_3)
+                    if len(self.question_prefixes) < max_prefixes:
+                        logger.info(f"QuestionDetector: Learned dynamic prefix: '{prefix_3}'")
+                        self.question_prefixes.append(prefix_3)
 
     def reset_fragment_buffer(self, reason: str = "") -> None:
         self.fragment_buffer.clear()

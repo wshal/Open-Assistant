@@ -6,7 +6,14 @@ RESTORATION: High-performance regex-based syntax highlighting + premium styling.
 import re
 import html
 from typing import List, Tuple
+from urllib.parse import urlparse
 from utils.logger import setup_logger
+
+# Issue #25: Allowlist of URL schemes safe to render as a clickable <a href>.
+# Anything else (javascript:, file:, data:, vbscript:, app-specific deep links)
+# is downgraded to the bare label text to prevent local/script actions when the
+# user clicks a model-generated link inside QTextEdit.
+_SAFE_LINK_SCHEMES = {"http", "https", "mailto"}
 
 logger = setup_logger(__name__)
 
@@ -253,14 +260,30 @@ class MarkdownRenderer:
             text,
         )
 
-        # Links
+        # Links — Issue #25: validate URL scheme against allowlist before
+        # producing a clickable <a href>. Anything else renders as plain label text.
         text = re.sub(
             r"\[(.+?)\]\((.+?)\)",
-            r'<a style="color: #6699cc; text-decoration: underline;" href="\2">\1</a>',
+            lambda m: self._safe_link(m.group(1), m.group(2)),
             text,
         )
 
         return text
+
+    def _safe_link(self, label: str, url: str) -> str:
+        try:
+            parsed = urlparse(html.unescape(url).strip())
+        except Exception:
+            return label
+        scheme = (parsed.scheme or "").lower()
+        # Schemeless (relative) URLs and explicitly allow-listed schemes only.
+        if scheme and scheme not in _SAFE_LINK_SCHEMES:
+            return label
+        safe_url = html.escape(parsed.geturl(), quote=True)
+        return (
+            f'<a style="color: #6699cc; text-decoration: underline;" '
+            f'href="{safe_url}">{label}</a>'
+        )
 
     def _render_code_block(self, code: str, language: str = "") -> str:
         """Render a fenced code block with syntax highlighting."""

@@ -71,7 +71,7 @@ class AnthropicProvider(BaseProvider):
 
             return text
         except Exception as e:
-            self.stats.errors += 1
+            self.stats.record_error()
             raise self._handle_error(e)
 
     async def generate_stream(
@@ -97,7 +97,7 @@ class AnthropicProvider(BaseProvider):
 
             self.stats.record(total_tok, time.time() - t0)
         except Exception as e:
-            self.stats.errors += 1
+            self.stats.record_error()
             raise self._handle_error(e)
 
     @staticmethod
@@ -138,8 +138,9 @@ class AnthropicProvider(BaseProvider):
         try:
             message = await self.client.messages.create(
                 model=self.get_model("fast"),
-                max_tokens=10,
+                max_tokens=1,
                 messages=[{"role": "user", "content": "Say 'ok'"}],
+                temperature=0.0,
             )
             return bool(self._extract_text(message.content))
         except Exception as e:

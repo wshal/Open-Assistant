@@ -11,8 +11,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from PyQt6.QtWidgets import QApplication
 
-sys.path.insert(0, str(Path(__file__).parent))
-load_dotenv()
+_APP_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(_APP_ROOT))
+load_dotenv(dotenv_path=_APP_ROOT / ".env")
 
 # Patch SSL on Windows to fallback to certifi if access to system certificate store is denied
 if sys.platform == "win32":
@@ -130,12 +131,19 @@ def cleanup_old_instances():
 
                 if is_same_app:
                     try:
-                        # Use kill() (TerminateProcess) instead of terminate() (CTRL_BREAK) on Windows.
-                        # terminate() sends CTRL_BREAK_EVENT which propagates to the whole console
-                        # process group and can accidentally terminate the NEW process we are launching.
-                        # kill() directly calls TerminateProcess() which is fully isolated.
-                        proc.kill()
-                        proc.wait(timeout=1.0)
+                        # M-9: Try graceful terminate first so the prior
+                        # instance can flush history, release audio, and write
+                        # its on-disk state. On Windows ``terminate()`` maps
+                        # to TerminateProcess (process-scoped, no CTRL_BREAK
+                        # group propagation), so it is safe here. Fall through
+                        # to kill() only if the prior instance refuses to exit
+                        # within 1.5s.
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=1.5)
+                        except psutil.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=1.0)
                     except (psutil.NoSuchProcess, psutil.TimeoutExpired):
                         pass
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
@@ -219,7 +227,12 @@ def main():
             logger.info(f"✅ Added documents from {args.add_docs}")
             return
 
-        signal.signal(signal.SIGINT, lambda *_,: sys.exit(0))
+        _term_handler = lambda *_: sys.exit(0)
+        signal.signal(signal.SIGINT, _term_handler)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _term_handler)
+        if sys.platform != "win32" and hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, _term_handler)
 
         app = OpenAssistApp(config, mini_mode=args.mini)
         try:

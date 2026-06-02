@@ -15,10 +15,26 @@ from PyQt6.QtWidgets import (
     QTextEdit,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QTimer
-from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor
+from PyQt6.QtGui import QTextCursor, QTextCharFormat, QTextBlockFormat, QColor
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+
+class _DoubleClickLabel(QLabel):
+    """QLabel that emits a signal on double-click.
+
+    L-G2: Replaces the prior pattern of monkey-patching
+    ``mouseDoubleClickEvent`` with a lambda that closed over the parent
+    window — that lambda held a strong reference to the parent and kept
+    the cycle (QLabel ↔ MiniOverlay) alive across reloads.
+    """
+
+    doubleClicked = pyqtSignal()
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802 — Qt override
+        self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
 
 
 class MiniOverlay(QMainWindow):
@@ -35,6 +51,7 @@ class MiniOverlay(QMainWindow):
 
     def __init__(self, config, app):
         super().__init__()
+        self.setWindowTitle("OpenAssist Mini Overlay")
         self.config = config
         self.app = app
         self._response = ""
@@ -112,11 +129,11 @@ class MiniOverlay(QMainWindow):
         bl.setContentsMargins(12, 6, 12, 6)
         bl.setSpacing(6)
 
-        self.mode_icon = QLabel("🧠")
+        self.mode_icon = _DoubleClickLabel("🧠")
         self.mode_icon.setStyleSheet("font-size: 15px;")
         self.mode_icon.setToolTip("Double-click for nano/compact mode")
         self.mode_icon.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.mode_icon.mouseDoubleClickEvent = lambda e: self._toggle_nano_mode()
+        self.mode_icon.doubleClicked.connect(self._toggle_nano_mode)
         bl.addWidget(self.mode_icon)
 
         self.input = QLineEdit()
@@ -158,6 +175,18 @@ class MiniOverlay(QMainWindow):
         )
         self.expand_btn.clicked.connect(self._toggle_expand)
         bl.addWidget(self.expand_btn)
+
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedSize(22, 22)
+        self.close_btn.setToolTip("Close or background the app")
+        self.close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_btn.setStyleSheet(
+            "QPushButton { background: rgba(255,255,255,12); color: #cbd5e1; border: none; "
+            "border-radius: 11px; font-size: 11px; padding: 0px; margin: 0px; } "
+            "QPushButton:hover { background: rgba(248,113,113,35); color: #fecaca; }"
+        )
+        self.close_btn.clicked.connect(self._request_close)
+        bl.addWidget(self.close_btn)
         self.ml.addWidget(self.bar)
 
         from ui.markdown_renderer import MarkdownRenderer
@@ -205,6 +234,10 @@ class MiniOverlay(QMainWindow):
         _, _, entry = self.app.history.get_state()
         if entry and entry.get("response"):
             self.on_complete(entry.get("response", ""), entry.get("query", ""))
+
+    def _request_close(self):
+        if hasattr(self.app, "request_close_surface"):
+            self.app.request_close_surface("mini")
 
     def _send(self):
         q = self.input.text().strip()
@@ -272,6 +305,19 @@ class MiniOverlay(QMainWindow):
         self._active_response_text += text
         self._active_response_streaming = True
 
+    def _response_text_cursor(self) -> QTextCursor:
+        """Position response text on its own block after the query header."""
+        cursor = self.response_area.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if (
+            self.response_area.document().blockCount() <= 1
+            and self.response_area.toPlainText().strip()
+        ):
+            block_fmt = QTextBlockFormat()
+            block_fmt.setTopMargin(8)
+            cursor.insertBlock(block_fmt)
+        return cursor
+
     def restore_active_response_view(self) -> bool:
         query = (self._active_response_query or "").strip()
         text = self._active_response_text or ""
@@ -288,8 +334,7 @@ class MiniOverlay(QMainWindow):
                 f"<b>Q:</b> {query}</div>"
             )
             if text:
-                cursor = self.response_area.textCursor()
-                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor = self._response_text_cursor()
                 fmt = QTextCharFormat()
                 fmt.setForeground(QColor("#d0d0e8"))
                 cursor.setCharFormat(fmt)
@@ -330,8 +375,7 @@ class MiniOverlay(QMainWindow):
         sb = self.response_area.verticalScrollBar()
         previous_value = sb.value()
         was_scrolling = bool(self._user_is_scrolling)
-        cursor = self.response_area.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor = self._response_text_cursor()
         fmt = QTextCharFormat()
         fmt.setForeground(QColor("#d0d0e8"))
         cursor.setCharFormat(fmt)
@@ -424,10 +468,18 @@ class MiniOverlay(QMainWindow):
         anim.setEasingCurve(QEasingCurve.Type.OutBack)
         anim.start()
         
+        # M-6: Track the toast, but bind the dismissal timer to ``self`` so that
+        # when the overlay is destroyed the singleShot lambda dies with it
+        # instead of firing into a deleted Qt widget. ``toast.destroyed`` also
+        # purges the list when the toast goes away early.
         if not hasattr(self, "_active_toasts"):
             self._active_toasts = []
         self._active_toasts.append(toast)
-        
+        toast.destroyed.connect(
+            lambda _=None, t=toast: self._active_toasts.remove(t)
+            if t in self._active_toasts else None
+        )
+
         def _dismiss():
             if toast in self._active_toasts:
                 self._active_toasts.remove(toast)
@@ -438,8 +490,11 @@ class MiniOverlay(QMainWindow):
             fade.setEasingCurve(QEasingCurve.Type.InBack)
             fade.finished.connect(toast.deleteLater)
             fade.start()
-            
-        QTimer.singleShot(8000, _dismiss)
+
+        dismiss_timer = QTimer(self)
+        dismiss_timer.setSingleShot(True)
+        dismiss_timer.timeout.connect(_dismiss)
+        dismiss_timer.start(8000)
 
     def set_response(self, text: str):
         self._raw_buffer = text or ""
@@ -658,6 +713,16 @@ class MiniOverlay(QMainWindow):
 
     def mouseReleaseEvent(self, e):
         self._drag = False
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            if getattr(self.app, "session_active", False):
+                event.ignore()
+                return
+            self._request_close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _check_gaze(self):
         """Neural UX: Fades the mini-overlay if mouse is near/over it.

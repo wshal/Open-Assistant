@@ -308,6 +308,13 @@ def _should_defer_for_followup(raw: str, candidate: str) -> bool:
 
     lower = cleaned.lower().rstrip(".?!")
 
+    # ── Continuation punctuation on raw → always defer ──────────────────────
+    # Whisper produces a trailing comma/colon/dash when the speaker pauses
+    # mid-clause. The follow-up clause will arrive in the next transcript.
+    raw_cleaned = " ".join((raw or "").split()).strip()
+    if raw_cleaned.endswith((",", ":", "-", "\u2014", "\u2013")):
+        return True
+
     # ── Open-ended prompts: ALWAYS defer regardless of punctuation ──────────
     # Whisper may or may not add a `?`; we must not depend on it.
     OPEN_ENDED_STARTS = (
@@ -342,7 +349,6 @@ def _should_defer_for_followup(raw: str, candidate: str) -> bool:
         return True
 
     # ── Non-open-ended with explicit ? → treat as complete, don't defer ────
-    raw_cleaned = " ".join((raw or "").split()).strip()
     if "?" in raw_cleaned:
         return False
 
@@ -355,6 +361,7 @@ def _should_defer_for_followup(raw: str, candidate: str) -> bool:
         or lower.endswith("and what")
         or lower.endswith("and why")
     )
+
 
 
 def _needs_long_followup_debounce(text: str) -> bool:
@@ -387,11 +394,14 @@ def _needs_long_followup_debounce(text: str) -> bool:
 
 def _final_dispatch_delay_ms(app: "OpenAssistApp", raw: str, candidate: str) -> int:
     default_delay_ms = max(0, int(app.config.get("ai.auto_mode.final_dispatch_debounce_ms", 900) or 900))
+    long_ms = int(app.config.get("ai.auto_mode.open_ended_followup_debounce_ms", 5200) or 5200)
+    # Comma/colon/dash at end of raw transcript signals an incomplete sentence
+    # (Whisper strips trailing punctuation when the speaker pauses mid-clause).
+    raw_cleaned = " ".join((raw or "").split()).strip()
+    if raw_cleaned.endswith((",", ":", "-", "\u2014", "\u2013")):
+        return max(default_delay_ms, long_ms)
     if _needs_long_followup_debounce(candidate or raw):
-        return max(
-            default_delay_ms,
-            int(app.config.get("ai.auto_mode.open_ended_followup_debounce_ms", 5200) or 5200),
-        )
+        return max(default_delay_ms, long_ms)
     return default_delay_ms
 
 
@@ -420,12 +430,7 @@ def _dispatch_auto_query(
     request_metadata = dict(request_metadata or {})
     preamble = (getattr(app, "_auto_answer_context", "") or "").strip()
     if preamble and hasattr(app, "ai") and hasattr(app.ai, "set_session_context"):
-        context_block = (
-            "[RECENT SPOKEN CONTEXT]\n"
-            "Use this only when it helps disambiguate the user's current question. "
-            "Ignore it if the current question is clearly unrelated.\n"
-            f"{preamble}"
-        )
+        context_block = f"[SPOKEN CONTEXT]\n{preamble}"
         app.ai.set_session_context(context_block)
         request_metadata["preserve_session_context"] = True
         logger.info(
@@ -558,7 +563,13 @@ def _merge_pending_final_dispatch(
     merged_candidate = (sanitize_query_label(merge_transcripts(pending, candidate, max_overlap_words=24)) or candidate).strip()
     metadata = dict(getattr(app, "_auto_final_pending_metadata", None) or {})
     metadata.update(dict(request_metadata or {}))
-    followup_delay_ms = max(0, int(app.config.get("ai.auto_mode.final_dispatch_debounce_ms", 900) or 900))
+    # Most merged follow-ups dispatch quickly. If the merged raw transcript
+    # still ends mid-clause, keep the longer debounce for the next clause.
+    merged_raw_cleaned = " ".join((merged_raw or "").split()).strip()
+    if merged_raw_cleaned.endswith((",", ":", "-", "\u2014", "\u2013")):
+        followup_delay_ms = _final_dispatch_delay_ms(app, merged_raw, merged_candidate)
+    else:
+        followup_delay_ms = max(0, int(app.config.get("ai.auto_mode.final_dispatch_debounce_ms", 900) or 900))
     _schedule_final_dispatch(
         app,
         merged_candidate,

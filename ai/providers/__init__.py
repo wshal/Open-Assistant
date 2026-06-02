@@ -1,6 +1,6 @@
 """Provider registry - discovers and initialises all AI providers from config."""
 
-import asyncio
+import time
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -11,47 +11,121 @@ def _is_health_check_custom(provider) -> bool:
     return isinstance(provider, BaseProvider) and provider.supports_health_check()
 
 
+def _provider_is_enabled(config, name: str) -> bool:
+    try:
+        enabled = config.get(f"ai.providers.{name}.enabled", True)
+    except Exception:
+        enabled = True
+    return bool(enabled)
+
+
+def _provider_has_key(config, name: str) -> bool:
+    checker = getattr(config, "has_provider_key", None)
+    if callable(checker):
+        try:
+            return bool(checker(name))
+        except Exception:
+            pass
+
+    getter = getattr(config, "get_api_key", None)
+    if callable(getter):
+        try:
+            return bool(str(getter(name) or "").strip())
+        except Exception:
+            pass
+
+    try:
+        raw = config.get(f"ai.providers.{name}.api_key", "")
+    except Exception:
+        raw = ""
+    return bool(str(raw or "").strip()) or name == "ollama"
+
+
 def init_providers(config) -> dict:
     """Instantiate every configured provider and return the enabled ones."""
-    from ai.providers.groq_provider import GroqProvider
-    from ai.providers.gemini_provider import GeminiProvider
-    from ai.providers.cerebras_provider import CerebrasProvider
-    from ai.providers.mistral_provider import MistralProvider
-    from ai.providers.cohere_provider import CohereProvider
-    from ai.providers.ollama_provider import OllamaProvider
-    from ai.providers.openai_compat import OpenAICompatProvider
+    def _groq():
+        from ai.providers.groq_provider import GroqProvider
+        return GroqProvider(config)
 
-    candidates = {
-        "groq":       lambda: GroqProvider(config),
-        "gemini":     lambda: GeminiProvider(config),
-        "cerebras":   lambda: CerebrasProvider(config),
-        "sambanova":  lambda: OpenAICompatProvider("sambanova", config, "https://api.sambanova.ai/v1"),
-        "together":   lambda: OpenAICompatProvider("together", config, "https://api.together.xyz/v1"),
-        "openrouter": lambda: OpenAICompatProvider("openrouter", config, "https://openrouter.ai/api/v1"),
-        "hyperbolic": lambda: OpenAICompatProvider("hyperbolic", config, "https://api.hyperbolic.xyz/v1"),
-        "mistral":    lambda: MistralProvider(config),
-        "cohere":     lambda: CohereProvider(config),
-        "ollama":     lambda: OllamaProvider(config),
+    def _gemini():
+        from ai.providers.gemini_provider import GeminiProvider
+        return GeminiProvider(config)
+
+    def _cerebras():
+        from ai.providers.cerebras_provider import CerebrasProvider
+        return CerebrasProvider(config)
+
+    def _sambanova():
+        from ai.providers.openai_compat import OpenAICompatProvider
+        return OpenAICompatProvider("sambanova", config, "https://api.sambanova.ai/v1")
+
+    def _together():
+        from ai.providers.openai_compat import OpenAICompatProvider
+        return OpenAICompatProvider("together", config, "https://api.together.xyz/v1")
+
+    def _openrouter():
+        from ai.providers.openai_compat import OpenAICompatProvider
+        return OpenAICompatProvider("openrouter", config, "https://openrouter.ai/api/v1")
+
+    def _hyperbolic():
+        from ai.providers.openai_compat import OpenAICompatProvider
+        return OpenAICompatProvider("hyperbolic", config, "https://api.hyperbolic.xyz/v1")
+
+    def _mistral():
+        from ai.providers.mistral_provider import MistralProvider
+        return MistralProvider(config)
+
+    def _cohere():
+        from ai.providers.cohere_provider import CohereProvider
+        return CohereProvider(config)
+
+    def _ollama():
+        from ai.providers.ollama_provider import OllamaProvider
+        return OllamaProvider(config)
+
+    candidate_factories = {
+        "groq": _groq,
+        "gemini": _gemini,
+        "cerebras": _cerebras,
+        "sambanova": _sambanova,
+        "together": _together,
+        "openrouter": _openrouter,
+        "hyperbolic": _hyperbolic,
+        "mistral": _mistral,
+        "cohere": _cohere,
+        "ollama": _ollama,
     }
 
     try:
-        from ai.providers.openai_provider import OpenAIProvider
-        candidates["openai"] = lambda: OpenAIProvider(config)
+        def _openai():
+            from ai.providers.openai_provider import OpenAIProvider
+            return OpenAIProvider(config)
+
+        candidate_factories["openai"] = _openai
     except ImportError:
         pass
 
     try:
-        from ai.providers.anthropic_provider import AnthropicProvider
-        candidates["anthropic"] = lambda: AnthropicProvider(config)
+        def _anthropic():
+            from ai.providers.anthropic_provider import AnthropicProvider
+            return AnthropicProvider(config)
+
+        candidate_factories["anthropic"] = _anthropic
     except ImportError:
         pass
 
     providers = {}
-    validate = config.get("ai.providers.validate_on_init", False)
-    timeout = config.get("ai.providers.health_check_timeout", 5)
+    started_at = time.time()
+    skipped = []
 
-    # First, instantiate all configured providers
-    for name, factory in candidates.items():
+    # First, instantiate only providers that are both enabled and configured.
+    for name, factory in candidate_factories.items():
+        if not _provider_is_enabled(config, name):
+            skipped.append(f"{name} (disabled)")
+            continue
+        if name != "ollama" and not _provider_has_key(config, name):
+            skipped.append(f"{name} (no key)")
+            continue
         try:
             prov = factory()
             if prov.enabled:
@@ -59,33 +133,22 @@ def init_providers(config) -> dict:
         except Exception as exc:
             logger.warning(f"  x {name} failed to load: {exc}")
 
-    # If validation is enabled, run all health checks concurrently to prevent massive startup delays
-    if validate and providers:
-        async def _check_provider(name, prov):
-            if not _is_health_check_custom(prov):
-                return
-            try:
-                ok = await asyncio.wait_for(prov.health_check(), timeout=timeout)
-                if not ok:
-                    prov.enabled = False
-                    logger.warning(f"  x {name} failed health check")
-            except Exception as exc:
-                prov.enabled = False
-                logger.warning(f"  x {name} health check failed: {exc}")
+    if skipped:
+        logger.info("Skipping unconfigured providers: %s", ", ".join(skipped))
+    if providers and bool(config.get("ai.providers.validate_on_init", True)):
+        # Validation is now kicked off by AIEngine.warmup() on the app loop so
+        # it runs in parallel with Whisper, OCR, and the rest of startup.
+        # Keeping it out of this hot path removes a large synchronous stall.
+        logger.info(
+            "Provider validation deferred to background (%d provider(s) loaded)",
+            len(providers),
+        )
 
-        async def _run_all_checks():
-            tasks = [_check_provider(name, prov) for name, prov in providers.items()]
-            await asyncio.gather(*tasks)
-
-        try:
-            asyncio.run(_run_all_checks())
-        except Exception as e:
-            logger.error(f"Provider health check batch failed: {e}")
-
-        # Filter out providers that failed validation
-        providers = {name: prov for name, prov in providers.items() if prov.enabled}
-
-    active = list(providers.keys())
+    active = [
+        name
+        for name, prov in providers.items()
+        if getattr(prov, "health_state", lambda: "unknown")() != "down"
+    ]
     if active:
         logger.info(f"Providers active: {', '.join(active)}")
     else:

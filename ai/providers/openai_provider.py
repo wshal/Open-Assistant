@@ -63,13 +63,15 @@ class OpenAIProvider(BaseProvider):
 
             response = await self.client.chat.completions.create(**kwargs)
 
+            if not response.choices:
+                raise Exception(f"OpenAI returned empty choices list (model={model})")
             text = response.choices[0].message.content or ""
             tok = response.usage.total_tokens if response.usage else len(text) // 4
             self.stats.record(tok, time.time() - t0)
             return text
 
         except Exception as e:
-            self.stats.errors += 1
+            self.stats.record_error()
             raise self._handle_error(e)
 
     async def generate_stream(
@@ -103,7 +105,7 @@ class OpenAIProvider(BaseProvider):
             self.stats.record(tok, time.time() - t0)
 
         except Exception as e:
-            self.stats.errors += 1
+            self.stats.record_error()
             raise self._handle_error(e)
 
     @staticmethod
@@ -180,12 +182,14 @@ class OpenAIProvider(BaseProvider):
                 kwargs["temperature"] = 0.4
 
             response = await self.client.chat.completions.create(**kwargs)
+            if not response.choices:
+                raise Exception(f"OpenAI returned empty choices list (model={model})")
             text = response.choices[0].message.content or ""
             tok = response.usage.total_tokens if response.usage else len(text) // 4
             self.stats.record(tok, time.time() - t0)
             return text
         except Exception as e:
-            self.stats.errors += 1
+            self.stats.record_error()
             raise self._handle_error(e)
 
     def supports_vision_stream(self) -> bool:
@@ -246,5 +250,21 @@ class OpenAIProvider(BaseProvider):
 
             self.stats.record(tok, time.time() - t0)
         except Exception as e:
-            self.stats.errors += 1
+            self.stats.record_error()
             raise self._handle_error(e)
+
+    async def health_check(self) -> bool:
+        """Verify the API key by completing a minimal chat request."""
+        try:
+            model = self.get_model("fast")
+            if not model:
+                return False
+            messages = self._build_messages("Health check.", "Hi", model)
+            kwargs = {"model": model, "messages": messages, "max_tokens": 1}
+            if not model.startswith("o"):
+                kwargs["temperature"] = 0.0
+            response = await self.client.chat.completions.create(**kwargs)
+            return bool(getattr(response, "choices", None))
+        except Exception as e:
+            logger.debug("OpenAI health check failed: %s", e)
+            return False

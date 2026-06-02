@@ -1,9 +1,10 @@
 """Base provider with stats tracking and rate limiting."""
 
 import time
+import threading
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -18,14 +19,22 @@ class Stats:
     total_tokens: int = 0
     last_latency: float = 0.0
     tps: float = 0.0
+    # Issue #13: parallel inference races mutate counters/tps; serialise updates.
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def record(self, tokens: int, latency: float):
-        self.requests += 1
-        self.total_tokens += tokens
-        self.total_time += latency
-        self.last_latency = latency
-        if latency > 0:
-            self.tps = self.tps * 0.7 + (tokens / latency) * 0.3
+        with self._lock:
+            self.requests += 1
+            self.total_tokens += int(tokens or 0)
+            self.total_time += float(latency or 0.0)
+            self.last_latency = float(latency or 0.0)
+            if latency > 0:
+                self.tps = self.tps * 0.7 + (tokens / latency) * 0.3
+
+    def record_error(self):
+        """Thread-safe error counter increment."""
+        with self._lock:
+            self.errors += 1
 
     @property
     def success_rate(self):
@@ -54,7 +63,14 @@ class BaseProvider(ABC):
         self._disabled_until = 0.0
         self._disabled_reason = ""
         self._disabled_at = 0.0
+        self._health_state = "unknown"
+        self._health_reason = ""
+        self._health_checked_at = 0.0
         self.failure_cooldown = self.pcfg.get("failure_cooldown", 30)
+        # Issue #13: serialise _req_times mutations across parallel/race callers.
+        self._rate_lock = threading.Lock()
+        # Track last successful request time for idle connection detection.
+        self._last_request_time: float = 0.0
 
     def get_model(self, tier: str = None) -> str:
         """
@@ -97,28 +113,69 @@ class BaseProvider(ABC):
     def disabled_reason(self) -> str:
         return str(self._disabled_reason or "").strip()
 
+    def health_state(self) -> str:
+        return str(self._health_state or "unknown")
+
+    def health_reason(self) -> str:
+        return str(self._health_reason or "").strip()
+
+    def health_checked_at(self) -> float:
+        return float(self._health_checked_at or 0.0)
+
+    def set_health_state(self, state: str, reason: str = "") -> None:
+        state = (state or "unknown").strip().lower()
+        if state not in {"active", "down", "cooldown", "unknown"}:
+            state = "unknown"
+        self._health_state = state
+        self._health_reason = str(reason or "").strip()
+        self._health_checked_at = time.time()
+
+    def is_available(self) -> bool:
+        return self.enabled and not self.is_disabled() and self.health_state() != "down"
+
     def disable(self, seconds: int = None, reason: str = ""):
         duration = seconds if seconds is not None else self.failure_cooldown
         now = time.time()
-        self._disabled_until = now + duration
-        self._disabled_at = now
-        self._disabled_reason = str(reason or "").strip()
+        with self._rate_lock:  # Guard against torn reads in _pre_request's is_disabled()
+            self._disabled_until = now + duration
+            self._disabled_at = now
+            self._disabled_reason = str(reason or "").strip()
         logger.warning(
             f"{self.name}: temporarily disabled for {duration}s after failure"
             + (f" ({self._disabled_reason})" if self._disabled_reason else "")
         )
 
     def check_rate(self) -> bool:
+        # Issue #13: lock both the prune and the read so a parallel _pre_request
+        # can't append between this thread's prune and its capacity check.
         now = time.time()
-        self._req_times = [t for t in self._req_times if now - t < 60]
-        return len(self._req_times) < self.rpm and not self.is_disabled()
+        with self._rate_lock:
+            self._req_times = [t for t in self._req_times if now - t < 60]
+            return len(self._req_times) < self.rpm and not self.is_disabled()
+
+    def idle_seconds(self) -> float:
+        """Seconds since the last successful request (0.0 if never called)."""
+        if self._last_request_time == 0.0:
+            return 0.0
+        return time.time() - self._last_request_time
+
+    _MAX_REQ_TIMES = 1000  # Safety cap to prevent unbounded list growth
 
     def _pre_request(self):
-        if not self.check_rate():
-            raise Exception(
-                f"{self.name}: rate limit ({self.rpm} RPM) or temporary cooldown"
-            )
-        self._req_times.append(time.time())
+        # Issue #13: atomic check + append. Previously two threads could both
+        # pass check_rate() before either recorded, exceeding the RPM ceiling.
+        now = time.time()
+        with self._rate_lock:
+            self._req_times = [t for t in self._req_times if now - t < 60]
+            # Safety cap: prevent pathological growth if pruning is starved
+            if len(self._req_times) > self._MAX_REQ_TIMES:
+                self._req_times = self._req_times[-self._MAX_REQ_TIMES:]
+            if len(self._req_times) >= self.rpm or self.is_disabled():
+                raise Exception(
+                    f"{self.name}: rate limit ({self.rpm} RPM) or temporary cooldown"
+                )
+            self._req_times.append(now)
+            self._last_request_time = now
 
     @abstractmethod
     async def generate(self, system: str, user: str, tier: str = None) -> str:
@@ -157,11 +214,13 @@ class BaseProvider(ABC):
         raise NotImplementedError(f"{self.name} does not support streaming image analysis")
 
     async def health_check(self) -> bool:
-        try:
-            r = await self.generate("Say ok.", "ok", "fast")
-            return bool(r)
-        except Exception:
-            return False
+        """Lightweight availability probe. Does NOT consume RPM quota.
+
+        Subclasses that support a dedicated ping/status endpoint should override
+        this. The default simply reflects whether the provider is enabled and
+        not in a cooldown period.
+        """
+        return self.enabled and not self.is_disabled()
 
     def __repr__(self):
         return f"<{self.name} spd={self.speed} qual={self.quality} ok={self.stats.success_rate:.0%}>"

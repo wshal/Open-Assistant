@@ -36,14 +36,17 @@ _DOCUMENTS_DIR = Path(DOCS_DIR)
 # ---------------------------------------------------------------------------
 
 def extract_text_from_pdf(pdf_path: Path) -> str:
-    """Extract all text from a PDF using PyMuPDF (fitz). Returns plain text."""
+    """Extract all text from a PDF using PyMuPDF (fitz). Returns plain text.
+
+    Issue #16: Use ``with fitz.open(...)`` so the document handle is closed
+    deterministically even when ``page.get_text()`` raises mid-iteration.
+    """
     try:
         import fitz  # PyMuPDF
-        doc = fitz.open(str(pdf_path))
-        pages = []
-        for page in doc:
-            pages.append(page.get_text())
-        doc.close()
+        pages: List[str] = []
+        with fitz.open(str(pdf_path)) as doc:
+            for page in doc:
+                pages.append(page.get_text())
         return "\n\n".join(pages)
     except Exception as e:
         logger.warning(f"[Ingest] PDF extraction failed for {pdf_path.name}: {e}")
@@ -134,8 +137,14 @@ def ingest_all(rag_engine, documents_dir: Path = _DOCUMENTS_DIR) -> None:
     documents_dir = Path(documents_dir)
     documents_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── GAP 7: mtime manifest ────────────────────────────────────────────────
+    # ── GAP 7 + Issue #17: SHA-256 content manifest with stale-source cleanup ──
+    # The old manifest keyed on st_mtime alone, so content edits that preserved
+    # mtime were missed and deleted/renamed sources never had their chunks
+    # removed from Chroma. We now key on a content hash and explicitly delete
+    # chunks whose source no longer exists on disk.
     import json as _json
+    import hashlib as _hashlib
+
     _manifest_path = documents_dir / ".ingest_manifest.json"
     try:
         _manifest: dict = _json.loads(_manifest_path.read_text(encoding="utf-8"))
@@ -148,11 +157,53 @@ def ingest_all(rag_engine, documents_dir: Path = _DOCUMENTS_DIR) -> None:
         except Exception:
             return ""
 
+    def _fingerprint(p: Path) -> str:
+        try:
+            h = _hashlib.sha256()
+            with p.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return ""
+
+    def _entry_for(p: Path) -> dict:
+        return {"sha256": _fingerprint(p), "mtime": _mtime(p)}
+
     def _unchanged(p: Path) -> bool:
-        return _manifest.get(str(p)) == _mtime(p)
+        entry = _manifest.get(str(p))
+        # Back-compat: previous manifest stored a bare mtime string.
+        if isinstance(entry, str):
+            return False  # force re-ingest under the new format
+        if not isinstance(entry, dict):
+            return False
+        return bool(entry.get("sha256")) and entry["sha256"] == _fingerprint(p)
 
     def _mark(p: Path) -> None:
-        _manifest[str(p)] = _mtime(p)
+        _manifest[str(p)] = _entry_for(p)
+
+    def _remove_deleted_sources() -> bool:
+        """Drop manifest entries whose source file no longer exists and delete
+        their chunks from the Chroma collection. Returns True if any removal
+        occurred."""
+        removed = False
+        if rag_engine.collection is None:
+            return removed
+        for source in list(_manifest.keys()):
+            if Path(source).exists():
+                continue
+            try:
+                rag_engine.collection.delete(where={"source": source})
+            except Exception as e:
+                logger.debug(
+                    "[Ingest] Could not delete chunks for missing source %s: %s",
+                    source,
+                    e,
+                )
+            finally:
+                _manifest.pop(source, None)
+                removed = True
+        return removed
 
     _anything_new = False
 
@@ -177,6 +228,21 @@ def ingest_all(rag_engine, documents_dir: Path = _DOCUMENTS_DIR) -> None:
     if not getattr(rag_engine, "enabled", False) or rag_engine.collection is None:
         return
 
+    # Issue #17: remove chunks belonging to sources that no longer exist on disk.
+    if _remove_deleted_sources():
+        _anything_new = True
+
+    def _purge_source(source: str) -> None:
+        # Issue #17: When a tracked file's content has changed, drop its old
+        # chunks from Chroma before re-indexing so retrieval can't surface
+        # stale text that's no longer in the source.
+        try:
+            rag_engine.collection.delete(where={"source": source})
+        except Exception as e:
+            logger.debug(
+                "[Ingest] Could not purge stale chunks for %s: %s", source, e
+            )
+
     for path in documents_dir.rglob("*"):
         if path.name.startswith(".") or not path.is_file():
             continue
@@ -185,6 +251,10 @@ def ingest_all(rag_engine, documents_dir: Path = _DOCUMENTS_DIR) -> None:
         if _unchanged(path):
             logger.debug("[Ingest] Unchanged — skip: %s", path.name)
             continue
+
+        # Issue #17: previously-tracked file whose content changed → purge stale chunks.
+        if str(path) in _manifest:
+            _purge_source(str(path))
 
         # PDF
         if suffix == ".pdf":

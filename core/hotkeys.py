@@ -15,6 +15,7 @@ class HotkeySignals(QObject):
     triggered = pyqtSignal(str)
     started = pyqtSignal(str)
     stopped = pyqtSignal(str)
+    invoke = pyqtSignal(object)
 
 
 class NativeHotkeyThread(threading.Thread):
@@ -98,6 +99,7 @@ class HotkeyManager:
         self.active_keys = {}
         self._id_to_action = {}
         self.signals.triggered.connect(self._handle_trigger)
+        self.signals.invoke.connect(lambda callback: callback())
         self.signals.started.connect(
             lambda n: (
                 self.app.start_move(n.replace("move_", ""))
@@ -162,7 +164,7 @@ class HotkeyManager:
             "toggle_click_through": self.app.toggle_click_through,
         }
         if action in bridges:
-            QTimer.singleShot(0, bridges[action])
+            self.signals.invoke.emit(bridges[action])
 
     def _handle_native_trigger(self, hotkey_id):
         action = self._id_to_action.get(hotkey_id)
@@ -186,10 +188,26 @@ class HotkeyManager:
             self.native_thread.join(timeout=1.0)  # Ensure it's dead
 
         if hasattr(self, "listener"):
-            try:
-                self.listener.stop()
-            except Exception as e:
-                logger.debug(f"Hotkey listener stop: {e}")
+            # M-8: pynput's ``Listener.stop()`` can block indefinitely on
+            # some platforms when the input grabber is wedged (X11, Wayland,
+            # remote-desktop sessions). Issue the stop on a daemon thread and
+            # give it a hard wall-clock cap so shutdown always returns.
+            import threading as _th
+
+            def _do_stop(lst):
+                try:
+                    lst.stop()
+                except Exception as e:
+                    logger.debug(f"Hotkey listener stop: {e}")
+
+            stopper = _th.Thread(
+                target=_do_stop, args=(self.listener,),
+                daemon=True, name="hotkey-stop",
+            )
+            stopper.start()
+            stopper.join(timeout=1.5)
+            if stopper.is_alive():
+                logger.warning("Hotkey listener.stop() did not return within 1.5s; abandoning")
 
         self.active_keys.clear()
         self._id_to_action.clear()

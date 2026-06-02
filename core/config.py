@@ -129,7 +129,7 @@ class Config:
     def _load(self):
         if self._path.exists():
             try:
-                with open(self._path) as f:
+                with open(self._path, encoding="utf-8") as f:
                     self._data = yaml.safe_load(f) or {}
             except Exception as e:
                 logger.error(f"Config: Malformed YAML in {self._path}: {e}")
@@ -138,7 +138,9 @@ class Config:
 
         migrated = self._migrate_plaintext_keys_from_yaml()
         self._apply_defaults()
-        self.set("stealth.enabled", True)
+        # Issue #3: Do NOT force stealth.enabled=True here — _apply_defaults
+        # already supplies the default on first run, and forcing it every load
+        # clobbers a user-saved stealth.enabled=false on every startup.
         self._resolve_env(self._data)
         self._inject_secrets()
         self._disable_providers_without_keys()
@@ -249,6 +251,17 @@ class Config:
         self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("enabled", True)
         self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("stability_ms", 650)
         self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("delay_ms", 250)
+        self._data["ai"].setdefault("providers", {})
+        # Keep boot light: provider availability is shown from configuration,
+        # and live health checks are only run on explicit test or background
+        # request failure. This avoids quota churn from probing every provider
+        # at startup.
+        self._data["ai"]["providers"].setdefault("validate_on_init", False)
+        self._data["ai"]["providers"].setdefault("health_check_timeout", 4)
+        self._data["ai"]["providers"].setdefault("groq", {})
+        # Periodic pings can reduce first-token latency after idle gaps, but
+        # each ping is still a Groq API request and can consume free-tier RPM.
+        self._data["ai"]["providers"]["groq"].setdefault("keepalive_enabled", False)
 
         # P1: Provider health polling (adaptive)
         self._data["ai"].setdefault("health", {})
@@ -267,7 +280,7 @@ class Config:
 
         self._data.setdefault("capture", {})
         self._data["capture"].setdefault("screen", {})
-        self._data["capture"]["screen"].setdefault("enabled", True)
+        self._data["capture"]["screen"].setdefault("enabled", False)
         self._data["capture"]["screen"].setdefault("interval_ms", 500)
         self._data["capture"]["screen"].setdefault("quality", "medium")
         self._data["capture"]["screen"].setdefault("smart_crop", True)
@@ -285,6 +298,8 @@ class Config:
 
         # Phase 2: Transcription provider ("local" = faster-whisper, "groq" = Groq Cloud)
         self._data["capture"].setdefault("audio", {})
+        self._data["capture"]["audio"].setdefault("enabled", True)
+        self._data["capture"]["audio"].setdefault("muted", False)
         self._data["capture"]["audio"].setdefault("transcription_provider", "groq")
         self._data["capture"]["audio"].setdefault("groq_stt_model", "whisper-large-v3-turbo")
         self._data["capture"]["audio"].setdefault("groq_stt_timeout_s", 8.0)
@@ -643,8 +658,33 @@ class Config:
         return data
 
     def save(self):
-        with open(self._path, 'w') as f:
-            yaml.dump(self._data_for_save(), f, default_flow_style=False, allow_unicode=True)
+        # Issue #26: Atomic write. yaml.dump straight onto self._path can leave a
+        # truncated file on crash/power-loss/kill, causing _load() to fall back to
+        # defaults on next start and wipe user configuration. Write to a sibling
+        # .tmp in the same directory, then os.replace() onto the destination.
+        import tempfile
+
+        config_dir = str(self._path.parent)
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        fd, tmp_path = tempfile.mkstemp(dir=config_dir, suffix=".yaml.tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.dump(
+                    self._data_for_save(),
+                    f,
+                    default_flow_style=False,
+                    allow_unicode=True,
+                )
+            os.replace(tmp_path, str(self._path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def reset_all(self):
         """Restore config to first-run state and wipe encrypted secrets."""
@@ -656,21 +696,43 @@ class Config:
 
     def set_api_key(self, provider: str, key: str):
         # Clean the key before saving
-        clean = key.strip().strip('"').strip("'").strip()
+        clean = (key or "").strip().strip('"').strip("'").strip()
 
         self.secrets.set_api_key(provider, clean)
         ai_cfg = self._data.setdefault("ai", {})
         provs = ai_cfg.setdefault("providers", {})
         prov_cfg = provs.setdefault(provider, {})
         prov_cfg["api_key"] = clean
-        prov_cfg["enabled"] = bool(clean)
+        # Issue #4: Ollama runs locally without a key, so keep it enabled even
+        # when the "key" (endpoint) is empty. Everything else is enabled only
+        # when a key is actually present.
+        prov_cfg["enabled"] = True if provider == "ollama" else bool(clean)
         from core.constants import PROVIDERS
         env_key = PROVIDERS.get(provider, {}).get("env_key", "")
         if env_key:
-            os.environ[env_key] = clean
+            # Issue #4: Clearing a key must unset the env var, not leave it set
+            # to an empty string. Some SDKs treat "" differently from absent,
+            # which surfaces as confusing auth errors rather than clean fallback.
+            if clean:
+                os.environ[env_key] = clean
+            else:
+                os.environ.pop(env_key, None)
 
     def get_api_key(self, provider: str) -> str:
-        return self.secrets.get_api_key(provider)
+        # Issue #4: Fall back to the env var so runtime behaviour stays
+        # consistent with _get_raw_key()/_inject_secrets() after a clear.
+        stored = self.secrets.get_api_key(provider)
+        if stored:
+            return stored
+        from core.constants import PROVIDERS
+        env_key = PROVIDERS.get(provider, {}).get("env_key", "")
+        return os.environ.get(env_key, "") if env_key else ""
+
+    def has_provider_key(self, provider: str) -> bool:
+        """Return True when the provider has a usable key or local endpoint."""
+        if str(provider).lower() == "ollama":
+            return True
+        return bool((self.get_api_key(provider) or "").strip())
 
     @property
     def data(self):

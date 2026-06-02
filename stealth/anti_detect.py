@@ -1,6 +1,7 @@
 """Always-on anti-capture helpers for overlay windows."""
 
 import ctypes
+from ctypes import c_void_p
 import sys
 
 from PyQt6.QtCore import Qt
@@ -191,9 +192,10 @@ class StealthManager:
         self._last_affinity_state[hwnd] = current
 
     def _macos_anti_capture(self, window, enabled):
-        """macOS: AppKit native stealth for Mission Control and all-workspaces."""
+        """macOS: AppKit native stealth — hide from screen recording via NSWindowSharingNone."""
         try:
-            window.setWindowFlag(Qt.WindowType.WindowTransparentForInput, enabled)
+            # NOTE: WindowTransparentForInput was WRONG here — it disables mouse/keyboard
+            # input but does nothing to prevent screen capture. Removed.
 
             # Native AppKit behavior (Dynamic loading to prevent IDE errors on Windows)
             try:
@@ -204,9 +206,13 @@ class StealthManager:
                 hwnd = int(window.winId())
                 if hwnd != 0:
                     # winId on macOS PyQt returns a pointer to the NSView
-                    ns_view = objc.objc_object(c_void_p=hwnd)
+                    ns_view = objc.objc_object(c_void_p=c_void_p(hwnd))
                     ns_window = ns_view.window()
                     if ns_window is not None:
+                        # NSWindowSharingNone = 0  → hidden from all screen capture APIs
+                        # NSWindowSharingReadOnly = 1 → visible to capture (default)
+                        ns_window.setSharingType_(0 if enabled else 1)
+
                         can_join = appkit.NSWindowCollectionBehaviorCanJoinAllSpaces
                         move_to_active = appkit.NSWindowCollectionBehaviorMoveToActiveSpace
                         transient = appkit.NSWindowCollectionBehaviorTransient
@@ -216,7 +222,7 @@ class StealthManager:
                             behavior |= transient
 
                         ns_window.setCollectionBehavior_(behavior)
-                        logger.info("Stealth: macOS AppKit NSWindow behaviors applied.")
+                        logger.info("Stealth: macOS AppKit NSWindow behaviors applied (NSWindowSharingNone).")
             except ImportError:
                 logger.debug(
                     "Stealth: pyobjc not installed. Skipping native macOS window behaviors."
@@ -227,7 +233,7 @@ class StealthManager:
                 )
 
             logger.info(
-                f"Stealth: macOS transparency {'enabled' if enabled else 'disabled'}"
+                f"Stealth: macOS stealth {'enabled' if enabled else 'disabled'}"
             )
             self._set_status(
                 "limited",
@@ -236,6 +242,7 @@ class StealthManager:
         except Exception as e:
             logger.warning(f"macOS stealth: {e}")
             self._set_status("error", f"macOS stealth failed: {e}")
+
 
     def _linux_anti_capture(self, window, enabled):
         """Linux: best-effort only; compositor behavior varies."""

@@ -10,6 +10,7 @@ config.yaml
 *.enc
 data/settings.enc
 data/history.enc
+data/master.key
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🗃️  Runtime / User-Generated Data  (auto-generated, user-specific)

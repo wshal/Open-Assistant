@@ -32,110 +32,22 @@ _WINDOWS_SHELL_BUILTINS = {"dir", "set", "start"}
 # command_template_fn(match, cwd) -> Optional[List[str]]
 # Returns None if the action should NOT execute (safety block).
 
+# Issue #1: Restrict auto-action surface to read-only, low-risk commands only.
+# Removed: npm install/start/dev/build/test, yarn dev, next dev, vite, run_python_file,
+#          run_node_file, open_file, show_env, scan_errors. These could install packages,
+#          execute project scripts, leak environment variables (API keys), or open
+#          untrusted files in OS apps — all triggerable from spoken/OCR-derived prompts.
+# Kept: git read-only commands, version checks, pip list, list files, show tree, which.
 _BLOCKED_PATTERNS = [
-    re.compile(r"\b(rm|del|rmdir|rd|format|drop|truncate|shred|wipe|destroy)\b", re.I),
+    re.compile(
+        r"\b(rm|del|rmdir|rd|format|drop|truncate|shred|wipe|destroy|"
+        r"env|environment|secret|api[_ -]?key|token|password|credential)\b",
+        re.I,
+    ),
 ]
 
 _INTENT_RULES: List[Tuple[str, re.Pattern, Any]] = [
-    # --- Testing ---
-    (
-        "run_pytest",
-        re.compile(r"\b(run|execute)\b.{0,30}\bpytest\b|\bpytest\b.{0,20}\b(run|now)\b", re.I),
-        lambda m, cwd: ["python", "-m", "pytest", "--tb=short", "-q"],
-    ),
-    (
-        "run_tests",
-        re.compile(r"\b(run|execute)\s+(?:all\s+)?tests?\b", re.I),
-        lambda m, cwd: (
-            ["python", "-m", "pytest", "--tb=short", "-q"]
-            if (Path(cwd) / "pytest.ini").exists() or (Path(cwd) / "pyproject.toml").exists()
-            else ["python", "-m", "unittest", "discover"]
-        ),
-    ),
-    # --- Run specific file ---
-    (
-        "run_python_file",
-        re.compile(r"\b(run|execute)\s+([\w./\\]+\.py)\b", re.I),
-        lambda m, cwd: ["python", m.group(2)],
-    ),
-    (
-        "run_node_file",
-        re.compile(r"\b(run|execute|node)\s+([\w./\\]+\.[jt]s)\b", re.I),
-        lambda m, cwd: ["node", m.group(2)],
-    ),
-    # --- npm / Node ecosystem ---
-    (
-        "node_version",
-        re.compile(r"\bnode\s*(?:\.js)?\s*version\b|\bwhich\s+node\b|\bnode\s+-v\b", re.I),
-        lambda m, cwd: ["node", "--version"],
-    ),
-    (
-        "npm_version",
-        re.compile(r"\bnpm\s+version\b|\bwhich\s+npm\b|\bnpm\s+-v\b", re.I),
-        lambda m, cwd: ["npm", "--version"],
-    ),
-    (
-        "npm_install",
-        re.compile(r"\bnpm\s+install\b|\binstall\s+(?:the\s+)?(?:npm\s+)?packages?\b|\bnpm\s+i\b", re.I),
-        lambda m, cwd: ["npm", "install"],
-    ),
-    (
-        "npm_start",
-        # Note: 'start dev server' is handled by npm_dev above — npm_start covers npm run start only
-        re.compile(r"\bnpm\s+(?:run\s+)?start\b|\bstart\s+(?:the\s+)?server\b(?!.*dev)", re.I),
-        lambda m, cwd: ["npm", "run", "start"],
-    ),
-    (
-        "npm_build",
-        re.compile(r"\bnpm\s+(?:run\s+)?build\b|\bbuild\s+(?:the\s+)?(?:project|app|frontend)\b", re.I),
-        lambda m, cwd: ["npm", "run", "build"],
-    ),
-    (
-        "npm_test",
-        re.compile(r"\bnpm\s+(?:run\s+)?test\b|\brun\s+(?:the\s+)?npm\s+tests?\b", re.I),
-        lambda m, cwd: ["npm", "test"],
-    ),
-    (
-        "npm_list_packages",
-        re.compile(r"\bnpm\s+list\b|\bnpm\s+ls\b|\blist\s+npm\s+packages?\b", re.I),
-        lambda m, cwd: ["npm", "list", "--depth=0"],
-    ),
-    # --- Dev server / Hot-reload (Q19) --- placed BEFORE npm_start to take priority
-    (
-        "npm_dev",
-        re.compile(
-            r"\bnpm\s+run\s+dev\b"
-            r"|\bstart\s+(?:the\s+)?dev(?:elopment)?\s+(?:server|mode)\b"
-            r"|\brun\s+(?:in\s+)?dev(?:elopment)?\s+mode\b"
-            r"|\bhot[\s-]?reload\b",
-            re.I,
-        ),
-        lambda m, cwd: ["npm", "run", "dev"],
-    ),
-    (
-        "yarn_dev",
-        re.compile(r"\byarn\s+dev\b|\byarn\s+run\s+dev\b", re.I),
-        lambda m, cwd: ["yarn", "dev"],
-    ),
-    (
-        "next_dev",
-        re.compile(
-            r"\bnext(?:\.js)?\s+dev\b|\bnpx\s+next\s+dev\b"
-            r"|\bstart\s+next(?:\.js)?\b|\blaunch\s+next(?:\.js)?\b",
-            re.I,
-        ),
-        lambda m, cwd: ["npx", "next", "dev"],
-    ),
-    (
-        "vite_dev",
-        re.compile(
-            r"\bvite\b|\bnpx\s+vite\b|\brun\s+vite\b|\blaunch\s+vite\b"
-            r"|\bstart\s+vite\b",
-            re.I,
-        ),
-        lambda m, cwd: ["npx", "vite"],
-    ),
-    # --- Git ---
+    # --- Git (read-only) ---
     (
         "git_status",
         re.compile(r"\bgit\s+status\b|\bwhat.{0,15}changed\b|\bwhat.{0,15}modified\b", re.I),
@@ -164,7 +76,22 @@ _INTENT_RULES: List[Tuple[str, re.Pattern, Any]] = [
         ),
         lambda m, cwd: ["git", "branch", "--show-current"],
     ),
-    # --- Python ---
+    # --- Version / which (read-only metadata) ---
+    (
+        "node_version",
+        re.compile(r"\bnode\s*(?:\.js)?\s*version\b|\bwhich\s+node\b|\bnode\s+-v\b", re.I),
+        lambda m, cwd: ["node", "--version"],
+    ),
+    (
+        "npm_version",
+        re.compile(r"\bnpm\s+version\b|\bwhich\s+npm\b|\bnpm\s+-v\b", re.I),
+        lambda m, cwd: ["npm", "--version"],
+    ),
+    (
+        "npm_list_packages",
+        re.compile(r"\bnpm\s+list\b|\bnpm\s+ls\b|\blist\s+npm\s+packages?\b", re.I),
+        lambda m, cwd: ["npm", "list", "--depth=0"],
+    ),
     (
         "python_version",
         re.compile(r"\bpython\s+version\b|\bwhich\s+python\b", re.I),
@@ -175,7 +102,14 @@ _INTENT_RULES: List[Tuple[str, re.Pattern, Any]] = [
         re.compile(r"\b(list|show)\s+(?:installed\s+)?packages?\b|\bpip\s+list\b", re.I),
         lambda m, cwd: ["pip", "list", "--format=columns"],
     ),
-    # --- Directory & Files ---
+    (
+        "which_command",
+        re.compile(r"\bwhich\s+(\w+)\b", re.I),
+        lambda m, cwd: (
+            ["where", m.group(1)] if os.name == "nt" else ["which", m.group(1)]
+        ),
+    ),
+    # --- Directory listing (read-only) ---
     (
         "list_files",
         re.compile(r"\b(list|show)\s+(?:all\s+)?files?\b|\bwhat\s+files\b", re.I),
@@ -185,41 +119,6 @@ _INTENT_RULES: List[Tuple[str, re.Pattern, Any]] = [
         "show_tree",
         re.compile(r"\bfolder\s+structure\b|\bdirectory\s+tree\b|\bshow\s+tree\b", re.I),
         lambda m, cwd: ["tree", "/F", "/A"] if os.name == "nt" else ["find", ".", "-maxdepth", "3"],
-    ),
-    # --- Open file in OS default app ---
-    (
-        "open_file",
-        re.compile(r"\bopen\s+([\w./\\]+\.\w{1,6})\b", re.I),
-        lambda m, cwd: (
-            ["start", "", m.group(1)] if os.name == "nt" else ["open", m.group(1)]
-        ),
-    ),
-    # --- Environment & system info ---
-    (
-        "show_env",
-        re.compile(r"\bshow\s+(?:environment\s+)?variables?\b|\benv\s+vars?\b|\bprint\s+env\b", re.I),
-        lambda m, cwd: ["set"] if os.name == "nt" else ["env"],
-    ),
-    (
-        "which_command",
-        re.compile(r"\bwhich\s+(\w+)\b", re.I),
-        lambda m, cwd: (
-            ["where", m.group(1)] if os.name == "nt" else ["which", m.group(1)]
-        ),
-    ),
-    # --- Error scanning ---
-    (
-        "scan_errors",
-        re.compile(
-            r"\b(find|show|list|grep)\s+(?:all\s+)?(?:errors?|exceptions?|tracebacks?)\b"
-            r"|\bwhere\s+(?:are\s+)?(?:the\s+)?errors?\b",
-            re.I,
-        ),
-        lambda m, cwd: (
-            ["findstr", "/S", "/I", "Error", "*.py", "*.js", "*.ts"]
-            if os.name == "nt"
-            else ["grep", "-r", "--include=*.py", "--include=*.js", "--include=*.ts", "-l", "Error", "."]
-        ),
     ),
 ]
 
@@ -239,9 +138,12 @@ class ActionExecutor:
 
     def __init__(self, config):
         self._config = config
-        self._enabled: bool = bool(config.get("ai.actions.enabled", True))
-        self._timeout_s: float = float(config.get("ai.actions.timeout_s", 15.0))
-        self._cwd: str = str(config.get("ai.actions.cwd", "."))
+        # Issue #1: Default-disabled. Auto-actions execute local commands derived
+        # from spoken/OCR prompts; require explicit opt-in.
+        self._enabled: bool = bool(config.get("ai.actions.enabled", False))
+        # Issue #2: Clamp timeout to a sensible bounded range.
+        self._timeout_s: float = max(1.0, min(float(config.get("ai.actions.timeout_s", 10.0)), 30.0))
+        self._cwd: str = str(Path(config.get("ai.actions.cwd", ".")).resolve())
 
         if self._enabled:
             logger.info(
@@ -308,24 +210,41 @@ class ActionExecutor:
                     return f"[Command not found: {command[0]}]"
                 run_cmd = [resolved, *command[1:]]
 
+            # Issue #2: subprocess.run() inside asyncio.wait_for() only cancels the
+            # Python awaitable on timeout — the child process keeps running. Use
+            # Popen + communicate(timeout) so we can explicitly kill the child.
+            timeout_s = self._timeout_s
+
             def _run_command():
-                return subprocess.run(
+                proc = subprocess.Popen(
                     run_cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     cwd=self._cwd,
-                    check=False,
+                    creationflags=(
+                        subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0  # type: ignore[attr-defined]
+                    ),
                 )
+                try:
+                    stdout, _ = proc.communicate(timeout=timeout_s)
+                    return subprocess.CompletedProcess(run_cmd, proc.returncode, stdout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        stdout, _ = proc.communicate(timeout=2)
+                    except Exception:
+                        stdout = b""
+                    raise TimeoutError((stdout or b"").decode("utf-8", errors="replace"))
 
             try:
-                completed = await asyncio.wait_for(
-                    asyncio.to_thread(_run_command), timeout=self._timeout_s
-                )
-            except asyncio.TimeoutError:
+                completed = await asyncio.to_thread(_run_command)
+            except TimeoutError as exc:
                 logger.warning(
-                    f"[P3.3 Actions] '{intent_label}' timed out after {self._timeout_s}s"
+                    f"[P3.3 Actions] '{intent_label}' timed out after {self._timeout_s}s — process killed"
                 )
-                return f"[Action timed out after {self._timeout_s:.0f}s]"
+                partial = str(exc).strip()
+                suffix = f"\n{partial[:1000]}" if partial else ""
+                return f"[Action timed out after {self._timeout_s:.0f}s and was terminated]{suffix}"
 
             elapsed = (time.perf_counter() - t0) * 1000
             output = (completed.stdout or b"").decode("utf-8", errors="replace").strip()

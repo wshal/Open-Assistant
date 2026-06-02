@@ -10,7 +10,7 @@ Validates:
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from PIL import Image
 
@@ -66,6 +66,17 @@ class OCREngineSingleBackendTests(unittest.TestCase):
         text = "const x = async function() { return await fetch(); };"
         hits = OCREngine._code_keyword_hits(text)
         self.assertGreaterEqual(hits, 3)
+
+    def test_unavailable_backend_is_not_reloaded_every_extract(self):
+        engine = OCREngine(ConfigStub())
+        engine._mark_backend_unavailable("missing WinRT module: winrt.windows.storage")
+        engine._try_load_winrt = Mock(side_effect=AssertionError("should not reload"))
+
+        text, boxes = asyncio.run(engine.extract(Image.new("RGB", (120, 80), "white")))
+
+        self.assertIsNone(text)
+        self.assertEqual(boxes, [])
+        engine._try_load_winrt.assert_not_called()
 
 
 class TelemetryTests(unittest.TestCase):

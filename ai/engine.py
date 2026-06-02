@@ -54,6 +54,11 @@ class AIEngine(QObject):
         self._providers = {}
         self._active_provider_id = config.get("ai.fixed_provider", "")
         self._is_cancelled = False
+        # Per-session cancellation event. Cleared at the start of each top-level
+        # generation method; set by cancel(). Using an asyncio.Event instead of
+        # a raw bool eliminates the check-then-branch race on shared mutable state.
+        self._cancel_event: asyncio.Event = asyncio.Event()
+        self._foreground_cancel_token = 0
         self._health_task = None
         self._loop = None
         self._router = None
@@ -61,6 +66,8 @@ class AIEngine(QObject):
         self._parallel = None
         self._bg_slot = BackgroundGenerationSlot()
         self._foreground_turn_id: str = ""
+        self._provider_health_cache: Dict[str, Dict[str, Any]] = {}
+        self._provider_validation_task = None
 
         # Provider speed ranking (fastest first)
         self._provider_priority = ["groq", "cerebras", "gemini", "together", "ollama"]
@@ -197,6 +204,30 @@ class AIEngine(QObject):
         return filtered
 
     @staticmethod
+    def _sanitize_error_for_ui(exc: Exception) -> str:
+        """Sanitize a provider exception before displaying it in the UI.
+
+        Strips API keys, internal URLs, and verbose SDK payloads so that
+        secrets are never exposed in error dialogs or frontend logs.
+        """
+        import re as _re
+        msg = str(exc or "An unknown error occurred")
+        # Redact anything that looks like an API key / token
+        msg = _re.sub(
+            r'(?i)(key|token|secret|bearer|authorization)[=:\s]+[\w\-\.]{8,}',
+            r'\1=[REDACTED]',
+            msg,
+        )
+        # Redact full URLs (may contain keys in query-strings)
+        msg = _re.sub(r'https?://\S+', '[URL REDACTED]', msg)
+        # Collapse consecutive whitespace / newlines
+        msg = _re.sub(r'\s+', ' ', msg).strip()
+        # Truncate to a UI-friendly length
+        if len(msg) > 300:
+            msg = msg[:297] + "..."
+        return msg
+
+    @staticmethod
     def _cooldown_seconds_for_error(exc: Exception) -> int:
         """
         Best-effort cooldown for transient provider failures so we don't keep
@@ -287,6 +318,13 @@ class AIEngine(QObject):
                     provider.disable(seconds=seconds, reason=reason)
                 except TypeError:
                     provider.disable(seconds=seconds)
+            if provider is not None and getattr(provider, "name", ""):
+                self.set_provider_health(
+                    getattr(provider, "name", ""),
+                    False,
+                    reason=reason or str(exc),
+                    source="request_failure",
+                )
         except Exception:
             # Cooldown is best-effort; never fail the request flow due to it.
             pass
@@ -296,8 +334,8 @@ class AIEngine(QObject):
         self._session_context = (text or "").strip()
         logger.debug(f"Session context updated ({len(self._session_context)} chars)")
 
-    def warmup(self):
-        """Initializes AI providers and checks availability."""
+    def warmup(self, loop: asyncio.AbstractEventLoop = None):
+        """Initializes AI providers and starts background availability checks."""
         try:
             # If warmup is called multiple times (e.g. hot-apply settings), ensure
             # we clean up any long-lived network resources (aiohttp sessions, etc.)
@@ -307,6 +345,11 @@ class AIEngine(QObject):
 
             self._providers = init_providers(self.config)
             logger.info(f"AI Engine initialized: {list(self._providers.keys())}")
+
+            # Kick off provider validation immediately so it overlaps with the
+            # rest of warmup instead of waiting until the brain thread finishes.
+            if loop and loop.is_running():
+                self.ensure_provider_validation(loop)
 
             # Initialize router
             self._router = SmartRouter(self.config, self._providers)
@@ -323,14 +366,14 @@ class AIEngine(QObject):
             if (
                 configured
                 and configured in self._providers
-                and self._providers[configured].enabled
+                and getattr(self._providers[configured], "is_available", lambda: self._providers[configured].enabled)()
             ):
                 self._active_provider_id = configured
                 logger.info(f"Using configured provider: {configured}")
             else:
                 # Auto-select: groq > cerebras > gemini based on speed
                 for p in ["groq", "cerebras", "gemini", "together", "ollama"]:
-                    if p in self._providers and self._providers[p].enabled:
+                    if p in self._providers and getattr(self._providers[p], "is_available", lambda: self._providers[p].enabled)():
                         self._active_provider_id = p
                         logger.info(f"Auto-selected provider: {p} (fastest available)")
                         break
@@ -339,8 +382,210 @@ class AIEngine(QObject):
                 self._active_provider_id = list(self._providers.keys())[0]
 
             logger.info(f"Active Provider: {self._active_provider_id}")
+            self.emit_provider_status_snapshot()
         except Exception as e:
             logger.error(f"AI Warmup Error: {e}")
+
+    async def validate_loaded_providers(self, provider_ids: List[str] = None):
+        """Probe loaded providers in the background without blocking app boot."""
+        if not self._providers:
+            return
+
+        timeout = float(self.config.get("ai.providers.health_check_timeout", 5) or 5)
+        concurrency = int(self.config.get("ai.providers.health_check_concurrency", 3) or 3)
+        targets = list(provider_ids or self._providers.keys())
+        seen = set()
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _check_provider(name, prov, priority: int = 0):
+            if name in seen or prov is None or not getattr(prov, "enabled", False):
+                return
+            seen.add(name)
+            if not getattr(prov, "supports_health_check", lambda: False)():
+                self.set_provider_health(name, True, source="startup_skip")
+                return
+
+            async with sem:
+                ok = False
+                last_error = ""
+                attempts = 2 if name in {"groq", "gemini", "ollama"} else 1
+                for attempt in range(1, attempts + 1):
+                    try:
+                        ok = await asyncio.wait_for(prov.health_check(), timeout=timeout)
+                        if ok:
+                            break
+                    except Exception as exc:
+                        last_error = str(exc)
+                        ok = False
+                    if not ok and attempt < attempts:
+                        await asyncio.sleep(min(0.5 * attempt, 0.75))
+
+                self.set_provider_health(
+                    name,
+                    ok,
+                    reason=last_error,
+                    source="startup_probe",
+                )
+                if not ok:
+                    logger.warning("x %s failed background health probe", name)
+
+        ordered = []
+        fixed = str(self.config.get("ai.fixed_provider", "") or "").strip()
+        if fixed:
+            ordered.append(fixed)
+        for pid in self._provider_priority:
+            if pid not in ordered:
+                ordered.append(pid)
+        for pid in targets:
+            if pid not in ordered:
+                ordered.append(pid)
+
+        await asyncio.gather(*[_check_provider(name, self._providers.get(name)) for name in ordered])
+        self.emit_provider_status_snapshot()
+
+    def ensure_provider_validation(self, loop: asyncio.AbstractEventLoop):
+        """Start a non-blocking background probe pass for loaded providers."""
+        if not bool(self.config.get("ai.providers.validate_on_init", False)):
+            return None
+        if not loop or not loop.is_running():
+            return None
+        if self._provider_validation_task and not self._provider_validation_task.done():
+            return self._provider_validation_task
+
+        def _create():
+            if self._provider_validation_task and not self._provider_validation_task.done():
+                return self._provider_validation_task
+            self._provider_validation_task = loop.create_task(self.validate_loaded_providers())
+            return self._provider_validation_task
+
+        async def _spawn():
+            return _create()
+
+        future = asyncio.run_coroutine_threadsafe(_spawn(), loop)
+        try:
+            return future.result(timeout=2)
+        except Exception as e:
+            logger.debug("Failed to start provider validation task: %s", e)
+            return None
+
+    def set_provider_health(self, provider_id: str, healthy: bool, reason: str = "", source: str = "") -> None:
+        """Cache provider health without re-probing the network.
+
+        This is the single source of truth for the standby badge bar and it is
+        updated by startup validation, explicit provider tests, and request
+        failures. We intentionally do not poll live network availability here,
+        because that makes providers appear to flicker in and out of the UI.
+        """
+        pid = str(provider_id or "").strip()
+        if not pid:
+            return
+        state = "active" if healthy else "down"
+        cache = self._provider_health_cache.setdefault(pid, {})
+        cache.update(
+            {
+                "state": state,
+                "reason": str(reason or "").strip(),
+                "source": str(source or "").strip(),
+                "updated_at": time.time(),
+            }
+        )
+        prov = (self._providers or {}).get(pid)
+        if prov is not None and hasattr(prov, "set_health_state"):
+            prov.set_health_state(state, reason)
+        self.emit_provider_status_snapshot()
+
+    def emit_provider_status_snapshot(self):
+        """Emit a lightweight provider-status snapshot without re-probing networks."""
+        results = {
+            "_meta": {
+                "text_local_only": bool(self.config.get("ai.text.local_only", False)),
+                "vision_local_only": bool(self.config.get("ai.vision.local_only", False)),
+            }
+        }
+        for pid, prov in list(self._providers.items()):
+            cached = self._provider_health_cache.get(pid, {})
+            state = str(cached.get("state", "configured") or "configured")
+            if hasattr(prov, "is_disabled") and prov.is_disabled():
+                state = "cooldown"
+            info = {
+                "state": state,
+                "selected": pid == self._active_provider_id,
+                "configured": True,
+                "usable": state in {"active", "cooldown", "configured"},
+            }
+            if state == "cooldown":
+                try:
+                    info["cooldown_reason"] = (
+                        prov.disabled_reason() if hasattr(prov, "disabled_reason") else ""
+                    )
+                    info["cooldown_remaining_s"] = (
+                        prov.cooldown_remaining_s() if hasattr(prov, "cooldown_remaining_s") else 0
+                    )
+                except Exception:
+                    pass
+            elif cached.get("reason"):
+                info["reason"] = cached.get("reason", "")
+                info["updated_at"] = cached.get("updated_at", 0.0)
+            elif state == "configured":
+                info["reason"] = "Configured, not yet live-tested"
+            results[pid] = info
+        self.provider_status.emit(results)
+
+    def warm_groq_connection(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Fire a non-blocking Groq TCP pre-warm on the async loop.
+
+        Called from the warmup background thread after providers are initialised.
+        Schedules ``GroqProvider.warm_connection_async`` on *loop* without
+        waiting for the result — READY is never delayed.
+
+        Design intent:
+          - Standby warmup opportunistically opens Groq's TCP connection.
+          - READY does not wait for it.
+          - The first real user prompt does not get a synthetic request in
+            front of it. The warm request is still a Groq API call, so it stays
+            one-shot and best-effort.
+        """
+        if not loop or not loop.is_running():
+            return
+        groq = (self._providers or {}).get("groq")
+        if groq is None or not getattr(groq, "enabled", False):
+            return
+        warm_fn = getattr(groq, "warm_connection_async", None)
+        if warm_fn is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(warm_fn(), loop)
+            logger.debug("[Engine] Groq connection warm scheduled (opportunistic)")
+        except Exception as exc:
+            logger.debug("[Engine] Groq warm schedule failed (non-fatal): %s", exc)
+
+    def start_groq_keepalive(self, loop: asyncio.AbstractEventLoop, idle_threshold_s: float = 25.0) -> None:
+        """Start the Groq background keepalive task on the async loop.
+
+        The task re-pings Groq after ``idle_threshold_s`` seconds of inactivity
+        to keep the TCP connection alive.  Called once from warmup; subsequent
+        calls are no-ops (the task only starts once).
+        """
+        if not bool(self.config.get("ai.providers.groq.keepalive_enabled", False)):
+            logger.debug("[Engine] Groq keepalive disabled by config")
+            return
+        if not loop or not loop.is_running():
+            return
+        groq = (self._providers or {}).get("groq")
+        if groq is None or not getattr(groq, "enabled", False):
+            return
+        keepalive_fn = getattr(groq, "keepalive_loop", None)
+        if keepalive_fn is None:
+            return
+        # Guard: only one keepalive task per provider instance.
+        if getattr(groq, "_keepalive_started", False):
+            return
+        groq._keepalive_started = True
+        try:
+            asyncio.run_coroutine_threadsafe(keepalive_fn(idle_threshold_s), loop)
+            logger.debug("[Engine] Groq keepalive loop scheduled (threshold=%.0fs)", idle_threshold_s)
+        except Exception as exc:
+            logger.debug("[Engine] Groq keepalive schedule failed (non-fatal): %s", exc)
 
     async def aclose_providers(self):
         """Async best-effort provider cleanup (aiohttp sessions, etc.)."""
@@ -388,8 +633,19 @@ class AIEngine(QObject):
 
     def cancel(self):
         """Standardized cancellation flag for prioritized overrides."""
-        self._is_cancelled = True
+        self._is_cancelled = True      # Keep for external backward-compat checks
+        self._cancel_event.set()       # Primary signal — read by all stream loops
         logger.info("AI: Generation cancel flag set")
+
+    def _begin_foreground_generation(self) -> int:
+        """Start a new foreground generation token and clear cancellation."""
+        self._is_cancelled = False
+        self._foreground_cancel_token += 1
+        self._cancel_event.clear()
+        return self._foreground_cancel_token
+
+    def _foreground_cancelled(self, token: int) -> bool:
+        return self._cancel_event.is_set() or token != self._foreground_cancel_token
 
     def demote_to_background(self):
         """Demotes a query to finish in the background."""
@@ -426,8 +682,9 @@ class AIEngine(QObject):
         RESTORED: Main async generation task.
         Control flow managed by the App Master Loop.
         """
+        cancel_token = 0
         if not bg_mode:
-            self._is_cancelled = False
+            cancel_token = self._begin_foreground_generation()
             self._current_gen_kwargs = {
                 "query": query,
                 "nexus_snapshot": nexus_snapshot,
@@ -468,6 +725,9 @@ class AIEngine(QObject):
         current_turn_id = str(request_metadata.get("turn_id", "") or "")
         request_started_at = request_metadata.get("request_started_at", start_time)
         stage_timings["request_to_ai_start_ms"] = (start_time - request_started_at) * 1000
+
+        def _cancelled() -> bool:
+            return self._bg_slot.is_cancelled() if bg_mode else self._foreground_cancelled(cancel_token)
 
         # Resolve the active Mode object — use ModeManager if available
         mode_obj = self._mode_manager.current if self._mode_manager else None
@@ -564,7 +824,7 @@ class AIEngine(QObject):
                     },
                 )
                 for ch in self._chunk_response(cached.response, chunk_size=8):
-                    if self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled:
+                    if _cancelled():
                         return
                     if not bg_mode:
                         self._emit_response_chunk_for_turn(ch, turn_id=current_turn_id, bg_mode=bg_mode)
@@ -625,7 +885,7 @@ class AIEngine(QObject):
                     sys_prompt, user_msg, task=mode_id
                 )
 
-                if self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled:
+                if _cancelled():
                     return
 
                 latency_ms = (time.time() - start_time) * 1000
@@ -755,6 +1015,7 @@ class AIEngine(QObject):
 
             # ── Refinement: decide whether to run, build coroutine if so ────────
             refined_audio = audio_context
+            _refined_audio_context = audio_context   # stable alias used in race-mode metadata
             refine_coro = None
             is_general_knowledge = self.prompts._is_general_knowledge_query(query)
             # Keep manual simple queries ultra-fast, but allow spoken queries to
@@ -773,7 +1034,7 @@ class AIEngine(QObject):
                 refiner_id = self.config.get("capture.audio.correction_provider", "groq")
                 refiner = self._providers.get(refiner_id)
                 if refiner:
-                    refine_coro = self._refine_transcript(audio_context, refiner)
+                    refine_coro = self._refine_transcript(audio_context, refiner, cancel_token)
             elif skip_refinement:
                 logger.debug(
                     f"Refinement skipped: complexity={complexity}, "
@@ -793,6 +1054,7 @@ class AIEngine(QObject):
                         self._rag_cache.popitem(last=False)
                 if refined_text:
                     refined_audio = refined_text
+                    _refined_audio_context = refined_text   # keep alias in sync
                 logger.debug(
                     f"Parallel RAG+Refine: {(time.time() - parallel_start)*1000:.0f}ms"
                 )
@@ -820,6 +1082,14 @@ class AIEngine(QObject):
                 _mode_arg,
                 session_context="" if request_metadata.get("suppress_session_context") else getattr(self, "_session_context", ""),
             )
+            if request_metadata.get("benchmark_auto_mode"):
+                sys_prompt += (
+                    "\n\nBENCHMARK MODE: keep the answer short and tightly scoped. "
+                    "Default to 3-5 bullets or 2-4 sentences, with no long preamble, "
+                    "no repeated restatement of the question, and no extended examples "
+                    "unless the user explicitly asks for them. If the question is open-ended, "
+                    "answer with the minimum useful detail needed to be correct."
+                )
 
             # Strict Output Cap for Cloud Background Fallback
             if request_metadata.get("suppress_history_context"):
@@ -893,7 +1163,7 @@ class AIEngine(QObject):
                                     self._mark_provider_failed_for_session(getattr(p, "name", ""))
                                     continue
 
-                                if self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled:
+                                if _cancelled():
                                     return
 
                                 for other in list(tasks.keys()):
@@ -923,7 +1193,7 @@ class AIEngine(QObject):
                                         "had_audio": bool(
                                             (
                                                 audio_context
-                                                or locals().get("refined_audio")
+                                                or _refined_audio_context
                                                 or (nexus_snapshot or {}).get("full_audio_history", "")
                                                 or ""
                                             ).strip()
@@ -937,7 +1207,7 @@ class AIEngine(QObject):
                                     words = raced.split()
                                     batch: list = []
                                     for word in words:
-                                        if self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled:
+                                        if _cancelled():
                                             return
                                         batch.append(word)
                                         if len(batch) >= 6:  # ~40–50 chars per emit
@@ -991,8 +1261,8 @@ class AIEngine(QObject):
                         user_msg,
                         first_token_timeout_s=ft_timeout_s,
                     ):
-                        if self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled:
-                            logger.warning("AI: Stream cancelled mid-token")
+                        if _cancelled():
+                            logger.warning("AI: Stream cancelled before chunk emit")
                             return
 
                         full_response += chunk
@@ -1051,7 +1321,7 @@ class AIEngine(QObject):
                     logger.info(f"AI: Falling back to '{next_id}'")
 
             # 5. Finalize
-            if not (self._bg_slot.is_cancelled() if bg_mode else self._is_cancelled):
+            if not _cancelled():
                 full_response = self._clean_final_response(full_response)
                 latency_ms = (time.time() - start_time) * 1000
 
@@ -1093,7 +1363,7 @@ class AIEngine(QObject):
                         "had_audio": bool(
                             (
                                 audio_context
-                                or locals().get("refined_audio")
+                                or _refined_audio_context
                                 or (nexus_snapshot or {}).get("full_audio_history", "")
                                 or ""
                             ).strip()
@@ -1108,8 +1378,8 @@ class AIEngine(QObject):
                 logger.info(f"AI: Response complete ({latency_ms:.0f}ms) | {stage_timings}")
 
         except Exception as e:
-            logger.error(f"AI Engine Runtime Error: {e}")
-            self.error_occurred.emit(str(e))
+            logger.error(f"AI Engine Runtime Error: {e}", exc_info=True)
+            self.error_occurred.emit(self._sanitize_error_for_ui(e))
 
     async def _stream_with_first_token_timeout(
         self,
@@ -1203,7 +1473,7 @@ class AIEngine(QObject):
         logger.debug(f"Follow-up resolved: '{query}' -> '{resolved}'")
         return resolved
 
-    async def _refine_transcript(self, raw_text: str, provider) -> str:
+    async def _refine_transcript(self, raw_text: str, provider, cancel_token: int = 0) -> str:
 
         """Midnight Restoration: Uses Cloud-Speed models to fix ASR typos."""
         prompt = f"Fix common ASR typos in this text. Keep meaning exact. Output ONLY fixed text.\n\n{raw_text}"
@@ -1212,11 +1482,14 @@ class AIEngine(QObject):
             async for chunk in provider.generate_stream(
                 "You are a text correction engine.", prompt
             ):
-                if self._is_cancelled:
+                if self._foreground_cancelled(cancel_token) if cancel_token else self._cancel_event.is_set():
                     return raw_text
                 fixed += chunk
             return fixed.strip() if fixed else raw_text
-        except:
+        except asyncio.CancelledError:
+            raise  # Must propagate for cooperative asyncio cancellation
+        except Exception as _refine_err:
+            logger.debug("Transcript refinement failed (non-fatal): %s", _refine_err)
             return raw_text
 
     def _effective_speech_query(self, query: str, refined_audio: str) -> str:
@@ -1343,7 +1616,7 @@ class AIEngine(QObject):
         Fast path for hotkey-triggered context answers.
         Now fully mode-aware: uses mode.quick_answer_query and mode.quick_answer_format.
         """
-        self._is_cancelled = False
+        cancel_token = self._begin_foreground_generation()
         start_time = time.time()
 
         # Resolve Mode object for profile-aware behaviour
@@ -1377,7 +1650,7 @@ class AIEngine(QObject):
 
         summarized_audio = audio_context or nexus_snapshot.get("recent_audio", "")
         if len(summarized_audio.split()) > 40:
-            summarized_audio = await self._summarize_audio_fast(summarized_audio)
+            summarized_audio = await self._summarize_audio_fast(summarized_audio, cancel_token)
 
         _mode_arg = mode_obj or mode_id
         sys_prompt = self.prompts.system(_mode_arg)
@@ -1395,7 +1668,7 @@ class AIEngine(QObject):
             full_response = ""
             first_token_time = None
             async for chunk in provider.generate_stream(sys_prompt, user_msg):
-                if self._is_cancelled:
+                if self._foreground_cancelled(cancel_token):
                     return ""
                 if first_token_time is None:
                     first_token_time = time.time()
@@ -1427,11 +1700,11 @@ class AIEngine(QObject):
             self.response_complete.emit(full_response)
             return full_response
         except Exception as e:
-            logger.error(f"Quick response error: {e}")
-            self.error_occurred.emit(str(e))
+            logger.error(f"Quick response error: {e}", exc_info=True)
+            self.error_occurred.emit(self._sanitize_error_for_ui(e))
             return ""
 
-    async def _summarize_audio_fast(self, audio_text: str) -> str:
+    async def _summarize_audio_fast(self, audio_text: str, cancel_token: int = 0) -> str:
         """Compress recent audio into a short summary using the fastest available provider."""
         # Use mode's preferred fast provider if available
         mode_obj = self._mode_manager.current if self._mode_manager else None
@@ -1459,7 +1732,11 @@ class AIEngine(QObject):
                 "You compress spoken context into very short, accurate notes.",
                 prompt,
             ):
-                if self._is_cancelled:
+                if (
+                    self._foreground_cancelled(cancel_token)
+                    if cancel_token
+                    else self._cancel_event.is_set()
+                ):
                     return audio_text
                 summary += chunk
             return summary.strip() or audio_text
@@ -1515,22 +1792,26 @@ class AIEngine(QObject):
         try:
             from PIL import Image
 
-            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            w, h = img.size
-            quality = int(self.config.get("capture.screen.analysis_jpeg_quality", 70) or 70)
-            quality = max(35, min(quality, 92))
+            with Image.open(io.BytesIO(image_bytes)).convert("RGB") as img:
+                w, h = img.size
+                quality = int(self.config.get("capture.screen.analysis_jpeg_quality", 70) or 70)
+                quality = max(35, min(quality, 92))
 
-            attempts = 0
-            out = image_bytes
-            while len(out) > max_bytes and w > min_w and attempts < 5:
-                attempts += 1
-                w = max(min_w, int(w * 0.82))
-                new_h = max(1, int(h * (w / max(1, img.size[0]))))
-                resized = img.resize((w, new_h), Image.LANCZOS)
-                buf = io.BytesIO()
-                resized.save(buf, format="JPEG", quality=quality, optimize=True)
-                out = buf.getvalue()
-                quality = max(35, quality - 12)
+                attempts = 0
+                out = image_bytes
+                while len(out) > max_bytes and w > min_w and attempts < 5:
+                    attempts += 1
+                    w = max(min_w, int(w * 0.82))
+                    new_h = max(1, int(h * (w / max(1, img.size[0]))))
+                    # PIL Image.resize returns a new Image; close it after extracting bytes
+                    resized = img.resize((w, new_h), Image.LANCZOS)
+                    try:
+                        buf = io.BytesIO()
+                        resized.save(buf, format="JPEG", quality=quality, optimize=True)
+                        out = buf.getvalue()
+                    finally:
+                        resized.close()
+                    quality = max(35, quality - 12)
 
             return out, mime
         except Exception:
@@ -1546,7 +1827,7 @@ class AIEngine(QObject):
         audio_context: str = "",
     ) -> str:
         """Run screenshot analysis through the best available vision-capable provider."""
-        self._is_cancelled = False
+        cancel_token = self._begin_foreground_generation()
         start_time = time.time()
         self._last_request_at = start_time
         budget_s = float(self.config.get("ai.vision.budget_s", 10) or 10)
@@ -1595,7 +1876,7 @@ class AIEngine(QObject):
             if not provider:
                 logger.warning(f"[AnalyzeScreen] Provider {name!r} not found in _providers (keys={list(self._providers.keys())})")
                 continue
-            enabled_ok = provider.enabled
+            enabled_ok = getattr(provider, "is_available", lambda: provider.enabled)()
             rate_ok = provider.check_rate()
             vision_ok = getattr(provider, "supports_vision", lambda: False)()
             logger.info(f"[AnalyzeScreen] Provider {name!r}: enabled={enabled_ok}, rate_ok={rate_ok}, supports_vision={vision_ok}")
@@ -1682,7 +1963,7 @@ class AIEngine(QObject):
                 raise
             except Exception as exc:
                 # Retry only if we haven't emitted anything yet (payload errors are immediate).
-                if not locals().get("emitted", False) and self._is_vision_retryable_error(exc):
+                if not emitted and self._is_vision_retryable_error(exc):
                     payload2, mime2 = self._prepare_vision_payload_for_provider(
                         p.name, image_bytes, max_bytes_factor=0.70
                     )
@@ -1727,7 +2008,7 @@ class AIEngine(QObject):
                     # Consume stream into a full string for parity with non-streaming.
                     out = ""
                     async for chunk in _analyze_one_stream(p):
-                        if self._is_cancelled:
+                        if self._foreground_cancelled(cancel_token):
                             return ""
                         out += chunk
                     return out
@@ -1790,7 +2071,7 @@ class AIEngine(QObject):
                             self._maybe_cooldown_provider(p, exc)
                             continue
 
-                        if self._is_cancelled:
+                        if self._foreground_cancelled(cancel_token):
                             return ""
 
                         if not response.strip():
@@ -1860,7 +2141,7 @@ class AIEngine(QObject):
                 response = ""
                 if getattr(provider, "supports_vision_stream", lambda: False)():
                     async for chunk in _analyze_one_stream(provider):
-                        if self._is_cancelled:
+                        if self._foreground_cancelled(cancel_token):
                             return ""
                         if time.time() >= deadline:
                             raise Exception("Vision analysis timed out (budget exceeded)")
@@ -1870,7 +2151,7 @@ class AIEngine(QObject):
                 else:
                     remaining = max(0.05, deadline - time.time())
                     response = await asyncio.wait_for(_analyze_one(provider), timeout=remaining)
-                if self._is_cancelled:
+                if self._foreground_cancelled(cancel_token):
                     return ""
 
                 latency_ms = (time.time() - start_time) * 1000
@@ -2091,7 +2372,7 @@ class AIEngine(QObject):
         # P2: Local-only mode (Ollama) overrides routing for privacy/offline use.
         if bool(self.config.get("ai.text.local_only", False)):
             provider = self._providers.get("ollama")
-            if provider and getattr(provider, "enabled", False) and provider.check_rate():
+            if provider and getattr(provider, "is_available", lambda: getattr(provider, "enabled", False))() and provider.check_rate():
                 mode_name = mode.name if hasattr(mode, "name") else str(mode or "general")
                 tier = self._router._tier_for_task(mode_name) if self._router else "balanced"
                 return provider, tier
@@ -2120,7 +2401,7 @@ class AIEngine(QObject):
         if strict_preferred:
             for provider_id in preferred:
                 provider = self._providers.get(provider_id)
-                if provider and getattr(provider, "enabled", False) and provider.check_rate():
+                if provider and getattr(provider, "is_available", lambda: getattr(provider, "enabled", False))() and provider.check_rate():
                     resolved_tier = tier_hint or (self._router._tier_for_task(mode_name) if self._router else "balanced")
                     if provider.has_model(resolved_tier):
                         return provider, resolved_tier
@@ -2142,7 +2423,7 @@ class AIEngine(QObject):
             provider = self._providers.get(provider_id)
             if (
                 provider
-                and getattr(provider, "enabled", False)
+                and getattr(provider, "is_available", lambda: getattr(provider, "enabled", False))()
                 and provider_id not in self._session_failed_providers
                 and provider.check_rate()
             ):
@@ -2185,14 +2466,10 @@ class AIEngine(QObject):
         """Start the provider health monitor once and reuse it for future calls."""
         if not loop:
             return None
-        # The async thread may still be spinning up — wait briefly for the loop to be running
-        for _ in range(10):
-            if loop.is_running():
-                break
-            import time as _time
-            _time.sleep(0.1)
+        # If the loop is not yet running, schedule health monitor lazily instead
+        # of blocking with time.sleep() (which freezes the Qt main thread).
         if not loop.is_running():
-            logger.warning("Health monitor: loop not running after wait — skipping")
+            logger.warning("Health monitor: loop not running — will not block; monitor may start late")
             return None
 
         self._loop = loop
@@ -2229,57 +2506,52 @@ class AIEngine(QObject):
             pass
         except Exception as e:
             logger.debug(f"Provider health monitor shutdown error: {e}")
+        val_task = self._provider_validation_task
+        self._provider_validation_task = None
+        if val_task:
+            val_task.cancel()
+            try:
+                await val_task
+            except Exception:
+                pass
 
     async def poll_provider_health(self):
         """Polls providers and emits status to UI badges."""
-        results = self._router.get_provider_health() if self._router else {}
+        results = {}
         results["_meta"] = {
             "text_local_only": bool(self.config.get("ai.text.local_only", False)),
             "vision_local_only": bool(self.config.get("ai.vision.local_only", False)),
         }
         for pid, prov in list(self._providers.items()):
-            info = dict(results.get(pid, {}))
-            state = info.get("state", "unknown")
-            locked_state = state in {"cooldown", "rate_limited", "disabled"}
-            try:
-                # Only call availability checks for providers that explicitly
-                # advertise a health check (avoids expensive/noisy network calls).
-                supports_hc = bool(getattr(prov, "supports_health_check", lambda: False)())
-                if supports_hc and hasattr(prov, "check_availability"):
-                    is_ok = await asyncio.wait_for(prov.check_availability(), timeout=5)
-                    if is_ok and not locked_state:
-                        state = "active"
-                    elif getattr(prov, "state", "") == "missing":
-                        state = "missing"
-                    elif getattr(prov, "state", "") == "unavailable":
-                        state = "down"
-                    elif state not in {"cooldown", "rate_limited", "disabled"}:
-                        state = "down"
+            cached = self._provider_health_cache.get(pid, {})
+            state = str(cached.get("state", "active") or "active")
+            info = {
+                "state": state,
+                "selected": pid == self._active_provider_id,
+                "usable": state in {"active", "cooldown"},
+            }
 
-                # Reflect local cooldown state even without a health check.
-                if not locked_state and hasattr(prov, "is_disabled") and prov.is_disabled():
-                    state = "cooldown"
+            if hasattr(prov, "is_disabled") and prov.is_disabled():
+                state = "cooldown"
+                info["state"] = state
+                try:
+                    info["cooldown_reason"] = (
+                        prov.disabled_reason() if hasattr(prov, "disabled_reason") else ""
+                    )
+                    info["cooldown_remaining_s"] = (
+                        prov.cooldown_remaining_s() if hasattr(prov, "cooldown_remaining_s") else 0
+                    )
+                except Exception:
+                    pass
+            elif state == "cooldown":
+                try:
+                    info["cooldown_reason"] = cached.get("reason", "")
+                    info["cooldown_remaining_s"] = 0
+                except Exception:
+                    pass
 
-                if state == "cooldown":
-                    try:
-                        info["cooldown_reason"] = (
-                            prov.disabled_reason() if hasattr(prov, "disabled_reason") else ""
-                        )
-                        info["cooldown_remaining_s"] = (
-                            prov.cooldown_remaining_s() if hasattr(prov, "cooldown_remaining_s") else 0
-                        )
-                    except Exception:
-                        pass
-            except Exception:
-                if not locked_state:
-                    state = "down"
-
-            info["state"] = state
-            info["selected"] = pid == self._active_provider_id
-            info["usable"] = state in {"active", "cooldown"}
+            if cached.get("reason"):
+                info["reason"] = cached.get("reason", "")
             results[pid] = info
 
         self.provider_status.emit(results)
-
-    async def _call_in_loop(self, fn):
-        return fn()

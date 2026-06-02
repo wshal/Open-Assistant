@@ -55,6 +55,11 @@ class OCREngine:
         self._loaded = False
         self._lock = threading.Lock()
         self._backends: list[tuple[str, Any]] = []  # Populated by _ensure_loaded()
+        # M-7: Track whether this instance actually called CoInitialize so we
+        # only call CoUninitialize once in shutdown(), and only on Windows.
+        self._co_initialized = False
+        self._unavailable_reason = ""
+        self._unavailable_logged = False
 
     # ── Engine name normalization ──────────────────────────────────────────
 
@@ -76,22 +81,41 @@ class OCREngine:
         with self._lock:
             if self._loaded:
                 return
+            if self._unavailable_reason:
+                if not self._unavailable_logged:
+                    logger.warning("[OCR] WinRT backend unavailable - %s", self._unavailable_reason)
+                    self._unavailable_logged = True
+                return
             backend = self._try_load_winrt()
             if backend is None:
                 logger.error("[OCR] WinRT backend unavailable — OCR disabled")
-                self._loaded = False
+                self._mark_backend_unavailable("load failed")
                 return
             self.engine = backend
             self._backends = [(self.name, backend)]
             self._loaded = True
             logger.info("[OCR] Windows OCR ready as primary backend")
 
+    def _mark_backend_unavailable(self, reason: str) -> None:
+        """Disable OCR after a runtime dependency failure."""
+        self.engine = None
+        self._backends = []
+        self._loaded = False
+        self._unavailable_reason = reason or "unknown runtime failure"
+        if not self._unavailable_logged:
+            logger.warning("[OCR] WinRT backend unavailable - %s; OCR disabled", self._unavailable_reason)
+            self._unavailable_logged = True
+
     def _try_load_winrt(self):
         try:
             import ctypes
             # Ensure COM is initialized on this thread (required for WinRT in thread pools)
-            ctypes.windll.ole32.CoInitialize(0)
-            
+            # M-7: Track success so shutdown() can pair this with CoUninitialize.
+            hr = ctypes.windll.ole32.CoInitialize(0)
+            # S_OK == 0, S_FALSE == 1 (already init'd, still needs Uninit), RPC_E_CHANGED_MODE == 0x80010106
+            if hr in (0, 1):
+                self._co_initialized = True
+
             import winrt.windows.media.ocr as ocr
             from winrt.windows.globalization import Language
 
@@ -106,13 +130,33 @@ class OCREngine:
             logger.error("[OCR] WinRT load failed: %s", exc)
             return None
 
+    def shutdown(self) -> None:
+        """Release backend handles and pair CoInitialize with CoUninitialize.
+
+        M-7: Without this, every OCR-using process leaked one COM
+        initialisation per thread that touched the WinRT engine.
+        """
+        if self._co_initialized:
+            try:
+                import ctypes
+                ctypes.windll.ole32.CoUninitialize()
+            except Exception:
+                pass
+            finally:
+                self._co_initialized = False
+        self.engine = None
+        self._backends = []
+        self._loaded = False
+        self._unavailable_reason = ""
+        self._unavailable_logged = False
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     async def extract(self, img: Image.Image) -> Tuple[Optional[str], List[Box]]:
         """Extract text and bounding boxes from an image."""
         self._ensure_loaded()
         if not self._loaded or self.engine is None:
-            logger.warning("[OCR] extract() called but no OCR backend is loaded")
+            logger.debug("[OCR] extract() skipped because no OCR backend is loaded")
             return None, []
 
         from utils.telemetry import telemetry as _tel
@@ -303,6 +347,9 @@ class OCREngine:
                     b = word.bounding_rect
                     boxes.append((int(b.x), int(b.y), int(b.x + b.width), int(b.y + b.height)))
             return text, boxes
+        except ModuleNotFoundError as exc:
+            self._mark_backend_unavailable(f"missing WinRT module: {exc.name or exc}")
+            return None, []
         except Exception as exc:
             logger.warning("[OCR] WinRT OCR failed: %s", exc)
             return None, []

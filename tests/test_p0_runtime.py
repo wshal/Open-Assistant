@@ -3,6 +3,7 @@ import shutil
 import sys
 import unittest
 import os
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch
 from types import SimpleNamespace
@@ -122,6 +123,25 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         audio.stop()
 
         self.assertFalse(audio._running)
+
+    def test_start_recreates_transcription_pools_after_stop(self):
+        audio = AudioCapture(
+            ConfigStub({"capture.audio.mode": "system", "capture.audio.enabled": True})
+        )
+
+        audio.stop()
+        self.assertIsNone(audio._transcribe_pool)
+        self.assertIsNone(audio._cloud_stt_pool)
+        self.assertIsNone(audio._interim_pool)
+
+        with patch("capture.audio.threading.Thread.start", return_value=None):
+            audio.start()
+
+        self.assertIsNotNone(audio._transcribe_pool)
+        self.assertIsNotNone(audio._cloud_stt_pool)
+        self.assertIsNotNone(audio._interim_pool)
+        self.assertTrue(audio._submit_transcription_job(lambda: None))
+        audio.stop()
 
     def test_hardware_suspended_capture_is_healthy_for_injected_benchmark_frames(self):
         audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
@@ -1398,6 +1418,9 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         )
         audio._whisper_device = "cpu"
         audio._cloud_stt_session_blocked = True
+        # Set the failed key to match the current key so the "key changed"
+        # bypass (M-A6) doesn't reset the block — we're testing the block itself.
+        audio._cloud_stt_failed_key = "gsk_test_key_1234567890"
 
         with patch("capture.audio.time.time", return_value=12.0):
             provider = audio._effective_transcription_provider(
@@ -1651,8 +1674,8 @@ class PromptBuilderSpeechTests(unittest.TestCase):
         self.assertNotIn("(Origin: Audio. Fix ASR errors.)", prompt)
         self.assertNotIn("[AUDIO]", prompt)
         self.assertNotIn("[ENVIRONMENT]", prompt)
-        self.assertIn("silently correct them before answering", prompt)
-        self.assertIn("Do not mention audio context, ASR", prompt)
+        self.assertIn("Silently correct any ASR errors", prompt)
+
 
     def test_speech_session_context_prompt_disallows_direct_screen_access_claims(self):
         prompt = PromptBuilder().user(
@@ -2060,10 +2083,113 @@ class ConfigResetTests(unittest.TestCase):
 
             self.assertFalse(config.get("onboarding.completed", True))
             self.assertEqual(config.get("ai.vision.allow_paid_fallback", None), False)
+            self.assertFalse(config.get("capture.screen.enabled", True))
+            self.assertTrue(config.get("capture.audio.enabled", False))
+            self.assertFalse(config.get("capture.audio.muted", True))
             self.assertEqual(config.secrets.get_api_key("groq"), "")
 
         if config_path.exists():
             config_path.unlink()
+
+
+class ProviderInitTests(unittest.TestCase):
+    def test_init_providers_skips_cloud_providers_without_keys(self):
+        from ai.providers import init_providers
+
+        class FakeProvider:
+            def __init__(self, name):
+                self.name = name
+                self.enabled = True
+
+        class FakeConfig:
+            def get(self, path, default=None):
+                if path == "ai.providers.validate_on_init":
+                    return False
+                if path == "ai.providers.health_check_timeout":
+                    return 1
+                return default
+
+            def get_api_key(self, provider):
+                return ""
+
+        groq_ctor = Mock(side_effect=AssertionError("groq should be skipped"))
+        gemini_ctor = Mock(side_effect=AssertionError("gemini should be skipped"))
+        cerebras_ctor = Mock(side_effect=AssertionError("cerebras should be skipped"))
+        mistral_ctor = Mock(side_effect=AssertionError("mistral should be skipped"))
+        cohere_ctor = Mock(side_effect=AssertionError("cohere should be skipped"))
+        openai_compat_ctor = Mock(side_effect=AssertionError("openai-compat should be skipped"))
+        openai_ctor = Mock(side_effect=AssertionError("openai should be skipped"))
+        anthropic_ctor = Mock(side_effect=AssertionError("anthropic should be skipped"))
+
+        with patch("ai.providers.groq_provider.GroqProvider", groq_ctor), \
+             patch("ai.providers.gemini_provider.GeminiProvider", gemini_ctor), \
+             patch("ai.providers.cerebras_provider.CerebrasProvider", cerebras_ctor), \
+             patch("ai.providers.mistral_provider.MistralProvider", mistral_ctor), \
+             patch("ai.providers.cohere_provider.CohereProvider", cohere_ctor), \
+             patch("ai.providers.openai_compat.OpenAICompatProvider", openai_compat_ctor), \
+             patch("ai.providers.openai_provider.OpenAIProvider", openai_ctor), \
+             patch("ai.providers.anthropic_provider.AnthropicProvider", anthropic_ctor), \
+             patch("ai.providers.ollama_provider.OllamaProvider", lambda config: FakeProvider("ollama")):
+            providers = init_providers(FakeConfig())
+
+        self.assertEqual(list(providers.keys()), ["ollama"])
+        groq_ctor.assert_not_called()
+        gemini_ctor.assert_not_called()
+        cerebras_ctor.assert_not_called()
+        mistral_ctor.assert_not_called()
+        cohere_ctor.assert_not_called()
+        openai_compat_ctor.assert_not_called()
+        openai_ctor.assert_not_called()
+        anthropic_ctor.assert_not_called()
+
+    def test_poll_provider_health_uses_cached_state_without_network_probe(self):
+        engine = AIEngine(ConfigStub(), HistoryStub())
+
+        class CachedProvider:
+            def __init__(self, name, state="active"):
+                self.name = name
+                self.enabled = True
+                self._health_state = state
+
+            def is_disabled(self):
+                return False
+
+            def check_rate(self):
+                return True
+
+            def disabled_reason(self):
+                return ""
+
+            def cooldown_remaining_s(self):
+                return 0
+
+            def health_state(self):
+                return self._health_state
+
+            def check_availability(self):
+                raise AssertionError("poll_provider_health should not probe the network")
+
+        engine._providers = {
+            "groq": CachedProvider("groq", "active"),
+            "gemini": CachedProvider("gemini", "down"),
+            "ollama": CachedProvider("ollama", "active"),
+        }
+        engine._provider_health_cache = {
+            "groq": {"state": "active", "reason": "", "updated_at": time.time()},
+            "gemini": {"state": "down", "reason": "probe failed", "updated_at": time.time()},
+            "ollama": {"state": "active", "reason": "", "updated_at": time.time()},
+        }
+
+        captured = []
+        engine.provider_status.connect(lambda payload: captured.append(payload))
+
+        asyncio.run(engine.poll_provider_health())
+
+        self.assertTrue(captured, "provider status snapshot should be emitted")
+        snapshot = captured[-1]
+        self.assertEqual(snapshot["groq"]["state"], "active")
+        self.assertEqual(snapshot["gemini"]["state"], "down")
+        self.assertEqual(snapshot["ollama"]["state"], "active")
 
 
 class HotkeyMatchingTests(unittest.TestCase):
@@ -2126,6 +2252,7 @@ class HotkeyMatchingTests(unittest.TestCase):
 class ScreenCaptureContextTests(unittest.TestCase):
     def test_capture_context_uses_pipeline_result(self):
         capture = ScreenCapture.__new__(ScreenCapture)
+        capture._enabled = True
         capture._last_text = "old text"
 
         async def fake_capture():
@@ -2139,6 +2266,7 @@ class ScreenCaptureContextTests(unittest.TestCase):
 
     def test_capture_context_falls_back_to_last_text_when_debounced(self):
         capture = ScreenCapture.__new__(ScreenCapture)
+        capture._enabled = True
         capture._last_text = "cached text"
 
         async def fake_capture():
@@ -2149,6 +2277,20 @@ class ScreenCaptureContextTests(unittest.TestCase):
         result = asyncio.run(ScreenCapture.capture_context(capture))
 
         self.assertEqual(result, "cached text")
+
+    def test_capture_context_returns_empty_when_vision_disabled(self):
+        capture = ScreenCapture.__new__(ScreenCapture)
+        capture._enabled = False
+        capture._last_text = "stale screen text"
+
+        async def fake_capture():
+            raise AssertionError("disabled vision must not capture or return cached OCR")
+
+        capture.capture = fake_capture
+
+        result = asyncio.run(ScreenCapture.capture_context(capture))
+
+        self.assertEqual(result, "")
 
 
 class OllamaProviderTests(unittest.TestCase):

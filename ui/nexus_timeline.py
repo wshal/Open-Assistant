@@ -152,6 +152,14 @@ class NexusTimelineView(QWidget):
                 self._make_event_card(ev),
             )
 
+        max_cards = 300
+        # Layout is: [empty_label][cards...][stretch]. Cap only dynamic cards.
+        while self.log_layout.count() - 2 > max_cards:
+            item = self.log_layout.takeAt(1)
+            w = item.widget() if item is not None else None
+            if w is not None:
+                w.deleteLater()
+
         # Auto-scroll to bottom
         QTimer.singleShot(30, lambda: self.scroll.verticalScrollBar().setValue(
             self.scroll.verticalScrollBar().maximum()

@@ -351,6 +351,13 @@ class IntentClassifier:
                 self._centroids: dict[str, np.ndarray] = {}
                 self._learned_count: dict[str, int] = {k: 0 for k in VALID_INTENTS}
 
+                # H-2: Mutation lock guards every read/write of the learned
+                # vector/text/centroid state. Separate from cls._lock which only
+                # serialises the one-time singleton bootstrap. RLock so
+                # _recompute_centroids() (called under the lock) can be invoked
+                # from already-locked sites.
+                self._mutation_lock = threading.RLock()
+
                 # Session-level rate limiting
                 self._session_learn_count = 0
                 self._last_learn_time: dict[str, float] = {k: 0.0 for k in VALID_INTENTS}
@@ -668,34 +675,62 @@ class IntentClassifier:
         if vec is None:
             return False
 
-        # Gate 6: Exact/near-duplicate check (across ALL categories)
-        for cat_name, cat_texts in self._all_texts.items():
-            if text.lower() in [t.lower() for t in cat_texts]:
-                logger.debug("learn() rejected: exact duplicate in %r", cat_name)
+        # H-2/H-3: All remaining gates inspect mutable state, then mutate it as
+        # a group. Hold the mutation lock for the whole accept block so a
+        # concurrent classify() / learn() / reset_learned() cannot observe a
+        # half-updated triplet (vectors, texts, all_texts) or a stale centroid.
+        with self._mutation_lock:
+            # Gate 6: Exact/near-duplicate check (across ALL categories)
+            for cat_name, cat_texts in self._all_texts.items():
+                if text.lower() in [t.lower() for t in cat_texts]:
+                    logger.debug("learn() rejected: exact duplicate in %r", cat_name)
+                    return False
+
+            # Gate 7: Semantic diversity; reject if too similar to existing
+            existing_vecs = (
+                list(self._builtin_vectors.get(intent, []))
+                + list(self._learned_vectors.get(intent, []))
+            )
+            if existing_vecs:
+                similarities = [float(np.dot(vec, ev)) for ev in existing_vecs]
+                max_sim = max(similarities) if similarities else 0.0
+
+                if max_sim >= _DEDUPE_EXACT_THRESHOLD:
+                    logger.debug("learn() rejected: near-duplicate (sim=%.3f)", max_sim)
+                    return False
+                if max_sim >= _DIVERSITY_THRESHOLD:
+                    logger.debug("learn() rejected: insufficient diversity (sim=%.3f)", max_sim)
+                    return False
+
+            # All gates passed; accept
+            self._learned_vectors[intent].append(vec)
+            self._learned_texts[intent].append(text)
+            self._all_texts[intent].append(text)
+            self._learned_count[intent] = self._learned_count.get(intent, 0) + 1
+            self._session_learn_count += 1
+            self._last_learn_time[intent] = now
+
+            # H-3: Drift invariant — vectors and texts must move together.
+            if len(self._learned_vectors[intent]) != len(self._learned_texts[intent]):
+                logger.error(
+                    "IntentClassifier drift: %r vectors=%d texts=%d (rolling back)",
+                    intent,
+                    len(self._learned_vectors[intent]),
+                    len(self._learned_texts[intent]),
+                )
+                # Roll back the last append on the longer side.
+                while len(self._learned_vectors[intent]) > len(self._learned_texts[intent]):
+                    self._learned_vectors[intent].pop()
+                while len(self._learned_texts[intent]) > len(self._learned_vectors[intent]):
+                    self._learned_texts[intent].pop()
                 return False
 
-        # Gate 7: Semantic diversity; reject if too similar to existing
-        existing_vecs = self._builtin_vectors.get(intent, []) + self._learned_vectors.get(intent, [])
-        if existing_vecs:
-            similarities = [float(np.dot(vec, ev)) for ev in existing_vecs]
-            max_sim = max(similarities) if similarities else 0.0
+            self._recompute_centroids()
 
-            if max_sim >= _DEDUPE_EXACT_THRESHOLD:
-                logger.debug("learn() rejected: near-duplicate (sim=%.3f)", max_sim)
-                return False
-            if max_sim >= _DIVERSITY_THRESHOLD:
-                logger.debug("learn() rejected: insufficient diversity (sim=%.3f)", max_sim)
-                return False
-
-        # All gates passed; accept
-        self._learned_vectors[intent].append(vec)
-        self._learned_texts[intent].append(text)
-        self._all_texts[intent].append(text)
-        self._learned_count[intent] = self._learned_count.get(intent, 0) + 1
-        self._session_learn_count += 1
-        self._last_learn_time[intent] = now
-
-        self._recompute_centroids()
+            total = sum(
+                len(self._builtin_vectors[k]) + len(self._learned_vectors[k])
+                for k in VALID_INTENTS
+            )
 
         exemplar = _LearnedExemplar(
             text=text, intent=intent, confidence=confidence,
@@ -703,10 +738,6 @@ class IntentClassifier:
         )
         self._persist_exemplar(exemplar)
 
-        total = sum(
-            len(self._builtin_vectors[k]) + len(self._learned_vectors[k])
-            for k in VALID_INTENTS
-        )
         logger.info(
             "Learned new %r exemplar (confidence=%.2f, session=%d/%d, total=%d): %r",
             intent, confidence, self._session_learn_count, _MAX_LEARNS_PER_SESSION,
@@ -726,19 +757,21 @@ class IntentClassifier:
         if not self._ensure_initialized():
             return
 
-        # Clear in-memory learned data
-        for cat in VALID_INTENTS:
-            self._learned_vectors[cat] = []
-            self._learned_texts[cat] = []
-            self._learned_count[cat] = 0
-            # Rebuild _all_texts from builtins only
-            self._all_texts[cat] = list(_BUILTIN_EXEMPLARS.get(cat, []))
+        # H-2: Reset mutates the same fields that learn() touches; serialise.
+        with self._mutation_lock:
+            # Clear in-memory learned data
+            for cat in VALID_INTENTS:
+                self._learned_vectors[cat] = []
+                self._learned_texts[cat] = []
+                self._learned_count[cat] = 0
+                # Rebuild _all_texts from builtins only
+                self._all_texts[cat] = list(_BUILTIN_EXEMPLARS.get(cat, []))
 
-        self._session_learn_count = 0
-        self._last_learn_time = {k: 0.0 for k in VALID_INTENTS}
+            self._session_learn_count = 0
+            self._last_learn_time = {k: 0.0 for k in VALID_INTENTS}
 
-        # Recompute centroids (builtin-only)
-        self._recompute_centroids()
+            # Recompute centroids (builtin-only)
+            self._recompute_centroids()
 
         # Remove the file
         try:
@@ -789,8 +822,14 @@ class IntentClassifier:
         if vec is None:
             return None
 
+        # H-2: Snapshot centroids under the mutation lock to avoid reading a
+        # half-updated dict mid-learn(). The dot products themselves are
+        # computed outside the lock to keep the critical section minimal.
+        with self._mutation_lock:
+            centroids_snapshot = dict(self._centroids)
+
         scores = {}
-        for name, centroid in self._centroids.items():
+        for name, centroid in centroids_snapshot.items():
             sim = float(np.dot(vec, centroid))
             scores[name] = max(0.0, sim)
 

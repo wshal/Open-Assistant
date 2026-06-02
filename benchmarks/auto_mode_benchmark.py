@@ -109,15 +109,21 @@ class AutoModeTester:
         if not self._standard_response_ready():
             return False
         audio = getattr(self.app, "audio", None)
-        provider = str(getattr(audio, "_transcription_provider", "local") or "local").lower()
-        effective = getattr(audio, "_effective_transcription_provider", None)
-        if callable(effective):
+        if audio is None:
+            return False
+        if bool(getattr(audio, "_whisper_preload_inflight", False)):
+            return False
+        # The benchmark is noticeably noisier if we start before the local
+        # Whisper fallback has finished loading, even when Groq STT is the
+        # primary final transcription provider.
+        if not bool(getattr(audio, "_model_loaded", False)):
+            return False
+        if hasattr(audio, "has_pending_transcription_jobs"):
             try:
-                provider = str(effective(is_final=True) or provider).lower()
+                if audio.has_pending_transcription_jobs():
+                    return False
             except Exception:
                 pass
-        if provider == "local" and not bool(getattr(audio, "_model_loaded", False)):
-            return False
         return True
 
     def _record_auto_unavailable_fixture(self, fixture: Path, started_at: float, event_type: str) -> None:

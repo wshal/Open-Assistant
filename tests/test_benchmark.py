@@ -1,7 +1,20 @@
-"""Benchmark all providers."""
+"""Benchmark all providers.
+
+L-8: This file lives in ``tests/`` but is a CLI-only benchmark, not a pytest
+test (no ``test_*`` functions). pytest's default discovery would still import
+it during a full collection pass and pull in heavy provider deps. The
+``collect_ignore`` hook + ``pytestmark = skip`` make pytest silently ignore it
+while keeping the original filename / module path so existing tooling that
+invokes ``python -m tests.test_benchmark`` keeps working.
+"""
 
 import asyncio
 import time
+
+import pytest
+
+pytestmark = pytest.mark.skip(reason="benchmark module, not a pytest test (L-8)")
+collect_ignore = ["test_benchmark.py"]
 
 from rich.console import Console
 from rich.table import Table

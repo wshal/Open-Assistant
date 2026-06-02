@@ -1,7 +1,13 @@
 import json, statistics
 from collections import defaultdict, Counter
+from pathlib import Path
 
-data = json.loads(open(r'C:\Users\Vishal\Desktop\Open Assist\benchmarks\audio_asr_matrix_sweep.json').read())
+# Issue #18: Resolve paths relative to this file so the script works on any
+# checkout/CI runner rather than only on the original author's machine.
+_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_SWEEP = _ROOT / "benchmarks" / "audio_asr_matrix_sweep.json"
+
+data = json.loads(_DEFAULT_SWEEP.read_text(encoding="utf-8"))
 models_in_sweep = data.get('models', [])
 
 profiles = {}

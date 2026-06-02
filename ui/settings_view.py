@@ -188,7 +188,9 @@ class ProviderTestWorker(QThread):
             "gemini": (
                 # v1beta is the current Gemini API surface for model operations.
                 # Using Flash keeps TEST fast and typically within free-tier limits.
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}",
+                # Issue #7: API key passed via x-goog-api-key header (set below),
+                # NOT the URL query string, to keep it out of proxy/server logs.
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
                 {"contents": [{"parts": [{"text": "Hi"}]}]},
             ),
             "cerebras": (
@@ -244,7 +246,8 @@ class ProviderTestWorker(QThread):
 
         # Configure provider-specific authentication headers
         if self.provider_id == "gemini":
-            pass  # Key is already in the URL
+            # Issue #7: Send the Gemini key in a header instead of the URL query string.
+            headers["x-goog-api-key"] = key
         elif self.provider_id == "anthropic":
             headers["x-api-key"] = key
             headers["anthropic-version"] = "2023-06-01"
@@ -433,15 +436,6 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
         )
         hdr.addWidget(t)
         hdr.addStretch()
-
-        close_btn = QPushButton("✕")
-        close_btn.setFixedSize(30, 30)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setStyleSheet(
-            "color: #667; border: none; font-size: 18px; background: transparent;"
-        )
-        close_btn.clicked.connect(self.closed.emit)
-        hdr.addWidget(close_btn)
         layout.addLayout(hdr)
 
         self.tabs = QTabWidget()
@@ -546,6 +540,13 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             )
             self.provider_detail_labels[provider_id].setText(display_msg)
             logger.info("[Q6 Timestamp] %s test result: %s at %s", provider_id, message, ts)
+
+        try:
+            ai = getattr(self.app, "ai", None)
+            if ai and hasattr(ai, "set_provider_health"):
+                ai.set_provider_health(provider_id, bool(success), reason=message, source="settings_test")
+        except Exception:
+            pass
 
         if provider_id != "ollama" or not hasattr(self, "ollama_model_combo"):
             return
@@ -1021,4 +1022,20 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             count = self.tabs.count()
             if count:
                 self.tabs.setCurrentIndex((self.tabs.currentIndex() + 1) % count)
+
+    def closeEvent(self, event):  # noqa: N802 - Qt API
+        # M-5: Make sure in-flight provider-test QThreads finish before the
+        # dialog is destroyed. Without this the worker can outlive its parent
+        # and emit signals into a deleted widget, crashing on Windows.
+        try:
+            workers = list(getattr(self, "_test_workers", {}).values())
+            for w in workers:
+                try:
+                    if w is not None and w.isRunning():
+                        w.quit()
+                        w.wait(2000)
+                except Exception:
+                    pass
+        finally:
+            super().closeEvent(event)
 

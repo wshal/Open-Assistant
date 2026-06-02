@@ -269,7 +269,12 @@ class TestEmbeddingTier(unittest.TestCase):
         self.assertIsInstance(cache._embed, EmbeddingTier)
 
     def test_ttl_expiry_skips_record(self):
-        """Records older than TTL must not be returned."""
+        """Records older than TTL must not be returned.
+
+        L-10: Previously slept 50ms for a 10ms TTL — a 5x margin that flaked on
+        loaded CI runners. Use a generous 25x margin (250ms vs 10ms) so the
+        test stays fast but practically never flakes due to scheduler jitter.
+        """
         tier = EmbeddingTier(threshold=0.50, ttl_s=0.01)  # 10ms TTL
         v = np.random.rand(384).astype(np.float32)
 
@@ -280,7 +285,7 @@ class TestEmbeddingTier(unittest.TestCase):
 
         rec = _EmbedRecord(mode="general", context_fp="ctx1", cache_query="stored", history_fp="h1")
         tier.add("stored", rec)
-        time.sleep(0.05)  # let TTL expire
+        time.sleep(0.25)  # let TTL expire (25x the TTL = strong margin)
 
         result = tier.find("query", mode="general", context_fp="ctx1")
         self.assertIsNone(result)

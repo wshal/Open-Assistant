@@ -45,11 +45,19 @@ def _load_font(candidates: Iterable[str], size: int) -> ImageFont.FreeTypeFont |
     return ImageFont.load_default()
 
 
+# L-6: Per-platform font candidate lists. The Windows fonts are tried first
+# (matching legacy fixture output), then macOS, then common Linux fallbacks.
+# Pillow's ``ImageFont.truetype`` will silently fall through each candidate;
+# the final ``load_default()`` handles a fully font-less environment.
 MONO_FONT = _load_font(
     [
         r"C:\Windows\Fonts\consola.ttf",
         r"C:\Windows\Fonts\CascadiaMono.ttf",
         r"C:\Windows\Fonts\cour.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/SFNSMono.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
     ],
     21,
 )
@@ -57,6 +65,9 @@ UI_FONT = _load_font(
     [
         r"C:\Windows\Fonts\segoeui.ttf",
         r"C:\Windows\Fonts\arial.ttf",
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ],
     20,
 )
@@ -64,6 +75,9 @@ TITLE_FONT = _load_font(
     [
         r"C:\Windows\Fonts\segoeuib.ttf",
         r"C:\Windows\Fonts\arialbd.ttf",
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     ],
     22,
 )
