@@ -141,7 +141,7 @@ class OllamaProvider(BaseProvider):
             return model
         if self._resolved_model:
             return self._resolved_model
-        return "llama3.1:8b"
+        return "gemma3:4b"
 
     def _pick_available_model(self, requested: str = "") -> str:
         if not self._available_models:
@@ -158,13 +158,14 @@ class OllamaProvider(BaseProvider):
                     return model
 
         preferred_prefixes = (
+            "gemma3",
+            "gemma",
             "llama3.1",
             "llama3.2",
             "qwen2.5",
             "qwen2",
             "mistral",
             "phi3",
-            "gemma",
         )
         for prefix in preferred_prefixes:
             for model in self._available_models:

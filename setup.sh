@@ -27,7 +27,7 @@ esac
 # Ollama
 echo -e "${Y}🦙 Ollama...${N}"
 command -v ollama &>/dev/null || (curl -fsSL https://ollama.com/install.sh | sh 2>/dev/null || true)
-command -v ollama &>/dev/null && ollama pull llama3.2:3b 2>/dev/null &
+command -v ollama &>/dev/null && ollama pull gemma3:4b 2>/dev/null &
 
 mkdir -p data/vectordb knowledge/documents logs
 [ ! -f .env ] && cp .env.example .env
