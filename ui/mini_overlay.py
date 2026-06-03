@@ -95,6 +95,7 @@ class MiniOverlay(QMainWindow):
             self.hide()
 
     def _build(self):
+        self.setWindowTitle("OpenAssist Mini Overlay")
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint

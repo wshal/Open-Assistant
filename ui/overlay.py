@@ -172,6 +172,7 @@ class OverlayWindow(QMainWindow):
             self.show()
 
     def _build(self):
+        self.setWindowTitle("OpenAssist Overlay")
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -1064,13 +1065,11 @@ class OverlayWindow(QMainWindow):
             f"QPushButton {{ color: {'#4ade80' if enabled else '#ef4444'}; font-size: 14px; background: transparent; border: none; }}"
         )
 
-        # Disable ANALYZE SCREEN when vision is fully off — no point capturing
+        # Keep ANALYZE SCREEN always enabled so user can manually trigger it at any time
         if hasattr(self, "btn_analyze_screen"):
             self.btn_analyze_screen.setEnabled(True)
             self.btn_analyze_screen.setToolTip(
                 "Capture the current screen and analyze it with live session context"
-                if enabled
-                else "Vision is OFF — enable vision (👁️) to use screen analysis"
             )
 
             if not enabled:
