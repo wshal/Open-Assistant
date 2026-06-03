@@ -580,6 +580,8 @@ class OpenAssistApp(QObject):
 
     def _poll_nexus_context(self):
         """Polls environmental signals for the ContextNexus."""
+        if hasattr(self, "screen") and self.screen and not getattr(self.screen, "_enabled", True):
+            return
         title = ProcessUtils.get_active_window_title()
         if title:
             # Avoid self-referential capture if we are the active window
@@ -1164,6 +1166,7 @@ class OpenAssistApp(QObject):
             ):
                 snapshot = dict(snapshot)
                 snapshot["latest_ocr"] = ""
+                snapshot["active_window"] = "Unknown" 
             if request_epoch != self._generation_epoch:
                 return
             await self.ai.generate_response(
@@ -2422,12 +2425,14 @@ class OpenAssistApp(QObject):
                 provider = "local"
                 if hasattr(self.audio, "_effective_transcription_provider"):
                     provider = self.audio._effective_transcription_provider(is_final=True)
-                if hasattr(self.audio, "_ensure_whisper_loaded"):
-                    self.audio._ensure_whisper_loaded()
                 if provider == "groq":
-                    self.warmup_status_update.emit("Cloud + Local STT Ready", 90, False)
+                    if hasattr(self.audio, "_ensure_whisper_loaded_async"):
+                        self.audio._ensure_whisper_loaded_async(force=False)
+                    self.warmup_status_update.emit("Cloud STT Ready", 90, False)
                     return
-                self.warmup_status_update.emit("Audio Ready", 90, False)
+                if hasattr(self.audio, "_ensure_whisper_loaded_async"):
+                    self.audio._ensure_whisper_loaded_async(force=True)
+                self.warmup_status_update.emit("Local STT Preloading...", 90, False)
             except Exception as e:
                 logger.error(f"Audio Warmup Fault: {e}")
 

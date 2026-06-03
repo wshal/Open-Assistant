@@ -628,8 +628,8 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         app.ai.warmup = lambda loop=None: order.append("brain")
         app.ai.ensure_health_monitor = lambda loop: None
         app._continuous_capture_loop = lambda: object()
-        app.audio._effective_transcription_provider = lambda is_final=True: "groq"
-        app.audio._ensure_whisper_loaded = lambda: order.append("whisper")
+        app.audio._effective_transcription_provider = lambda is_final=True: "local"
+        app.audio._ensure_whisper_loaded_async = lambda force=False: order.append("whisper") if force else None
         app.rag.add_directory = lambda path: None
         classifier = SimpleNamespace(classify=lambda text: order.append("intent"))
 
@@ -642,10 +642,54 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertIn("intent", order)
         self.assertIn("whisper", order)
-        self.assertIn(("Cloud + Local STT Ready", 90, False), updates)
+        self.assertIn(("Local STT Preloading...", 90, False), updates)
         self.assertEqual(updates[-1], ("✅ READY", 100, True))
         self.assertLess(order.index("whisper"), order.index("ready"))
         self.assertEqual(app.audio.start_calls, 0)
+
+    def test_background_warmup_skips_whisper_preloading_when_using_groq(self):
+        app = self._build_app()
+        updates = []
+        order = []
+
+        class SignalStub:
+            def emit(self, message, progress, ready):
+                updates.append((message, progress, ready))
+                if ready:
+                    order.append("ready")
+
+        class ImmediateThread:
+            def __init__(self, target=None, daemon=None, name=None):
+                self.target = target
+
+            def start(self):
+                if self.target:
+                    self.target()
+
+            def join(self):
+                return None
+
+        app.warmup_status_update = SignalStub()
+        app.screen = SimpleNamespace(initialize=lambda: order.append("vision"))
+        app.ai.warmup = lambda loop=None: order.append("brain")
+        app.ai.ensure_health_monitor = lambda loop: None
+        app._continuous_capture_loop = lambda: object()
+        app.audio._effective_transcription_provider = lambda is_final=True: "groq"
+        app.audio._ensure_whisper_loaded_async = lambda force=False: order.append("whisper") if force else None
+        app.rag.add_directory = lambda path: None
+        classifier = SimpleNamespace(classify=lambda text: order.append("intent"))
+
+        with patch("core.app.threading.Thread", ImmediateThread), patch(
+            "core.app.asyncio.run_coroutine_threadsafe", return_value=None
+        ), patch(
+            "ai.auto_answer_controller._get_intent_classifier", return_value=classifier
+        ), patch("knowledge.ingest.ingest_all", lambda rag, path: order.append("rag")):
+            OpenAssistApp._background_warmup(app)
+
+        self.assertIn("intent", order)
+        self.assertNotIn("whisper", order)
+        self.assertIn(("Cloud STT Ready", 90, False), updates)
+        self.assertEqual(updates[-1], ("✅ READY", 100, True))
 
     def test_background_warmup_skips_disabled_vision_audio_and_rag(self):
         app = self._build_app()

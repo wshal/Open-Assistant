@@ -29,12 +29,15 @@ class _SoundcardLoopbackHandle:
     def __init__(self, name: str):
         self.name = name
         self.running = True
+        self._lock = threading.Lock()
 
     def stop(self):
-        self.running = False
+        with self._lock:
+            self.running = False
 
     def close(self):
-        self.running = False
+        with self._lock:
+            self.running = False
 
 
 class _PyAudioLoopbackHandle:
@@ -43,27 +46,38 @@ class _PyAudioLoopbackHandle:
         self._stream = pa_stream
         self.running = True
         self.active = True
+        self._lock = threading.Lock()
+        self._closed = False
 
     def stop(self):
-        self.running = False
-        self.active = False
-        try:
-            if self._stream.is_active():
-                self._stream.stop_stream()
-        except Exception:
-            pass
+        with self._lock:
+            self.running = False
+            self.active = False
+            if self._closed:
+                return
+            try:
+                if self._stream and hasattr(self._stream, "is_active") and self._stream.is_active():
+                    self._stream.stop_stream()
+            except Exception:
+                pass
 
     def close(self):
-        self.running = False
-        self.active = False
-        try:
-            self._stream.close()
-        except Exception:
-            pass
-        try:
-            self._pa.terminate()
-        except Exception:
-            pass
+        with self._lock:
+            self.running = False
+            self.active = False
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                if self._stream:
+                    self._stream.close()
+            except Exception:
+                pass
+            try:
+                if self._pa:
+                    self._pa.terminate()
+            except Exception:
+                pass
 
 
 class AudioCapture(QObject):
@@ -891,14 +905,15 @@ class AudioCapture(QObject):
         return True
 
     def _capture_workers_healthy_locked(self) -> bool:
-        capture_alive = bool(self._capture_thread and self._capture_thread.is_alive())
-        process_alive = bool(self._process_thread and self._process_thread.is_alive())
-        streams_ready = (
-            True
-            if bool(getattr(self, "_hardware_capture_suspended", False))
-            else any(self._stream_is_ready(s) for s in self._active_streams)
-        )
-        return bool(self._running and capture_alive and process_alive and streams_ready)
+        with self._lock:
+            capture_alive = bool(self._capture_thread and self._capture_thread.is_alive())
+            process_alive = bool(self._process_thread and self._process_thread.is_alive())
+            streams_ready = (
+                True
+                if bool(getattr(self, "_hardware_capture_suspended", False))
+                else any(self._stream_is_ready(s) for s in self._active_streams)
+            )
+            return bool(self._running and capture_alive and process_alive and streams_ready)
 
     def _ensure_whisper_loaded_async(self, *, force: bool = False) -> None:
         if not force and self._effective_transcription_provider(is_final=True) != "local":
@@ -916,24 +931,27 @@ class AudioCapture(QObject):
         threading.Thread(target=_run, daemon=True, name="whisper-preload").start()
 
     def _close_streams(self):
-        import subprocess
-        for s in list(self._active_streams):
-            try:
-                if isinstance(s, subprocess.Popen):
-                    if s.poll() is None:
-                        s.terminate()
-                        try:
-                            s.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            s.kill()
-                else:
-                    if s and hasattr(s, "stop"):
-                        s.stop()
-                    if s and hasattr(s, "close"):
-                        s.close()
-            except Exception as e:
-                logger.warning(f"Audio stream close error: {e}")
-        self._active_streams.clear()
+        with self._lock:
+            import subprocess
+            streams_to_close = list(self._active_streams)
+            self._active_streams.clear()
+
+            for s in streams_to_close:
+                try:
+                    if isinstance(s, subprocess.Popen):
+                        if s.poll() is None:
+                            s.terminate()
+                            try:
+                                s.wait(timeout=1.0)
+                            except subprocess.TimeoutExpired:
+                                s.kill()
+                    else:
+                        if s and hasattr(s, "stop"):
+                            s.stop()
+                        if s and hasattr(s, "close"):
+                            s.close()
+                except Exception as e:
+                    logger.warning(f"Audio stream close error: {e}")
 
     def _drain_queue(self):
         while True:
@@ -1115,7 +1133,8 @@ class AudioCapture(QObject):
             )
             handle = _PyAudioLoopbackHandle(pa, stream)
             handle_ref["handle"] = handle
-            self._active_streams.append(handle)
+            with self._lock:
+                self._active_streams.append(handle)
             logger.info(
                 "Binding to WASAPI loopback via PyAudioWPatch: %s (%d Hz, %d ch)",
                 loopback_device.get("name", default_name or "default output"),
@@ -1144,7 +1163,8 @@ class AudioCapture(QObject):
 
         name = str(getattr(mic, "name", "default speaker loopback"))
         handle = _SoundcardLoopbackHandle(name)
-        self._active_streams.append(handle)
+        with self._lock:
+            self._active_streams.append(handle)
         logger.info("Binding to WASAPI loopback via soundcard: %s", name)
         started = threading.Event()
         failed = []
@@ -1152,8 +1172,9 @@ class AudioCapture(QObject):
         def cleanup_handle() -> None:
             handle.stop()
             try:
-                if handle in self._active_streams:
-                    self._active_streams.remove(handle)
+                with self._lock:
+                    if handle in self._active_streams:
+                        self._active_streams.remove(handle)
             except ValueError:
                 pass
 
@@ -1282,7 +1303,8 @@ class AudioCapture(QObject):
             stderr=subprocess.DEVNULL,
             bufsize=0  # unbuffered
         )
-        self._active_streams.append(proc)
+        with self._lock:
+            self._active_streams.append(proc)
 
         # Start a dedicated thread to read from stdout
         t = threading.Thread(target=self._macos_audio_reader, args=(proc,), daemon=True, name="macos-sysaudio")
@@ -1385,7 +1407,8 @@ class AudioCapture(QObject):
                         s_mic = sd.InputStream(
                             samplerate=mic_rate, channels=1, callback=make_cb(mic_rate)
                         )
-                        self._active_streams.append(s_mic)
+                        with self._lock:
+                            self._active_streams.append(s_mic)
                         s_mic.start()
 
                     if mode in ["system", "both"]:
@@ -1417,7 +1440,8 @@ class AudioCapture(QObject):
                                         "callback": make_cb(native_rate),
                                     }
                                     s_sys = sd.InputStream(**kwargs)
-                                    self._active_streams.append(s_sys)
+                                    with self._lock:
+                                        self._active_streams.append(s_sys)
                                     s_sys.start()
                                     opened = True
                                     break
@@ -1450,7 +1474,8 @@ class AudioCapture(QObject):
                                             channels=1,
                                             callback=make_cb(mic_rate),
                                         )
-                                        self._active_streams.append(s_sys)
+                                        with self._lock:
+                                            self._active_streams.append(s_sys)
                                         s_sys.start()
                                         opened = True
                                     except Exception as fallback_error:
