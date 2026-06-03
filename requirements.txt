@@ -68,7 +68,7 @@ fastembed>=0.3.0
 # sentence-transformers>=3.0.0
 
 # Text splitting
-langchain-text-splitters>=0.2.0
+
 
 # PDF support
 PyMuPDF>=1.24.0

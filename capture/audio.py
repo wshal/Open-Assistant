@@ -83,7 +83,6 @@ class _PyAudioLoopbackHandle:
 class AudioCapture(QObject):
     transcription_ready = pyqtSignal(str)
     interim_transcription_ready = pyqtSignal(str)
-    level = pyqtSignal(float)
 
     def __init__(self, config, state=None):
         super().__init__()
@@ -811,6 +810,17 @@ class AudioCapture(QObject):
             finally:
                 self._groq_http_session = None
 
+        # Join background threads outside the lock to prevent leaks/deadlocks
+        for thread_attr in ("_capture_thread", "_process_thread"):
+            thread = getattr(self, thread_attr, None)
+            if thread and thread.is_alive() and thread != threading.current_thread():
+                try:
+                    thread.join(timeout=1.0)
+                except Exception as _e:
+                    logger.debug("Audio: error joining %s: %s", thread_attr, _e)
+                finally:
+                    setattr(self, thread_attr, None)
+
         logger.info("🎙️ Audio Capture Stopped.")
 
     def toggle(self) -> bool:
@@ -830,6 +840,25 @@ class AudioCapture(QObject):
         We stop and reopen streams instead of trying to patch live state.
         """
         with self._restart_lock:
+            # Reload all configuration parameters live
+            self._transcription_provider = str(
+                self.config.get("capture.audio.transcription_provider", "groq")
+            ).lower()
+            self._groq_stt_model = str(
+                self.config.get("capture.audio.groq_stt_model", "whisper-large-v3-turbo")
+                or "whisper-large-v3-turbo"
+            )
+            self._groq_stt_timeout_s = max(
+                1.0,
+                float(self.config.get("capture.audio.groq_stt_timeout_s", 8.0) or 8.0),
+            )
+            self._chunking_enabled = bool(self.config.get("capture.audio.chunking.enabled", True))
+            self._chunking_system_mode_enabled = bool(
+                self.config.get("capture.audio.chunking.system_mode_enabled", False)
+            )
+            self._chunk_min_s = float(self.config.get("capture.audio.chunking.min_chunk_s", 3.0))
+            self._chunk_max_s = float(self.config.get("capture.audio.chunking.max_chunk_s", 6.0))
+
             new_mode = self.config.get("capture.audio.mode", "system")
             with self._lock:
                 was_running = self._running
@@ -1395,7 +1424,6 @@ class AudioCapture(QObject):
                                 "Audio hardware capture suspended; using injected audio frames."
                             )
                         while self._running and self._hardware_capture_suspended:
-                            self.level.emit(self._current_rms)
                             time.sleep(0.1)
                         if not self._running:
                             return
@@ -1497,7 +1525,6 @@ class AudioCapture(QObject):
                         raise e
 
             while self._running:
-                self.level.emit(self._current_rms)
                 time.sleep(0.1)
         except Exception as e:
             err = str(e)
@@ -1531,7 +1558,7 @@ class AudioCapture(QObject):
             ms: Milliseconds of silence before the speech segment is sent to
                 Whisper. Clamped to [200, 2000] for safety.
         """
-        ms = max(200, min(2000, int(ms)))
+        ms = max(200, min(3000, int(ms)))
         new_blocks = int(ms / self.block_ms)
         if new_blocks != self.silence_blocks:
             self.silence_blocks = new_blocks
@@ -1759,7 +1786,11 @@ class AudioCapture(QObject):
         )
 
     def _effective_transcription_provider(self, *, is_final: bool, speech_started_at=None) -> str:
-        provider = str(getattr(self, "_transcription_provider", "local") or "local").lower()
+        # Re-read from config dynamically to support instant/live switches
+        self._transcription_provider = str(
+            self.config.get("capture.audio.transcription_provider", "groq")
+        ).lower()
+        provider = self._transcription_provider
         if provider != "groq":
             return "local"
         groq_key = self._groq_api_key()

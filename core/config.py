@@ -353,17 +353,30 @@ class Config:
             # observed at rms 0.01-0.03, real speech at 0.12-0.22.
             "system_queue_pressure_max_peak_rms", 0.035
         )
+        # VAD inter-turn silence values (read by settings CAPTURE tab sliders).
+        # Previously missing — slider values were silently ignored on fresh installs.
+        self._data["capture"]["audio"]["vad"].setdefault("inter_turn_start_silence_ms", 400)
+        self._data["capture"]["audio"]["vad"].setdefault("stop_silence_ms", 700)
 
         # Final speech transcript gating: ignore tiny non-question scraps like
         # "API." so they do not pollute session context or auto-trigger answers.
         self._data.setdefault("detection", {})
         self._data["detection"].setdefault("final_min_chars", 6)
-        self._data["detection"].setdefault("final_min_words", 2)
+        # Aligned with QuestionDetector fallback: 3 words required so
+        # single-word fragments like "API." don't auto-trigger answers.
+        self._data["detection"].setdefault("final_min_words", 3)
         self._data["detection"].setdefault("final_requires_question_signal", True)
         self._data["detection"].setdefault("fragment_ttl_s", 4.0)
 
         self._data.setdefault("app", {})
         self._data["app"].setdefault("focus_on_show", False)
+        # HUD opacity (read by settings DISPLAY tab and applied to main window)
+        self._data["app"].setdefault("opacity", 0.94)
+        # Gaze-fade feature defaults (read by settings DISPLAY tab)
+        self._data["app"].setdefault("gaze_fade", {})
+        self._data["app"]["gaze_fade"].setdefault("enabled", False)
+        self._data["app"]["gaze_fade"].setdefault("margin", 60)
+        self._data["app"]["gaze_fade"].setdefault("target_opacity", 0.10)
         self._data.setdefault("stealth", {})
         self._data["stealth"].setdefault("enabled", True)
         self._data["stealth"].setdefault("auto_hide_on_share", True)
@@ -386,6 +399,10 @@ class Config:
         hotkeys.setdefault("toggle_audio", "ctrl+shift+a")
         hotkeys.setdefault("mini_mode", "ctrl+alt+n")
         hotkeys.setdefault("emergency_erase", "ctrl+shift+e")
+        # Hotkeys exposed in the SHORTCUTS settings tab but previously missing
+        # from defaults — caused them to show up blank in the UI.
+        hotkeys.setdefault("cancel", "esc")
+        hotkeys.setdefault("clipboard_context", "ctrl+shift+x")
 
         self._data.setdefault("telemetry", {})
         self._data["telemetry"].setdefault("enabled", True)

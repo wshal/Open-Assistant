@@ -28,7 +28,7 @@ class AppState(QObject):
         # signal emissions and config writes run on the owner thread.
         self._lock = threading.RLock()
         self._config = config
-        self._dispatch_requested.connect(lambda fn: fn())
+        self._dispatch_requested.connect(self._execute_dispatched)
 
         # Internal State
         self._mode = "general"
@@ -67,6 +67,9 @@ class AppState(QObject):
             fn()
         else:
             self._dispatch_requested.emit(fn)
+
+    def _execute_dispatched(self, fn):
+        fn()
 
     # Properties with signal emission
     @property

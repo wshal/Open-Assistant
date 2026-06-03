@@ -1085,12 +1085,21 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             workers = list(getattr(self, "_test_workers", {}).values())
             for w in workers:
                 try:
-                    # M27 FIX: quit() is a no-op for threads whose run()
-                    # doesn't call exec(). Just wait for natural completion.
                     if w is not None and w.isRunning():
+                        # Disconnect signals first to prevent callbacks into
+                        # the (partially) destroyed widget.
+                        try:
+                            w.result_ready.disconnect()
+                        except Exception:
+                            pass
+                        try:
+                            w.finished.disconnect()
+                        except Exception:
+                            pass
+                        # M27 FIX: quit() is a no-op for threads whose run()
+                        # doesn't call exec(). Just wait for natural completion.
                         w.wait(2000)
                 except Exception:
                     pass
         finally:
             super().closeEvent(event)
-

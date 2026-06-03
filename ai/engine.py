@@ -366,16 +366,46 @@ class AIEngine(QObject):
         logger.debug(f"Session context updated ({len(self._session_context)} chars)")
 
     def warmup(self, loop: asyncio.AbstractEventLoop = None):
-        """Initializes AI providers and starts background availability checks."""
-        try:
-            # If warmup is called multiple times (e.g. hot-apply settings), ensure
-            # we clean up any long-lived network resources (aiohttp sessions, etc.)
-            # from the previous provider instances to prevent leak warnings.
-            if self._providers:
-                self.close_providers()
+        """Initializes AI providers and starts background availability checks.
 
-            self._providers = init_providers(self.config)
-            logger.info(f"AI Engine initialized: {list(self._providers.keys())}")
+        Thread-safety: builds the new provider set in a local variable and
+        swaps it atomically onto self._providers.  Old providers are cleaned
+        up with a 1-second delay so any in-flight request can finish before
+        the underlying aiohttp session is torn down.
+        """
+        try:
+            # Build new providers in a local variable first so any concurrent
+            # generate_response() call continues reading the old (valid) dict
+            # until the atomic swap below completes.
+            new_providers = init_providers(self.config)
+            logger.info(f"AI Engine initialized: {list(new_providers.keys())}")
+
+            # Stash old providers for deferred cleanup BEFORE the swap.
+            old_providers = self._providers if self._providers else {}
+
+            # Atomic swap: after this line all new calls read from new_providers.
+            self._providers = new_providers
+
+            # Deferred cleanup: give in-flight requests 1 s to finish before
+            # tearing down the old sessions / HTTP connections.
+            if old_providers and loop and loop.is_running():
+                async def _deferred_close(provs):
+                    await asyncio.sleep(1.0)
+                    for prov in provs.values():
+                        close_fn = getattr(prov, "close", None)
+                        if not close_fn:
+                            continue
+                        try:
+                            if inspect.iscoroutinefunction(close_fn):
+                                await close_fn()
+                            else:
+                                close_fn()
+                        except Exception:
+                            pass
+                asyncio.run_coroutine_threadsafe(_deferred_close(old_providers), loop)
+            elif old_providers:
+                # No loop available — best-effort sync cleanup.
+                self.close_providers()
 
             # Kick off provider validation immediately so it overlaps with the
             # rest of warmup instead of waiting until the brain thread finishes.
@@ -416,6 +446,7 @@ class AIEngine(QObject):
             self.emit_provider_status_snapshot()
         except Exception as e:
             logger.error(f"AI Warmup Error: {e}")
+
 
     async def validate_loaded_providers(self, provider_ids: List[str] = None):
         """Probe loaded providers in the background without blocking app boot."""
@@ -687,17 +718,16 @@ class AIEngine(QObject):
             return
             
         kwargs = dict(self._current_gen_kwargs)
-        
-        # FIX: Clear immediately to prevent Double-Demote race condition
-        self._current_gen_kwargs = None 
-        
-        # FIX: Cancel the foreground instance so it stops fighting Q2 for the UI
-        self.cancel()
-        
         query = kwargs.get("query", "")
+        
+        # Do NOT clear _current_gen_kwargs here — if the background assignment
+        # fails we must keep the foreground state intact. This is cleared by
+        # _on_response_complete or a following successful demote.
         logger.info(f"AI: Demoting query '{query[:20]}...' to background slot")
         kwargs["bg_mode"] = True
         self._bg_slot.assign(self.generate_response(**kwargs), self._loop)
+        self.cancel()
+        self._current_gen_kwargs = None
 
     async def generate_response(
         self,
@@ -1010,9 +1040,13 @@ class AIEngine(QObject):
             self.error_occurred.emit("No available AI provider found.")
             return
 
-        self._active_provider_id = provider.name
+        # Only update the globally-visible active provider for foreground
+        # queries.  Background tasks (bg_mode=True) run on a separate slot
+        # and must NOT change the UI provider indicator.
+        if not bg_mode:
+            self._active_provider_id = provider.name
         logger.debug(
-            f"Provider selection -> complexity={complexity}, provider={provider.name}, tier={tier}"
+            f"Provider selection -> complexity={complexity}, provider={provider.name}, tier={tier}, bg_mode={bg_mode}"
         )
 
         try:
@@ -1484,71 +1518,6 @@ class AIEngine(QObject):
                     providers_tried.append(next_id)
                     logger.info(f"AI: Falling back to '{next_id}'")
                     continue
-
-            # 5. Finalize
-                if not _cancelled():
-                    full_response = self._clean_final_response(full_response)
-                    latency_ms = (time.time() - start_time) * 1000
-
-                # GAP 1: Populate short-query cache after a successful response.
-                # Only cache if allow_cache AND the RAG result did NOT require a
-                # uncached ChromaDB call.  Prefetch/LRU RAG hits are stable and cacheable.
-                cache_eligible = allow_cache and not _rag_from_uncached_call
-                if cache_eligible and (full_response or "").strip():
-                    try:
-                        self._short_cache.set(
-                            mode=mode_id,
-                            query=query,
-                            context_fp=context_fp,
-                            history_fp=history_fp,
-                            response=full_response,
-                            provider=current_provider.name,
-                        )
-                    except Exception:
-                        pass
-
-                if _is_stale_turn():
-                    logger.info(
-                        "AI: Skipping stale finalization for turn=%s (active=%s)",
-                        current_turn_id,
-                        self._foreground_turn_id or "",
-                    )
-                    return
-
-                self.history.add(
-                    query,
-                    full_response,
-                    provider=current_provider.name,  # actual provider that served the response
-                    mode=mode_id,
-                    latency=latency_ms,
-                    metadata={
-                        "background": bg_mode,
-                        "stage_timings": {
-                            **stage_timings,
-                            "request_to_complete_ms": (time.time() - request_started_at) * 1000,
-                        },
-                        "request_metadata": request_metadata,
-                        "providers_tried": providers_tried,
-                        # P2.7: Provenance flags — which context sources contributed
-                        "had_screen": bool(
-                            (screen_context or (nexus_snapshot or {}).get("latest_ocr", "") or "").strip()
-                        ),
-                        "had_audio": bool(
-                            (
-                                audio_context
-                                or _refined_audio_context
-                                or (nexus_snapshot or {}).get("full_audio_history", "")
-                                or ""
-                            ).strip()
-                        ),
-                        "had_rag": bool(rag_context.strip()) if rag_context else False,
-                    }
-                )
-                if not bg_mode:
-                    self._emit_response_complete_for_turn(full_response, turn_id=current_turn_id, bg_mode=bg_mode)
-                else:
-                    self.background_complete.emit(query, full_response)
-                logger.info(f"AI: Response complete ({latency_ms:.0f}ms) | {stage_timings}")
 
         except Exception as e:
             logger.error(f"AI Engine Runtime Error: {e}", exc_info=True)
@@ -2453,8 +2422,10 @@ class AIEngine(QObject):
                             break
                     self._rag_prefetch[fingerprint] = (context_str, now + self._prefetch_ttl)
                     # Also seed the regular cache with a likely query key
-                    cache_key = context_hint.lower()[:100]
+                    cache_key = context_hint.lower().strip()[:100]
                     self._rag_cache[cache_key] = (context_str, now + self._cache_ttl)
+                    if len(self._rag_cache) > self._max_cache_size:
+                        self._rag_cache.popitem(last=False)
                     logger.debug(f"RAG Prefetch: stored ({len(results)} results)")
             except Exception as e:
                 logger.debug(f"RAG Prefetch error (non-fatal): {e}")
@@ -2601,7 +2572,10 @@ class AIEngine(QObject):
                 mode_name = mode.name if hasattr(mode, "name") else str(mode or "general")
                 tier = self._router._tier_for_task(mode_name) if self._router else "balanced"
                 return provider, tier
-            return None, ""
+            if not bool(self.config.get("ai.text.local_only_strict", False)):
+                logger.warning("AI: local_only requested but Ollama unavailable — falling back to cloud providers")
+            else:
+                return None, ""
 
         prefer_speed = complexity in {"simple", "moderate"}
         prefer_quality = complexity in {"complex", "reasoning"}

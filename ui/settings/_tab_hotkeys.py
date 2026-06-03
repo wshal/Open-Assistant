@@ -51,6 +51,8 @@ class HotkeysTabMixin:
             "mini_mode": "Switch to Mini-HUD",
             "toggle_click_through": "Focus Click-Through",
             "emergency_erase": "Emergency System Wipe",
+            "cancel": "Cancel AI Response",
+            "clipboard_context": "Paste Clipboard as Context",
             "move_up": "Glide HUD Up",
             "move_down": "Glide HUD Down",
             "move_left": "Glide HUD Left",

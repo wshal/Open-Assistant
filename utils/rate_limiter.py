@@ -41,8 +41,6 @@ class RateLimiter:
             cutoff_24h = now - 86400
             while window_24h and window_24h[0] < cutoff_24h:
                 window_24h.popleft()
-            while window_1m and window_1m[0] < cutoff_24h:
-                window_1m.popleft()
             cutoff_1m = now - 60
             while window_1m and window_1m[0] < cutoff_1m:
                 window_1m.popleft()
@@ -56,8 +54,6 @@ class RateLimiter:
             cutoff_24h = now - 86400
             while window_24h and window_24h[0] < cutoff_24h:
                 window_24h.popleft()
-            while window_1m and window_1m[0] < cutoff_24h:
-                window_1m.popleft()
             window_24h.append(now)
             window_1m.append(now)
 
@@ -71,8 +67,6 @@ class RateLimiter:
             cutoff_24h = now - 86400
             while window_24h and window_24h[0] < cutoff_24h:
                 window_24h.popleft()
-            while window_1m and window_1m[0] < cutoff_24h:
-                window_1m.popleft()
             cutoff_1m = now - 60
             while window_1m and window_1m[0] < cutoff_1m:
                 window_1m.popleft()

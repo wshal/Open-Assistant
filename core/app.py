@@ -110,6 +110,8 @@ class OpenAssistApp(QObject):
         self._pending_request_metadata = None
         self._screen_share_active = False
         self._screen_share_hidden_window = None
+        self._pending_incomplete_audio_query = ""
+        self._pending_incomplete_audio_at = 0.0
         # Tracks whether the current session_context was auto-suggested by a mode
         # switch (True) or typed/loaded manually (False). Auto-suggested context
         # can be silently replaced when the mode changes; manual context cannot.
@@ -176,22 +178,12 @@ class OpenAssistApp(QObject):
     def _wire_signals(self):
         self.overlay.user_query.connect(self.generate_response)
         self.mini_overlay.user_query.connect(self.generate_response)
-        self.ai.response_chunk.connect(lambda c: self.overlay.append_response(c))
-        self.ai.response_chunk.connect(lambda c: self.mini_overlay.append_response(c))
+        self.ai.response_chunk.connect(self.overlay.append_response)
+        self.ai.response_chunk.connect(self.mini_overlay.append_response)
         if hasattr(self.ai, "background_complete"):
-            self.ai.background_complete.connect(
-                lambda q, r: self.overlay._on_bg_complete(q, r)
-            )
-            self.ai.background_complete.connect(
-                lambda q, r: self.mini_overlay._on_bg_complete(q, r)
-            )
-        # GAP 5: on_complete is now called by _on_response_complete (below) with
-        # cache_tier + provider so the source badge can be rendered in the response area.
-        # We keep a direct error→on_complete connection for error text display.
-        self.ai.error_occurred.connect(
-            lambda e: self.overlay.on_complete(f"ERROR: {e}")
-        )
-        self.ai.error_occurred.connect(lambda e: self.mini_overlay.show_error(e))
+            self.ai.background_complete.connect(self.overlay._on_bg_complete)
+            self.ai.background_complete.connect(self.mini_overlay._on_bg_complete)
+        self.ai.error_occurred.connect(self.mini_overlay.show_error)
         self.audio.transcription_ready.connect(self._on_transcription)
         if hasattr(self.audio, "interim_transcription_ready"):
             self.audio.interim_transcription_ready.connect(self._on_interim_transcription)
@@ -411,6 +403,8 @@ class OpenAssistApp(QObject):
             # Trim long stack traces to a readable one-liner
             short = error_text.split("\n")[0][:120]
             self.overlay.show_error_toast(short)
+        
+        self.overlay.on_complete(f"ERROR: {error_text}")
 
     def _reset_turn_local_state(self, reason: str = "") -> None:
         """Reset per-turn query/audio state so later utterances start clean."""
@@ -1266,7 +1260,7 @@ class OpenAssistApp(QObject):
                 pass
         self._reset_turn_local_state("cancel-generation")
         if getattr(self, "session_active", False):
-            self.overlay.update_transcript("Cancelled â€” Listening...", state="listening")
+            self.overlay.update_transcript("Cancelled — Listening...", state="listening")
         else:
             self.overlay.update_transcript("Cancelled.", state="idle")
         if hasattr(self.mini_overlay, "set_ready"):
@@ -1963,8 +1957,8 @@ class OpenAssistApp(QObject):
         # Clear AI caches so the next session has no stale context
         if hasattr(self.ai, "clear_rag_prefetch"):
             self.ai.clear_rag_prefetch()
-        if hasattr(self.ai, "_complexity_cached"):
-            self.ai._complexity_cached.cache_clear()
+        if hasattr(self.ai, "_complexity_cache"):
+            self.ai._complexity_cache.clear()
 
         # Persist the current context to disk before clearing from state,
         # so it reloads on next app launch (user doesn't retype every time).
