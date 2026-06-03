@@ -109,6 +109,7 @@ var/
 wheels/
 share/python-wheels/
 .installed.cfg
+Open.iss
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🐍  Python Environment & Cache
