@@ -22,6 +22,7 @@ class InputSimulator:
     def __init__(self, config):
         self.config = config
         self.typing_speed = config.get("stealth.typing_delay_ms", 20) / 1000.0
+        self._state_lock = threading.Lock()
         self._is_typing = False
         self._stop_requested = False
         self._available = sys.platform == "win32"
@@ -41,6 +42,10 @@ class InputSimulator:
             logger.warning("Sim: No target window or text provided.")
             return
 
+        if not ctypes.windll.user32.IsWindow(target_hwnd):
+            logger.warning(f"Sim: target_hwnd {target_hwnd} is not a valid window.")
+            return
+
         # Strip markdown syntax (```code```) if it's a code block
         clean_text = self._clean_markdown(text)
         
@@ -52,8 +57,9 @@ class InputSimulator:
         thread.start()
 
     def _do_type(self, text: str, hwnd: int):
-        self._is_typing = True
-        self._stop_requested = False
+        with self._state_lock:
+            self._is_typing = True
+            self._stop_requested = False
         logger.info(f"Sim: Starting stealth type to HWND {hwnd}")
 
         # CRLF Guard: Final normalization before injection
@@ -62,7 +68,12 @@ class InputSimulator:
 
         try:
             for char in text:
-                if self._stop_requested:
+                with self._state_lock:
+                    if self._stop_requested:
+                        break
+                
+                if not ctypes.windll.user32.IsWindow(hwnd):
+                    logger.warning(f"Sim: Target window {hwnd} was closed/invalidated during typing.")
                     break
                 
                 # Universal Line-Endings: Normalize \n for Windows
@@ -80,11 +91,13 @@ class InputSimulator:
         except Exception as e:
             logger.error(f"Sim: Typing failure: {e}")
         finally:
-            self._is_typing = False
+            with self._state_lock:
+                self._is_typing = False
             logger.info("Sim: Typing complete.")
 
     def stop(self):
-        self._stop_requested = True
+        with self._state_lock:
+            self._stop_requested = True
 
     def _clean_markdown(self, text: str) -> str:
         """Removes markdown code fences for cleaner IDE injection."""

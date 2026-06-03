@@ -1,5 +1,5 @@
 """
-Integrated Settings View — v4.1 (Midnight Premium).
+Integrated Settings View — v1.0.0 (Midnight Premium).
 RESTORATION: Hotkey Configuration Tab & SVG Tick Icons.
 FIXED: Checkbox tick visibility with URL-encoded SVG (Safe Mode).
 """
@@ -130,7 +130,13 @@ class ProviderTestWorker(QThread):
                         return await resp.json()
 
             try:
-                result = asyncio.run(test_ollama())
+                # M26 FIX: Explicit event loop creation/cleanup instead of
+                # asyncio.run() which is fragile inside a QThread.
+                loop = asyncio.new_event_loop()
+                try:
+                    result = loop.run_until_complete(test_ollama())
+                finally:
+                    loop.close()
                 if "error" in result:
                     self.result_ready.emit(
                         self.provider_id,
@@ -270,7 +276,13 @@ class ProviderTestWorker(QThread):
                     return status, data
 
         try:
-            status, result = asyncio.run(_post_json())
+            # M26 FIX: Explicit event loop creation/cleanup instead of
+            # asyncio.run() which is fragile inside a QThread.
+            loop = asyncio.new_event_loop()
+            try:
+                status, result = loop.run_until_complete(_post_json())
+            finally:
+                loop.close()
             if status >= 400:
                 msg = None
                 if isinstance(result, dict):
@@ -502,6 +514,26 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
         if self._test_cooldowns.get(pid, False):
             logger.debug("[Q5 Debounce] TEST for %s is on cooldown, ignoring click", pid)
             return
+
+        ai = getattr(self.app, "ai", None)
+        if pid != "ollama" and ai is not None:
+            provider = getattr(ai, "providers", {}).get(pid)
+            if provider is not None and hasattr(provider, "is_disabled") and provider.is_disabled():
+                remaining = getattr(provider, "cooldown_remaining_s", lambda: 0)()
+                reason = getattr(provider, "disabled_reason", lambda: "")()
+                if reason and "quota" in reason.lower():
+                    logger.info(
+                        "[Q5] Skipping provider test for %s due to active quota cooldown (%ss remaining)",
+                        pid,
+                        remaining,
+                    )
+                    self.status_labels[pid].setText("⏳")
+                    if pid in self.provider_detail_labels:
+                        self.provider_detail_labels[pid].setText(
+                            f"Skipped live test: recent quota limit ({remaining}s remaining)"
+                        )
+                    return
+
         self._test_cooldowns[pid] = True
         # Re-enable after 3 seconds
         QTimer.singleShot(3000, lambda p=pid: self._test_cooldowns.update({p: False}))
@@ -998,9 +1030,17 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             QTimer.singleShot(800, self.closed.emit)
             logger.info("[Settings] Close scheduled after apply")
 
-            # Safety reset in case view doesn't close or is re-opened
-            QTimer.singleShot(2000, lambda: self.btn_save.setText("APPLY SETTINGS"))
-            QTimer.singleShot(2000, lambda: self.btn_save.setEnabled(True))
+            # M28 FIX: Parent timers to self so they're destroyed with the
+            # widget, preventing crash if settings view is closed within 2s.
+            _reset_timer = QTimer(self)
+            _reset_timer.setSingleShot(True)
+            _reset_timer.timeout.connect(
+                lambda: (
+                    self.btn_save.setText("APPLY SETTINGS"),
+                    self.btn_save.setEnabled(True),
+                )
+            )
+            _reset_timer.start(2000)
         except Exception as e:
             logger.error("Save Fail: %s", e)
             logger.error(traceback.format_exc())
@@ -1045,8 +1085,9 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             workers = list(getattr(self, "_test_workers", {}).values())
             for w in workers:
                 try:
+                    # M27 FIX: quit() is a no-op for threads whose run()
+                    # doesn't call exec(). Just wait for natural completion.
                     if w is not None and w.isRunning():
-                        w.quit()
                         w.wait(2000)
                 except Exception:
                     pass

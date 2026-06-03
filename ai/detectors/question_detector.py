@@ -56,7 +56,7 @@ class DetectionResult:
 class QuestionDetector:
     def __init__(self, config):
         self.enabled = config.get("detection.auto_detect_questions", True)
-        self.min_words = config.get("detection.min_words", 3)
+        self.min_words = config.get("detection.final_min_words", 3)
 
         # Question patterns
         self.question_patterns = config.get(

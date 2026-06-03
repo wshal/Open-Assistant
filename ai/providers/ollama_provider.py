@@ -25,7 +25,7 @@ class OllamaProvider(BaseProvider):
     """
     Ollama local LLM provider.
 
-    FIXED in v4.0:
+    FIXED in v1.0.0:
     - Model availability check happens at init, NOT during generate()
     - If model isn't available, provider marks itself disabled
     - Model pull only happens via explicit pull_model() call
@@ -469,7 +469,10 @@ class OllamaProvider(BaseProvider):
         self._pre_request()
         model = self.get_model(tier)
         t0 = time.time()
-        tok = 0
+        # M50 FIX: accumulate text length instead of counting chunks as tokens;
+        # also capture eval_count from the final chunk (Ollama sends it when done=true).
+        accumulated_len = 0
+        final_eval_count = None
 
         session = await self._get_session()
         async with session.post(
@@ -498,11 +501,16 @@ class OllamaProvider(BaseProvider):
                     continue
                 chunk = data.get("message", {}).get("content", "")
                 if chunk:
-                    tok += 1
+                    accumulated_len += len(chunk)
                     yield chunk
+                # M50 FIX: capture eval_count from the final streaming chunk
+                if data.get("done") and "eval_count" in data:
+                    final_eval_count = data["eval_count"]
 
             t_end = time.time()  # Capture INSIDE context manager for accurate latency
 
+        # M50 FIX: prefer actual eval_count over estimate
+        tok = final_eval_count if final_eval_count is not None else max(1, accumulated_len // 4)
         self.stats.record(tok, t_end - t0)
 
     async def health_check(self) -> bool:
@@ -610,7 +618,8 @@ class OllamaProvider(BaseProvider):
         self._pre_request()
         model = self.get_model(tier)
         t0 = time.time()
-        tok = 0
+        # M50 FIX: accumulate text length instead of counting chunks as tokens
+        accumulated_len = 0
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
         session = await self._get_session()
@@ -621,7 +630,7 @@ class OllamaProvider(BaseProvider):
 
         last_error = None
         for idx, m in enumerate(attempt_models):
-            tok = 0                   # Reset per attempt so fallback stats are accurate
+            accumulated_len = 0       # Reset per attempt so fallback stats are accurate
             t0_attempt = time.time()
             async with session.post(
                 f"{self.endpoint}/api/chat",
@@ -647,6 +656,9 @@ class OllamaProvider(BaseProvider):
                         continue
                     raise last_error
 
+                # M50 FIX: accumulate text length and capture eval_count
+                # from the final chunk instead of counting chunks as tokens.
+                final_eval_count = None
                 async for line in resp.content:
                     if not line:
                         continue
@@ -656,11 +668,16 @@ class OllamaProvider(BaseProvider):
                         continue
                     chunk = data.get("message", {}).get("content", "")
                     if chunk:
-                        tok += 1
+                        accumulated_len += len(chunk)
                         yield chunk
+                    # M50 FIX: capture eval_count from the final streaming chunk
+                    if data.get("done") and "eval_count" in data:
+                        final_eval_count = data["eval_count"]
 
                 t_end_attempt = time.time()  # Capture INSIDE context manager for accurate latency
 
+            # M50 FIX: prefer actual eval_count over estimate
+            tok = final_eval_count if final_eval_count is not None else max(1, accumulated_len // 4)
             self.stats.record(tok, t_end_attempt - t0_attempt)
             if m != model:
                 self._resolved_vision_model = m

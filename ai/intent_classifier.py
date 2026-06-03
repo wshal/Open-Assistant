@@ -309,15 +309,16 @@ class IntentClassifier:
                          confidence=0.85)
     """
 
-    _instance: "IntentClassifier | None" = None
+    _instances: dict[type, object] = {}
     _lock = threading.Lock()
 
     def __new__(cls) -> "IntentClassifier":
         with cls._lock:
-            if cls._instance is None:
-                cls._instance = super().__new__(cls)
-                cls._instance._initialized = False
-            return cls._instance
+            if cls not in cls._instances:
+                instance = super().__new__(cls)
+                instance._initialized = False
+                cls._instances[cls] = instance
+            return cls._instances[cls] # type: ignore[return-value]
 
     # Initialization
 
@@ -404,6 +405,7 @@ class IntentClassifier:
         This ensures bad learned data can never fully corrupt the system:
         the hardcoded exemplars always anchor the centroid.
         """
+        temp_centroids = {}
         for name in VALID_INTENTS:
             builtin_vecs = self._builtin_vectors.get(name, [])
             learned_vecs = self._learned_vectors.get(name, [])
@@ -423,7 +425,9 @@ class IntentClassifier:
                 norm = np.linalg.norm(centroid)
                 if norm > 0:
                     centroid = centroid / norm
-                self._centroids[name] = centroid
+                temp_centroids[name] = centroid
+        with self._mutation_lock:
+            self._centroids = temp_centroids
 
     # Persistence + Decay + Compaction
 
@@ -537,8 +541,6 @@ class IntentClassifier:
         if len(embedded) <= _COMPACTION_KEEP:
             return [e for e, _ in embedded]
 
-        # Greedy diversity selection
-        selected_idx_set: set[int] = {0}  # Start with highest confidence
         # Sort by confidence descending, then by recency
         embedded.sort(
             key=lambda x: (
@@ -547,22 +549,32 @@ class IntentClassifier:
             )
         )
 
-        while len(selected_idx_set) < _COMPACTION_KEEP and len(selected_idx_set) < len(embedded):
+        n = len(embedded)
+        selected_idx_set: set[int] = {0}  # Start with highest confidence
+        
+        # min_distances[i] will store the minimum distance from candidate i to the selected set.
+        # Initially, the selected set only contains index 0.
+        min_distances = [1.0 - float(np.dot(embedded[i][1], embedded[0][1])) for i in range(n)]
+
+        while len(selected_idx_set) < _COMPACTION_KEEP and len(selected_idx_set) < n:
             best_idx = -1
             best_min_dist = -1.0
-            for i, (_, vec) in enumerate(embedded):
+            for i in range(n):
                 if i in selected_idx_set:
                     continue
-                # Min distance to all selected
-                min_dist = min(
-                    1.0 - float(np.dot(vec, embedded[j][1]))
-                    for j in selected_idx_set
-                )
-                if min_dist > best_min_dist:
-                    best_min_dist = min_dist
+                if min_distances[i] > best_min_dist:
+                    best_min_dist = min_distances[i]
                     best_idx = i
+            
             if best_idx >= 0:
                 selected_idx_set.add(best_idx)
+                # Update min_distances incrementally with the newly selected element
+                best_vec = embedded[best_idx][1]
+                for i in range(n):
+                    if i not in selected_idx_set:
+                        dist_to_new = 1.0 - float(np.dot(embedded[i][1], best_vec))
+                        if dist_to_new < min_distances[i]:
+                            min_distances[i] = dist_to_new
             else:
                 break
 
@@ -590,7 +602,11 @@ class IntentClassifier:
             logger.warning("Failed to rewrite learned intents: %s", e)
 
     def _persist_exemplar(self, exemplar: _LearnedExemplar) -> None:
-        """Append a single learned exemplar to disk (JSONL format)."""
+        """Append a single learned exemplar to disk (JSONL format).
+
+        H7 FIX: Serialize file writes under _mutation_lock to prevent two
+        concurrent learn() calls from interleaving JSONL lines.
+        """
         try:
             _DATA_DIR.mkdir(parents=True, exist_ok=True)
             entry = {
@@ -600,8 +616,9 @@ class IntentClassifier:
                 "learned_at": exemplar.learned_at,
                 "source": exemplar.source,
             }
-            with open(_LEARNED_INTENTS_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            with self._mutation_lock:
+                with open(_LEARNED_INTENTS_FILE, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.warning("Failed to persist learned exemplar: %s", e)
 
@@ -787,9 +804,14 @@ class IntentClassifier:
             return {"available": False}
 
         stats = {"available": True, "categories": {}}
+        with self._mutation_lock:
+            session_learns = self._session_learn_count
+            learned_counts = dict(self._learned_count)
+            builtin_counts = {name: len(self._builtin_vectors.get(name, [])) for name in VALID_INTENTS}
+
         for name in VALID_INTENTS:
-            builtin = len(self._builtin_vectors.get(name, []))
-            learned = self._learned_count.get(name, 0)
+            builtin = builtin_counts[name]
+            learned = learned_counts.get(name, 0)
             stats["categories"][name] = {
                 "builtin": builtin,
                 "learned": learned,
@@ -799,7 +821,7 @@ class IntentClassifier:
         stats["total_exemplars"] = sum(
             d["total"] for d in stats["categories"].values()
         )
-        stats["session_learns"] = self._session_learn_count
+        stats["session_learns"] = session_learns
         stats["session_limit"] = _MAX_LEARNS_PER_SESSION
         stats["max_age_days"] = _MAX_AGE_DAYS
         return stats

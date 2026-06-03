@@ -47,7 +47,8 @@ class CohereProvider(BaseProvider):
         t0 = time.time()
         tok = 0
         try:
-            stream = self.client.chat_stream(
+            # M47 FIX: await the coroutine — was missing, causing TypeError
+            stream = await self.client.chat_stream(
                 model=model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                 max_tokens=self.max_tokens, temperature=0.7

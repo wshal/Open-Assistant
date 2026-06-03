@@ -120,7 +120,9 @@ class SmartRouter:
                 if p.stats.tps > 100:
                     score += 5
 
-            remaining = p.rpm - len(p._req_times)
+            # M12 FIX: Use getattr to avoid crashing on custom providers
+            # that don't expose _req_times.
+            remaining = p.rpm - len(getattr(p, '_req_times', []))
             if remaining < p.rpm * 0.1:
                 score -= 15
 
@@ -178,8 +180,8 @@ class SmartRouter:
             elif not p.check_rate():
                 state = "rate_limited"
             else:
-                health = getattr(p, "health_state", lambda: "unknown")()
-                state = "down" if health == "down" else "active"
+                health_result = getattr(p, "health_state", lambda: "unknown")()
+                state = "down" if health_result == "down" else "active"
 
             health[name] = {
                 "state": state,

@@ -9,6 +9,7 @@ Refined for:
 - cleaner section header style
 """
 
+from typing import Optional
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -400,7 +401,19 @@ class StandbyView(QWidget):
 
         layout.addWidget(self.mode_grid_widget)
 
-        layout.addSpacing(4)
+        layout.addSpacing(10)
+
+        self.auto_mode_hint = QLabel()
+        self.auto_mode_hint.setWordWrap(True)
+        self.auto_mode_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.auto_mode_hint.setStyleSheet(
+            "color: #64748b; font-size: 10px; line-height: 1.35; "
+            "background: rgba(255,255,255,4); border: 1px solid rgba(255,255,255,10); "
+            "border-radius: 10px; padding: 8px 12px;"
+        )
+        layout.addWidget(self.auto_mode_hint)
+
+        layout.addSpacing(14)
 
         # ── CAPTURE SOURCE ───────────────────────────────────────────────────
         layout.addWidget(self._divider())
@@ -429,19 +442,7 @@ class StandbyView(QWidget):
             self.audio_btns[name] = btn
         layout.addLayout(audio_row)
 
-        layout.addSpacing(12)
-
-        self.auto_mode_hint = QLabel()
-        self.auto_mode_hint.setWordWrap(True)
-        self.auto_mode_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.auto_mode_hint.setStyleSheet(
-            "color: #64748b; font-size: 10px; line-height: 1.35; "
-            "background: rgba(255,255,255,4); border: 1px solid rgba(255,255,255,10); "
-            "border-radius: 10px; padding: 8px 12px;"
-        )
-        layout.addWidget(self.auto_mode_hint)
-
-        layout.addSpacing(25)
+        layout.addSpacing(16)
 
         # ── Provider status bar ──────────────────────────────────────────────
         self.model_bar = QFrame()
@@ -545,7 +546,12 @@ class StandbyView(QWidget):
                     local_ver = "0.0.0"
 
                 if is_newer(latest_tag, local_ver):
-                    self._call_on_ui_thread(lambda: self._show_update_badge(info))
+                    # M30 FIX: Guard UI callback against widget destruction —
+                    # the background thread may outlive the StandbyView.
+                    try:
+                        self._call_on_ui_thread(lambda: self._show_update_badge(info))
+                    except RuntimeError:
+                        pass  # Widget was destroyed before callback fired
             except Exception:
                 pass  # Non-fatal — silently ignore (offline, rate limit, etc.)
 
@@ -567,18 +573,31 @@ class StandbyView(QWidget):
                 self._update_badge.setToolTip(
                     f"Click to download: {asset}\n(Installer will open after download)"
                 )
-                self._update_badge.mousePressEvent = lambda e: self._download_update()
+                # M29 FIX: Store the action and use _on_update_badge_click
+                # instead of a lambda to avoid reference cycles.
+                self._update_badge_action = "download"
+                self._update_badge.mousePressEvent = self._on_update_badge_click
             else:
                 self._update_badge.setText(
                     f"UPDATE AVAILABLE  v{tag_str}  - click to visit releases"
                 )
                 self._update_badge.setToolTip("Click to open releases page")
-                self._update_badge.mousePressEvent = lambda e: self._open_releases()
+                self._update_badge_action = "releases"
+                self._update_badge.mousePressEvent = self._on_update_badge_click
             self._update_badge.show()
             return
         self._update_badge.setText(f"⬆ UPDATE AVAILABLE  v{tag}  — click to visit releases")
-        self._update_badge.mousePressEvent = lambda e: self._open_releases()
+        self._update_badge_action = "releases"
+        self._update_badge.mousePressEvent = self._on_update_badge_click
         self._update_badge.show()
+
+    def _on_update_badge_click(self, event):
+        """M29 FIX: Proper method for mousePressEvent — avoids lambda reference cycle."""
+        action = getattr(self, "_update_badge_action", "releases")
+        if action == "download":
+            self._download_update()
+        else:
+            self._open_releases()
 
     def _open_releases(self):
         try:
@@ -612,7 +631,10 @@ class StandbyView(QWidget):
         if not expected_sha256:
             try:
                 allow = False
-                cfg = getattr(self, "config", None)
+                # H16 FIX: Resolve config via the parent app, since self.config
+                # was never set in __init__ and always returns None via getattr.
+                app = self._resolve_app()
+                cfg = getattr(app, "config", None) if app else None
                 if cfg is not None and hasattr(cfg, "get"):
                     allow = bool(cfg.get("updates.allow_unverified", False))
                 if not allow:
@@ -837,7 +859,7 @@ class StandbyView(QWidget):
             "Standard Mode: transcribe first, then answer only when the detector sees a clear question."
         )
 
-    def show_context_chip(self, preset_name: str | None, applied: bool = True):
+    def show_context_chip(self, preset_name: Optional[str], applied: bool = True):
         """Update the context chip below the mode grid.
 
         preset_name=None  → hide the chip (no suggestion for this mode).

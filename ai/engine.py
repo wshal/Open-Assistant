@@ -11,7 +11,8 @@ import io
 import re
 import time
 import inspect
-from functools import lru_cache
+import threading
+
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from collections import OrderedDict
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -39,6 +40,7 @@ class AIEngine(QObject):
     response_complete = pyqtSignal(str)
     background_complete = pyqtSignal(str, str)  # (query, response)
     error_occurred = pyqtSignal(str)
+    turn_complete = pyqtSignal()  # Emitted when a generation turn finishes (success or error)
     provider_status = pyqtSignal(dict)  # Emits health for UI dashboard
     provider_selected = pyqtSignal(str)  # Emits active provider ID (e.g. "groq", "gemini", "ollama", "cache", etc.)
 
@@ -56,9 +58,11 @@ class AIEngine(QObject):
         self._active_provider_id = config.get("ai.fixed_provider", "")
         self._is_cancelled = False
         # Per-session cancellation event. Cleared at the start of each top-level
-        # generation method; set by cancel(). Using an asyncio.Event instead of
-        # a raw bool eliminates the check-then-branch race on shared mutable state.
-        self._cancel_event: asyncio.Event = asyncio.Event()
+        # generation method; set by cancel().  Using threading.Event (not
+        # asyncio.Event) because cancel() is called from the Qt main thread
+        # while the event is read/cleared on the asyncio loop thread.
+        # asyncio.Event is documented as NOT thread-safe.
+        self._cancel_event: threading.Event = threading.Event()
         self._foreground_cancel_token = 0
         self._health_task = None
         self._loop = None
@@ -68,6 +72,8 @@ class AIEngine(QObject):
         self._bg_slot = BackgroundGenerationSlot()
         self._foreground_turn_id: str = ""
         self._provider_health_cache: Dict[str, Dict[str, Any]] = {}
+        self._complexity_cache: dict = {}
+        self._complexity_cache_max = 256
         self._provider_validation_task = None
 
         # Provider speed ranking (fastest first)
@@ -125,6 +131,8 @@ class AIEngine(QObject):
         # Set by app.py from AppState.session_context each time it changes.
         # Injected as the top block of every system prompt for the session.
         self._session_context: str = ""
+        # M5 FIX: Protect _session_failed_providers with a lock.
+        self._session_failed_lock = threading.Lock()
         self._session_failed_providers: set[str] = set()
 
     @property
@@ -138,7 +146,8 @@ class AIEngine(QObject):
         return self._active_provider_id
 
     def reset_session_failures(self) -> None:
-        self._session_failed_providers.clear()
+        with self._session_failed_lock:
+            self._session_failed_providers.clear()
 
     def set_foreground_turn_id(self, turn_id: str) -> None:
         self._foreground_turn_id = str(turn_id or "").strip()
@@ -178,14 +187,17 @@ class AIEngine(QObject):
 
     def _mark_provider_failed_for_session(self, provider_id: str) -> None:
         if provider_id:
-            self._session_failed_providers.add(str(provider_id))
+            with self._session_failed_lock:
+                self._session_failed_providers.add(str(provider_id))
 
     def _filter_provider_preferences(self, providers: List[str]) -> List[str]:
         filtered = []
         seen = set()
+        with self._session_failed_lock:
+            failed = set(self._session_failed_providers)
         for pid in providers or []:
             name = str(pid or "").strip()
-            if not name or name in seen or name in self._session_failed_providers:
+            if not name or name in seen or name in failed:
                 continue
             provider = self._providers.get(name)
             if not provider or not getattr(provider, "enabled", False):
@@ -240,6 +252,8 @@ class AIEngine(QObject):
         """
         import re as _re
         msg = str(exc or "").lower()
+        if AIEngine._is_quota_exhausted_error(exc):
+            return 3600
         if any(
             k in msg
             for k in [
@@ -270,6 +284,8 @@ class AIEngine(QObject):
     @staticmethod
     def _cooldown_reason_for_error(exc: Exception) -> str:
         msg = str(exc or "").lower()
+        if AIEngine._is_quota_exhausted_error(exc):
+            return "quota exhausted"
         if any(
             k in msg
             for k in [
@@ -289,11 +305,25 @@ class AIEngine(QObject):
             return "connection"
         return ""
 
-    # Cloud providers where a 429 means quota is exhausted for the session
-    # (not just a brief burst limit). Matching the cheating repo's
-    # groqFailedForSession pattern: disable for 3600s so they don't get
-    # retried within the same conversation.
-    _SESSION_QUOTA_PROVIDERS = frozenset({"groq", "gemini", "anthropic", "together", "cerebras"})
+    @staticmethod
+    def _is_quota_exhausted_error(exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        if any(k in msg for k in ["insufficient_quota", "resource_exhausted"]):
+            return True
+        if "quota" in msg and any(k in msg for k in ["exceed", "exceeded", "exhaust", "limit"]):
+            return True
+        if any(
+            k in msg
+            for k in [
+                "no credits",
+                "insufficient credits",
+                "billing",
+                "quota exhausted",
+                "daily limit",
+            ]
+        ):
+            return True
+        return False
 
     def _maybe_cooldown_provider(self, provider, exc: Exception) -> None:
         seconds = self._cooldown_seconds_for_error(exc)
@@ -304,9 +334,9 @@ class AIEngine(QObject):
         # cooldown (3600s) instead of the server-hinted retry window.
         # A Groq 6000 TPM limit isn't fixed by waiting 36s if we consumed ~5k tokens
         # per request — the next request will hit the same wall immediately.
-        if (
-            reason == "429 rate limit"
-            and getattr(provider, "name", "") in self._SESSION_QUOTA_PROVIDERS
+        if provider is not None and getattr(provider, "name", "") != "ollama" and (
+            reason == "quota exhausted"
+            or (reason == "429 rate limit" and self._is_quota_exhausted_error(exc))
         ):
             seconds = 3600  # effectively session-length disable
             logger.info(
@@ -409,7 +439,10 @@ class AIEngine(QObject):
             async with sem:
                 ok = False
                 last_error = ""
-                attempts = 2 if name in {"groq", "gemini", "ollama"} else 1
+                attempts = max(
+                    1,
+                    int(self.config.get("ai.providers.health_check_attempts", 1) or 1),
+                )
                 for attempt in range(1, attempts + 1):
                     try:
                         ok = await asyncio.wait_for(prov.health_check(), timeout=timeout)
@@ -731,6 +764,9 @@ class AIEngine(QObject):
         def _cancelled() -> bool:
             return self._bg_slot.is_cancelled() if bg_mode else self._foreground_cancelled(cancel_token)
 
+        def _is_stale_turn() -> bool:
+            return (not bg_mode) and bool(current_turn_id) and not self._owns_foreground_turn(current_turn_id)
+
         # Resolve the active Mode object — use ModeManager if available
         mode_obj = self._mode_manager.current if self._mode_manager else None
         mode_id = mode_obj.name if mode_obj else self.config.get("ai.mode", "general")
@@ -804,6 +840,13 @@ class AIEngine(QObject):
                         )
                     except Exception:
                         pass
+                if _is_stale_turn():
+                    logger.info(
+                        "AI: Skipping stale cache-hit finalization for turn=%s (active=%s)",
+                        current_turn_id,
+                        self._foreground_turn_id or "",
+                    )
+                    return
                 self.history.add(
                     query,
                     cached.response,
@@ -973,6 +1016,7 @@ class AIEngine(QObject):
         )
 
         try:
+            history_block = ""
             # 1 & 2.  RAG + Refinement — run concurrently to hide latency
             # ─────────────────────────────────────────────────────────────────
             # Previously sequential: wait(RAG) + wait(refine) = ~600ms worst-case.
@@ -1003,6 +1047,8 @@ class AIEngine(QObject):
                     screen_context or nexus_snapshot.get("latest_ocr", ""),
                     audio_context or nexus_snapshot.get("recent_audio", ""),
                 )
+                # Evict expired prefetch entries on read
+                self._evict_expired_prefetch()
                 prefetch_hit = self._rag_prefetch.get(prefetch_fp)
                 if prefetch_hit and now < prefetch_hit[1]:
                     rag_context = prefetch_hit[0]
@@ -1096,8 +1142,10 @@ class AIEngine(QObject):
                 )
 
             # Strict Output Cap for Cloud Background Fallback
+            # M1 FIX: Removed early `history_block = ""` here — the definitive
+            # assignment is in the block below (line ~1122) which covers all cases.
             if request_metadata.get("suppress_history_context"):
-                history_block = ""
+                pass  # history_block will be set to "" below
             elif bg_mode and cloud_bg_fallback:
                 sys_prompt += "\n\nCRITICAL INSTRUCTION: You are generating a background thought. Keep your response extremely concise, under 100 words. Do not ramble."
 
@@ -1170,6 +1218,14 @@ class AIEngine(QObject):
                                 if _cancelled():
                                     return
 
+                                if _is_stale_turn():
+                                    logger.info(
+                                        "AI: Skipping stale race finalization for turn=%s (active=%s)",
+                                        current_turn_id,
+                                        self._foreground_turn_id or "",
+                                    )
+                                    return
+
                                 for other in list(tasks.keys()):
                                     other.cancel()
                                 tasks.clear()
@@ -1226,6 +1282,19 @@ class AIEngine(QObject):
                                     self._emit_response_complete_for_turn(raced, turn_id=current_turn_id, bg_mode=bg_mode)
                                 else:
                                     self.background_complete.emit(query, raced)
+                                # M3 FIX: Populate cache after race success.
+                                if allow_cache and (raced or "").strip():
+                                    try:
+                                        self._short_cache.set(
+                                            mode=mode_id,
+                                            query=query,
+                                            context_fp=context_fp,
+                                            history_fp=history_fp,
+                                            response=raced,
+                                            provider=p.name if p else "race",
+                                        )
+                                    except Exception:
+                                        pass
                                 return
                     finally:
                         for t in list(tasks.keys()):
@@ -1263,6 +1332,67 @@ class AIEngine(QObject):
                 fallback_queue.append(pid)
 
             current_provider = provider
+
+            def _finalize_successful_response(final_response: str, provider_name: str) -> None:
+                final_response = self._clean_final_response(final_response)
+
+                if _is_stale_turn():
+                    logger.info(
+                        "AI: Skipping stale finalization for turn=%s (active=%s)",
+                        current_turn_id,
+                        self._foreground_turn_id or "",
+                    )
+                    return
+
+                latency_ms = (time.time() - start_time) * 1000
+                cache_eligible = allow_cache and not _rag_from_uncached_call
+                if cache_eligible and (final_response or "").strip():
+                    try:
+                        self._short_cache.set(
+                            mode=mode_id,
+                            query=query,
+                            context_fp=context_fp,
+                            history_fp=history_fp,
+                            response=final_response,
+                            provider=provider_name,
+                        )
+                    except Exception:
+                        pass
+
+                self.history.add(
+                    query,
+                    final_response,
+                    provider=provider_name,
+                    mode=mode_id,
+                    latency=latency_ms,
+                    metadata={
+                        "background": bg_mode,
+                        "stage_timings": {
+                            **stage_timings,
+                            "request_to_complete_ms": (time.time() - request_started_at) * 1000,
+                        },
+                        "request_metadata": request_metadata,
+                        "providers_tried": providers_tried,
+                        "had_screen": bool(
+                            (screen_context or (nexus_snapshot or {}).get("latest_ocr", "") or "").strip()
+                        ),
+                        "had_audio": bool(
+                            (
+                                audio_context
+                                or _refined_audio_context
+                                or (nexus_snapshot or {}).get("full_audio_history", "")
+                                or ""
+                            ).strip()
+                        ),
+                        "had_rag": bool(rag_context.strip()) if rag_context else False,
+                    },
+                )
+                if not bg_mode:
+                    self._emit_response_complete_for_turn(final_response, turn_id=current_turn_id, bg_mode=bg_mode)
+                else:
+                    self.background_complete.emit(query, final_response)
+                logger.info(f"AI: Response complete ({latency_ms:.0f}ms) | {stage_timings}")
+
             while True:
                 try:
                     ft_ms = provider_retry_timeouts_ms.get(
@@ -1291,8 +1421,11 @@ class AIEngine(QObject):
                             self.provider_selected.emit(current_provider.name)
                         if not bg_mode:
                             self._emit_response_chunk_for_turn(chunk, turn_id=current_turn_id, bg_mode=bg_mode)
+                    if not (full_response or "").strip():
+                        raise RuntimeError(f"Empty response from {current_provider.name}")
                     generation_succeeded = True
-                    break  # Stream completed successfully
+                    _finalize_successful_response(full_response, current_provider.name)
+                    return  # Stream completed successfully
 
                 except Exception as stream_err:
                     logger.warning(
@@ -1334,13 +1467,15 @@ class AIEngine(QObject):
                                 f"Dynamically routing next fallback to local Ollama."
                             )
 
-                    while fallback_queue and fallback_queue[0] in self._session_failed_providers:
+                    with self._session_failed_lock:
+                        _failed = set(self._session_failed_providers)
+                    while fallback_queue and fallback_queue[0] in _failed:
                         fallback_queue.pop(0)
 
                     if not fallback_queue:
                         logger.error("AI: All providers exhausted — no response generated.")
                         self.error_occurred.emit(
-                            f"All providers failed. Last error: {stream_err}"
+                            f"All providers failed. {self._sanitize_error_for_ui(stream_err)}"
                         )
                         return
 
@@ -1348,11 +1483,12 @@ class AIEngine(QObject):
                     current_provider = self._providers[next_id]
                     providers_tried.append(next_id)
                     logger.info(f"AI: Falling back to '{next_id}'")
+                    continue
 
             # 5. Finalize
-            if not _cancelled():
-                full_response = self._clean_final_response(full_response)
-                latency_ms = (time.time() - start_time) * 1000
+                if not _cancelled():
+                    full_response = self._clean_final_response(full_response)
+                    latency_ms = (time.time() - start_time) * 1000
 
                 # GAP 1: Populate short-query cache after a successful response.
                 # Only cache if allow_cache AND the RAG result did NOT require a
@@ -1370,6 +1506,14 @@ class AIEngine(QObject):
                         )
                     except Exception:
                         pass
+
+                if _is_stale_turn():
+                    logger.info(
+                        "AI: Skipping stale finalization for turn=%s (active=%s)",
+                        current_turn_id,
+                        self._foreground_turn_id or "",
+                    )
+                    return
 
                 self.history.add(
                     query,
@@ -1640,6 +1784,7 @@ class AIEngine(QObject):
         nexus_snapshot: Dict[str, Any],
         screen_context: str = "",
         audio_context: str = "",
+        turn_id: str = "",
     ) -> str:
         """
         Fast path for hotkey-triggered context answers.
@@ -1647,6 +1792,9 @@ class AIEngine(QObject):
         """
         cancel_token = self._begin_foreground_generation()
         start_time = time.time()
+        current_turn_id = str(turn_id or self._foreground_turn_id or "").strip()
+        if current_turn_id:
+            self.set_foreground_turn_id(current_turn_id)
 
         # Resolve Mode object for profile-aware behaviour
         mode_obj = self._mode_manager.current if self._mode_manager else None
@@ -1703,12 +1851,20 @@ class AIEngine(QObject):
                     first_token_time = time.time()
                     self.provider_selected.emit(provider.name)
                 full_response += chunk
-                self.response_chunk.emit(chunk)
+                self._emit_response_chunk_for_turn(chunk, turn_id=current_turn_id, bg_mode=False)
 
             latency_ms = (time.time() - start_time) * 1000
             stage_timings = {"request_to_complete_ms": latency_ms}
             if first_token_time is not None:
                 stage_timings["request_to_first_token_ms"] = (first_token_time - start_time) * 1000
+
+            if current_turn_id and not self._owns_foreground_turn(current_turn_id):
+                logger.info(
+                    "AI: Suppressing stale quick-response completion for turn=%s (active=%s)",
+                    current_turn_id,
+                    self._foreground_turn_id or "",
+                )
+                return ""
 
             had_screen = bool((screen_context or nexus_snapshot.get("latest_ocr", "")).strip())
             had_audio = bool((summarized_audio or "").strip())
@@ -1727,11 +1883,13 @@ class AIEngine(QObject):
                     "had_rag": False,
                 },
             )
-            self.response_complete.emit(full_response)
+            self._emit_response_complete_for_turn(full_response, turn_id=current_turn_id, bg_mode=False)
+            self.turn_complete.emit()
             return full_response
         except Exception as e:
             logger.error(f"Quick response error: {e}", exc_info=True)
             self.error_occurred.emit(self._sanitize_error_for_ui(e))
+            self.turn_complete.emit()
             return ""
 
     async def _summarize_audio_fast(self, audio_text: str, cancel_token: int = 0) -> str:
@@ -1864,14 +2022,17 @@ class AIEngine(QObject):
         if budget_s <= 0:
             budget_s = 10
         deadline = start_time + budget_s
-        mode_id = self.config.get("ai.mode", "general")
-        sys_prompt = self.prompts.system(mode_id)
+        # M2 FIX: Look up Mode object so mode-specific prompt customizations apply.
+        mode_obj = self._mode_manager.current if self._mode_manager else None
+        mode_id = mode_obj.name if mode_obj else self.config.get("ai.mode", "general")
+        _mode_arg = mode_obj or mode_id
+        sys_prompt = self.prompts.system(_mode_arg)
         user_msg = self.prompts.user(
             query=query,
             screen=screen_context or nexus_snapshot.get("latest_ocr", ""),
             audio=audio_context or nexus_snapshot.get("full_audio_history", ""),
             rag="",
-            mode=mode_id,
+            mode=_mode_arg,
             origin="screen_analysis",
             nexus=nexus_snapshot,
         )
@@ -2264,7 +2425,10 @@ class AIEngine(QObject):
         fingerprint = self._rag_prefetch_fingerprint(screen_text, audio_text)
         now = time.time()
 
-        # Don’t re-prefetch if we have a fresh result for this context
+        # Evict expired entries to bound memory growth
+        self._evict_expired_prefetch()
+
+        # Don't re-prefetch if we have a fresh result for this context
         existing = self._rag_prefetch.get(fingerprint)
         if existing and now < existing[1]:
             logger.debug("RAG Prefetch: already fresh, skipping")
@@ -2280,6 +2444,13 @@ class AIEngine(QObject):
                 results = await self.rag.query(context_hint)
                 if results:
                     context_str = "\n".join(results)
+                    # Enforce max size cap before inserting
+                    while len(self._rag_prefetch) >= 50:
+                        try:
+                            oldest_key = next(iter(self._rag_prefetch))
+                            del self._rag_prefetch[oldest_key]
+                        except StopIteration:
+                            break
                     self._rag_prefetch[fingerprint] = (context_str, now + self._prefetch_ttl)
                     # Also seed the regular cache with a likely query key
                     cache_key = context_hint.lower()[:100]
@@ -2287,6 +2458,13 @@ class AIEngine(QObject):
                     logger.debug(f"RAG Prefetch: stored ({len(results)} results)")
             except Exception as e:
                 logger.debug(f"RAG Prefetch error (non-fatal): {e}")
+
+    def _evict_expired_prefetch(self) -> None:
+        """Remove expired entries from _rag_prefetch to bound memory growth."""
+        now = time.time()
+        expired = [k for k, (_, expiry) in self._rag_prefetch.items() if now >= expiry]
+        for k in expired:
+            del self._rag_prefetch[k]
 
     def clear_rag_prefetch(self) -> None:
         """Clear prefetch cache on session end to avoid stale context bleed."""
@@ -2301,13 +2479,22 @@ class AIEngine(QObject):
         repeated or near-duplicate queries skip all regex work entirely.
         """
         key = query.lower().strip()[:80]
-        return self._complexity_cached(key)
+        cached = self._complexity_cache.get(key)
+        if cached is not None:
+            return cached
+        result = self._compute_complexity(key)
+        # Evict oldest if over capacity
+        if len(self._complexity_cache) >= self._complexity_cache_max:
+            try:
+                oldest = next(iter(self._complexity_cache))
+                del self._complexity_cache[oldest]
+            except StopIteration:
+                pass
+        self._complexity_cache[key] = result
+        return result
 
-    @lru_cache(maxsize=256)
-    def _complexity_cached(self, query_key: str) -> str:
-        """LRU-cached inner implementation. Called with the normalised key."""
-        lower = query_key
-
+    def _compute_complexity(self, lower: str) -> str:
+        """Compute query complexity from the normalised key."""
         # Check for reasoning patterns first (highest priority)
         for pattern in self._reasoning_patterns:
             if re.search(pattern, lower):
@@ -2445,6 +2632,9 @@ class AIEngine(QObject):
                         return provider, resolved_tier
                     return provider, getattr(provider, "default_tier", "balanced")
 
+        with self._session_failed_lock:
+            failed_providers = set(self._session_failed_providers)
+
         if self._router:
             provider, tier = self._router.select(
                 task=mode_name,
@@ -2452,7 +2642,7 @@ class AIEngine(QObject):
                 prefer_quality=prefer_quality,
                 preferred=preferred,
                 tier=tier_hint,
-                exclude=list(self._session_failed_providers),
+                exclude=list(failed_providers),  # snapshot; lock held briefly
             )
             if provider:
                 return provider, tier
@@ -2462,7 +2652,7 @@ class AIEngine(QObject):
             if (
                 provider
                 and getattr(provider, "is_available", lambda: getattr(provider, "enabled", False))()
-                and provider_id not in self._session_failed_providers
+                and provider_id not in failed_providers
                 and provider.check_rate()
             ):
                 tier = self._router._tier_for_task(mode_name) if self._router else "balanced"
@@ -2472,7 +2662,7 @@ class AIEngine(QObject):
         if (
             provider
             and getattr(provider, "enabled", False)
-            and getattr(provider, "name", "") not in self._session_failed_providers
+            and getattr(provider, "name", "") not in failed_providers
             and provider.check_rate()
         ):
             return provider, tier_hint or "balanced"
@@ -2566,7 +2756,7 @@ class AIEngine(QObject):
             info = {
                 "state": state,
                 "selected": pid == self._active_provider_id,
-                "usable": state in {"active", "cooldown"},
+                "usable": state in {"active", "cooldown", "configured"},  # M4 FIX: match line ~521
             }
 
             if hasattr(prov, "is_disabled") and prov.is_disabled():

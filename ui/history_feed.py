@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QVBoxLayout,
     QWidget,
+    QTextBrowser,
 )
 
 from ui.markdown_renderer import MarkdownRenderer
@@ -46,6 +47,18 @@ class _SessionCard(QFrame):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit(self._session_id)
         super().mousePressEvent(event)
+class _AutoResizingTextBrowser(QTextBrowser):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameStyle(0) # no border
+        self.setStyleSheet("background: transparent;")
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.document().documentSizeChanged.connect(self._adjust_height)
+
+    def _adjust_height(self):
+        size = self.document().size()
+        self.setFixedHeight(int(size.height()) + 10)
 
 
 class HistoryFeedView(QWidget):
@@ -54,6 +67,11 @@ class HistoryFeedView(QWidget):
         self.history = history
         self.md = MarkdownRenderer()
         self._current_session_id = None  # track for export
+        self._search_text = ""
+        self._search_timer = QTimer(self)
+        self._search_timer.setInterval(150)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.timeout.connect(self._do_search)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -135,19 +153,37 @@ class HistoryFeedView(QWidget):
         self.search_bar.show()
         self.title_label.setText("📚 Sessions Library")
         self._current_session_id = None
+        
+        # Cache formatted datetime on session dicts
+        for s in self.history.sessions:
+            if "_formatted_date" not in s:
+                s["_formatted_date"] = datetime.datetime.fromtimestamp(s.get("created_at", 0)).strftime("%Y-%m-%d %H:%M")
+            if "_snippet_lower" not in s:
+                s["_snippet_lower"] = (s.get("snippet", "") or "").lower()
+                
         self._render_sessions(self.history.sessions)
 
     def _on_search(self, text: str):
+        self._search_text = text
+        self._search_timer.start()
+
+    def _do_search(self):
         """P2.5: Live filter sessions by snippet or date."""
+        text = getattr(self, "_search_text", "")
         all_sessions = self.history.sessions
+        for s in all_sessions:
+            if "_formatted_date" not in s:
+                s["_formatted_date"] = datetime.datetime.fromtimestamp(s.get("created_at", 0)).strftime("%Y-%m-%d %H:%M")
+            if "_snippet_lower" not in s:
+                s["_snippet_lower"] = (s.get("snippet", "") or "").lower()
         if not text.strip():
             filtered = all_sessions
         else:
             q = text.lower()
             filtered = [
                 s for s in all_sessions
-                if q in s.get("snippet", "").lower()
-                or q in datetime.datetime.fromtimestamp(s.get("created_at", 0)).strftime("%Y-%m-%d %H:%M")
+                if q in s.get("_snippet_lower", "")
+                or q in s.get("_formatted_date", "")
             ]
         self._clear_layout()
         self._render_sessions(filtered)
@@ -229,7 +265,12 @@ class HistoryFeedView(QWidget):
             lbl.setStyleSheet("color: #556; font-style: italic; margin-top: 20px;")
             self.content_layout.insertWidget(0, lbl)
 
-        QTimer.singleShot(50, lambda: self.scroll.verticalScrollBar().setValue(0))
+        def safe_scroll():
+            try:
+                self.scroll.verticalScrollBar().setValue(0)
+            except RuntimeError:
+                pass
+        QTimer.singleShot(50, safe_scroll)
 
     # ── P2.5: Markdown export ─────────────────────────────────────────────────
 
@@ -337,11 +378,10 @@ class HistoryFeedView(QWidget):
             )
             layout.addWidget(q)
 
-        ans = QLabel(self.md.render(entry.response))
-        ans.setWordWrap(True)
-        ans.setTextFormat(Qt.TextFormat.RichText)
+        ans = _AutoResizingTextBrowser()
+        ans.setHtml(self.md.render(entry.response))
         ans.setOpenExternalLinks(True)
-        ans.setStyleSheet("color: #d0d0e8;")
+        ans.setStyleSheet("QTextBrowser { color: #d0d0e8; background: transparent; border: none; }")
         layout.addWidget(ans)
 
         # P2.7: Provenance strip
@@ -376,16 +416,26 @@ class HistoryFeedView(QWidget):
             )
             layout.addWidget(q)
 
-        response = QLabel(self.md.render(analysis.get("response", "")))
-        response.setWordWrap(True)
-        response.setTextFormat(Qt.TextFormat.RichText)
+        response = _AutoResizingTextBrowser()
+        response.setHtml(self.md.render(analysis.get("response", "")))
         response.setOpenExternalLinks(True)
-        response.setStyleSheet("color: #d8f3ff;")
+        response.setStyleSheet("QTextBrowser { color: #d8f3ff; background: transparent; border: none; }")
         layout.addWidget(response)
         return card
 
     def _clear_layout(self):
+        # M32 FIX: Recursively clear nested layouts to prevent leaked items.
+        def _recurse_clear(layout):
+            while layout.count():
+                item = layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+                elif item.layout():
+                    _recurse_clear(item.layout())
+
         while self.content_layout.count() > 1:
             item = self.content_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+            elif item.layout():
+                _recurse_clear(item.layout())

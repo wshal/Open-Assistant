@@ -199,10 +199,20 @@ class ContextBuilder:
         """
         Extract lines from `new` that are NOT in `old` (the diff).
         Prepends a '--- screen diff ---' marker so the AI knows it's a delta.
+
+        M7 FIX: Use a multiset (counter) instead of a set so duplicate lines
+        in `old` are handled correctly, and line order in `new` is preserved.
         """
-        old_lines: Set[str] = {l.strip() for l in old.splitlines() if l.strip()}
+        from collections import Counter
+        old_counter = Counter(l.strip() for l in old.splitlines() if l.strip())
         new_lines = [l for l in new.splitlines() if l.strip()]
-        added = [l for l in new_lines if l.strip() not in old_lines]
+        added = []
+        for l in new_lines:
+            stripped = l.strip()
+            if old_counter.get(stripped, 0) > 0:
+                old_counter[stripped] -= 1  # consume one occurrence
+            else:
+                added.append(l)
 
         if not added:
             # No textual diff found — send the full new context

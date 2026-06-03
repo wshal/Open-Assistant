@@ -10,15 +10,20 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from core.constants import LOG_DIR
 
+import threading
+
 _initialized = False
+_init_lock = threading.Lock()
 
 
 def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
     global _initialized
     log_level = getattr(logging, level.upper(), logging.INFO)
     if not _initialized:
-        _setup_root_logger(log_level)
-        _initialized = True
+        with _init_lock:
+            if not _initialized:
+                _setup_root_logger(log_level)
+                _initialized = True
     logger = logging.getLogger(name)
     logger.setLevel(log_level)
     return logger

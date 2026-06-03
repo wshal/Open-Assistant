@@ -136,6 +136,29 @@ class GeminiProvider(BaseProvider):
                 kwargs["thinking_config"] = {"thinking_budget": self._thinking_budget}
         return kwargs
 
+    @staticmethod
+    def _handle_error(error) -> Exception:
+        error_str = str(error).lower()
+        if any(
+            k in error_str
+            for k in [
+                "resource_exhausted",
+                "quota",
+                "quota exceeded",
+                "exceeded your current quota",
+                "daily limit",
+                "billing",
+                "insufficient credit",
+                "insufficient quota",
+            ]
+        ):
+            return Exception("Gemini: Quota exceeded. Check billing and usage limits in AI Studio.")
+        if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+            return Exception("Gemini: Rate limit exceeded. Wait and retry.")
+        if "api key" in error_str or "permission denied" in error_str or "unauthorized" in error_str:
+            return Exception("Gemini: Invalid API key or access not enabled.")
+        return Exception(f"Gemini: {error}")
+
     # ── Text generation ───────────────────────────────────────────────────────
 
     async def generate(self, system: str, user: str, tier: str = None) -> str:
@@ -164,13 +187,15 @@ class GeminiProvider(BaseProvider):
             return text
         except Exception as e:
             self.stats.record_error()
-            raise
+            raise self._handle_error(e)
 
     async def generate_stream(self, system: str, user: str, tier: str = None) -> AsyncGenerator[str, None]:
         self._pre_request()
         model = self.get_model(tier)
         t0 = time.time()
         tok = 0
+        # M49 FIX: guard flag to prevent double stats recording on stream error
+        stats_recorded = False
         try:
             from google.genai import types
             contents, sys_instr = self._build_contents(model, system, user)
@@ -186,12 +211,13 @@ class GeminiProvider(BaseProvider):
                     tok += max(1, len(chunk.text) // 4)
                     yield chunk.text
             self.stats.record(tok, time.time() - t0)
+            stats_recorded = True
         except Exception as e:
             self.stats.record_error()
-            # Still record partial timing for latency tracking
-            if tok > 0:
+            # M49 FIX: only record partial timing if not already recorded
+            if tok > 0 and not stats_recorded:
                 self.stats.record(tok, time.time() - t0)
-            raise
+            raise self._handle_error(e)
 
     # ── Vision ────────────────────────────────────────────────────────────────
 
@@ -238,9 +264,9 @@ class GeminiProvider(BaseProvider):
             )
             self.stats.record(tok, time.time() - t0)
             return text
-        except Exception:
+        except Exception as e:
             self.stats.record_error()
-            raise
+            raise self._handle_error(e)
 
     def supports_vision_stream(self) -> bool:
         return True
@@ -282,9 +308,9 @@ class GeminiProvider(BaseProvider):
                     tok += len(chunk.text) // 4
                     yield chunk.text
             self.stats.record(tok, time.time() - t0)
-        except Exception:
+        except Exception as e:
             self.stats.record_error()
-            raise
+            raise self._handle_error(e)
 
     async def health_check(self) -> bool:
         """Verify the API key and model access with a minimal prompt."""

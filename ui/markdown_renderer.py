@@ -171,7 +171,8 @@ class MarkdownRenderer:
             return f'<div style="margin: 3px 0; padding-left: 4px; {strike}">{icon} {text}</div>'
 
         # Bullet lists
-        ul_match = re.match(r"^(\s*)([-*+])\s+(.+)$", stripped)
+        # H17 FIX: Match against original `line` not `stripped` to preserve indent
+        ul_match = re.match(r"^(\s*)([-*+])\s+(.+)$", line)
         if ul_match:
             indent = len(ul_match.group(1)) // 2
             text = self._render_inline(ul_match.group(3))
@@ -179,7 +180,8 @@ class MarkdownRenderer:
             return f'<div style="margin: 3px 0; padding-left: {margin_left}px;">• {text}</div>'
 
         # Ordered lists
-        ol_match = re.match(r"^(\s*)(\d+)[.\)]\s+(.+)$", stripped)
+        # H17 FIX: Match against original `line` not `stripped` to preserve indent
+        ol_match = re.match(r"^(\s*)(\d+)[.\)]\s+(.+)$", line)
         if ol_match:
             indent = len(ol_match.group(1)) // 2
             num = ol_match.group(2)

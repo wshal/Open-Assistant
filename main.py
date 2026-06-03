@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenAssist AI v4.1 — Ultimate Free AI Assistant"""
+"""OpenAssist AI v1.0.0 — Ultimate Free AI Assistant"""
 
 import sys
 import os
@@ -37,7 +37,7 @@ from utils.logger import setup_logger
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="OpenAssist AI v4.0")
+    p = argparse.ArgumentParser(description="OpenAssist AI v1.0.0")
     p.add_argument("--config", default=CONFIG_FILE)
     p.add_argument(
         "--mode",
@@ -86,7 +86,8 @@ def cleanup_old_instances():
 
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
-                if proc.info['pid'] == current_pid:
+                # Do not terminate ourselves or our parent wrapper process (such as the venv redirector)
+                if proc.info['pid'] == current_pid or proc.info['pid'] == os.getppid():
                     continue
                 cmdline = proc.info['cmdline']
                 if not cmdline or len(cmdline) < 2:
@@ -227,7 +228,9 @@ def main():
             logger.info(f"✅ Added documents from {args.add_docs}")
             return
 
-        _term_handler = lambda *_: sys.exit(0)
+        # M39 FIX: sys.exit() in a signal handler deadlocks Qt. Use
+        # QApplication.quit() which schedules a clean event-loop exit.
+        _term_handler = lambda *_: qt_app.quit()
         signal.signal(signal.SIGINT, _term_handler)
         if hasattr(signal, "SIGTERM"):
             signal.signal(signal.SIGTERM, _term_handler)

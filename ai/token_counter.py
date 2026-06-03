@@ -144,8 +144,10 @@ class TokenCounter:
 
         estimated = int(total_chars / ratio)
 
-        # Account for special tokens (messages typically add 3-7 tokens overhead)
-        return estimated + 4
+        # M9 FIX: Removed +4 overhead here — count_messages() already adds
+        # per-message overhead (8 tokens for system+user).  Adding it here
+        # double-counts 8 tokens total.
+        return estimated
 
     def count_messages(self, system: str, user: str) -> int:
         """Count tokens for a full message exchange."""
@@ -159,11 +161,18 @@ class TokenCounter:
         if model in MODEL_CONTEXT_WINDOWS:
             return MODEL_CONTEXT_WINDOWS[model]
 
-        # Fuzzy match (model name contains key)
+        # M10 FIX: Pick the longest matching key to avoid substring collisions
+        # (e.g. "r1" matching unrelated models). Longer key = more specific.
         model_lower = model.lower()
+        best_match = None
+        best_len = 0
         for key, window in MODEL_CONTEXT_WINDOWS.items():
-            if key.lower() in model_lower or model_lower in key.lower():
-                return window
+            kl = key.lower()
+            if (kl in model_lower or model_lower in kl) and len(kl) > best_len:
+                best_match = window
+                best_len = len(kl)
+        if best_match is not None:
+            return best_match
 
         # Defaults by model family
         if "gemini" in model_lower:

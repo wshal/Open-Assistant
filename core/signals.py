@@ -1,7 +1,7 @@
 """
 Signal architecture documentation.
 
-DESIGN DECISION (v4.0):
+DESIGN DECISION (v1.0.0):
     We use DIRECT signal connections between components rather than
     a centralized SignalBus. Here's why:
 

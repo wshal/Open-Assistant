@@ -1,5 +1,5 @@
 """
-RAGEngine - v4.1 (Layer 3 Hardened).
+RAGEngine - v1.0.0 (Layer 3 Hardened).
 FIXED: Concurrency protection for initial vector DB loading.
 RESTORATION: Implemented 'add_directory' with recursive walking and chunking.
 """
@@ -49,6 +49,7 @@ class RAGEngine:
         self._loaded = False
         self._loading = False
         self._lock = threading.Lock()
+        self._load_condition = threading.Condition(self._lock)
 
         self._cache = {}
         self._cache_ttl = config.get("rag.cache_ttl", 60)
@@ -58,62 +59,84 @@ class RAGEngine:
         self._cache_max = int(config.get("rag.cache_max", 256))
 
     def _ensure_loaded(self):
-        """Hardened lazy-loader with concurrency protection."""
+        """Hardened lazy-loader with concurrency protection.
+
+        If another thread is currently loading, this thread will block on
+        the Condition until loading is complete (instead of returning
+        early with a possibly-None collection).
+        """
         if self._loaded:
             return
 
-        with self._lock:
-            if self._loaded or self._loading:
+        with self._load_condition:
+            # Re-check after acquiring the lock.
+            if self._loaded:
+                return
+            # Wait for an in-progress load to finish.
+            while self._loading:
+                self._load_condition.wait()
+            # After waiting, check if it's now loaded.
+            if self._loaded:
                 return
             self._loading = True
+
+        # Do the heavy I/O outside the lock to avoid blocking other
+        # threads that might call _ensure_loaded() concurrently.
+        try:
+            import chromadb
+            from chromadb.config import Settings
+
+            persist = self.config.get("rag.persist_dir", "./data/vectordb")
+            os.makedirs(persist, exist_ok=True)
+
+            # HARDENED: Handle potential handle collisions during restart
             try:
-                import chromadb
-                from chromadb.config import Settings
+                self.client = chromadb.PersistentClient(
+                    path=persist, settings=Settings(anonymized_telemetry=False)
+                )
+                self.collection = self.client.get_or_create_collection(
+                    "knowledge", metadata={"hnsw:space": "cosine"}
+                )
+            except Exception as ex:
+                logger.warning(
+                    f"RAG: Persistence handle sticky, retrying... ({ex})"
+                )
+                time.sleep(1.0)
+                self.client = chromadb.PersistentClient(
+                    path=persist, settings=Settings(anonymized_telemetry=False)
+                )
+                self.collection = self.client.get_or_create_collection(
+                    "knowledge", metadata={"hnsw:space": "cosine"}
+                )
 
-                persist = self.config.get("rag.persist_dir", "./data/vectordb")
-                os.makedirs(persist, exist_ok=True)
+            # M8 FIX: Cache the EmbeddingManager instead of creating one per call.
+            _cached_embed_mgr = EmbeddingManager()
 
-                # HARDENED: Handle potential handle collisions during restart
-                try:
-                    self.client = chromadb.PersistentClient(
-                        path=persist, settings=Settings(anonymized_telemetry=False)
-                    )
-                    self.collection = self.client.get_or_create_collection(
-                        "knowledge", metadata={"hnsw:space": "cosine"}
-                    )
-                except Exception as ex:
-                    logger.warning(
-                        f"RAG: Persistence handle sticky, retrying... ({ex})"
-                    )
-                    time.sleep(1.0)
-                    self.client = chromadb.PersistentClient(
-                        path=persist, settings=Settings(anonymized_telemetry=False)
-                    )
-                    self.collection = self.client.get_or_create_collection(
-                        "knowledge", metadata={"hnsw:space": "cosine"}
-                    )
+            def _embed_texts(texts):
+                vectors = []
+                for text in texts:
+                    vec = _cached_embed_mgr.embed(text)
+                    if vec is None:
+                        raise RuntimeError("embedding backend unavailable during startup")
+                    vectors.append(vec.tolist())
+                return vectors
 
-                def _embed_texts(texts):
-                    vectors = []
-                    for text in texts:
-                        vec = EmbeddingManager().embed(text)
-                        if vec is None:
-                            raise RuntimeError("embedding backend unavailable during startup")
-                        vectors.append(vec.tolist())
-                    return vectors
+            self._embed_fn = _embed_texts
 
-                self._embed_fn = _embed_texts
-
+            with self._load_condition:
                 self._loaded = True
-                logger.info(f"✅ RAG Ready ({self.collection.count()} chunks)")
-            except Exception as e:
-                if _is_expected_offline_error(e):
-                    logger.warning(f"RAG warmup skipped: {e}")
-                else:
-                    logger.warning(f"RAG warmup skipped: {e}")
-                self.enabled = False
-            finally:
                 self._loading = False
+                self._load_condition.notify_all()
+            logger.info(f"✅ RAG Ready ({self.collection.count()} chunks)")
+        except Exception as e:
+            with self._load_condition:
+                self._loading = False
+                self._load_condition.notify_all()
+            if _is_expected_offline_error(e):
+                logger.warning(f"RAG warmup skipped: {e}")
+            else:
+                logger.warning(f"RAG warmup skipped: {e}")
+            self.enabled = False
 
     async def query(self, text: str) -> List[str]:
         if not self.enabled:

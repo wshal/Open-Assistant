@@ -40,6 +40,16 @@ The goal is simple: capture context from the environment you are already working
 
 ### Install
 
+Fastest path, one command:
+
+```bash
+bash setup.sh
+```
+
+That script creates the virtual environment, installs dependencies, prepares local folders, and sets up Ollama if it is missing.
+
+Manual install if you want to do it step by step:
+
 ```powershell
 git clone <repo-url>
 cd openassist
@@ -72,6 +82,12 @@ or:
 
 ```powershell
 python main.py
+```
+
+On Linux/macOS, use:
+
+```bash
+bash run.sh
 ```
 
 ## Audio Capture

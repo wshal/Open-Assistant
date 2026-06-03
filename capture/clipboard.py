@@ -30,14 +30,19 @@ class ClipboardMonitor(QObject):
     
     def stop(self):
         self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.5)
     
     def _monitor_loop(self):
         while self._running:
             try:
                 current = pyperclip.paste() or ""
+                if len(current) > 1000000:
+                    current = current[:1000000]
                 if current != self._last_content and current:
                     self._last_content = current
                     self.clipboard_changed.emit(current)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Clipboard monitor read failed: {e}")
+                time.sleep(2)
             time.sleep(1)

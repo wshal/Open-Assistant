@@ -53,7 +53,7 @@ class OpenAICompatProvider(BaseProvider):
         self._pre_request()
         model = self.get_model(tier)
         t0 = time.time()
-        tok = 0
+        accumulated_len = 0
         try:
             stream = await self.client.chat.completions.create(
                 model=model,
@@ -61,10 +61,14 @@ class OpenAICompatProvider(BaseProvider):
                 max_tokens=self.max_tokens, temperature=0.7, stream=True
             )
             async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    c = chunk.choices[0].delta.content
-                    tok += 1
-                    yield c
+                # M51 FIX: null-check delta before accessing .content
+                if chunk.choices:
+                    delta = chunk.choices[0].delta
+                    c = delta.content if delta else None
+                    if c:
+                        accumulated_len += len(c)
+                        yield c
+            tok = max(1, accumulated_len // 4)
             self.stats.record(tok, time.time() - t0)
         except Exception:
             self.stats.record_error()

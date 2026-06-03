@@ -3,7 +3,7 @@
 import time
 import asyncio
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -15,7 +15,10 @@ class RateLimiter:
     # so parallel callers could all pass the check before any recorded. All
     # mutations now go through ``try_record`` under a single RLock.
     def __init__(self):
-        self._windows = defaultdict(list)  # provider -> [timestamps]
+        # Keep separate sliding windows so each check is O(k) over the
+        # current window, not O(n) over a long history list.
+        self._windows_24h = defaultdict(deque)  # provider -> deque[timestamps]
+        self._windows_1m = defaultdict(deque)   # provider -> deque[timestamps]
         self._limits = {}  # provider -> (rpm, rpd)
         self._lock = threading.RLock()
 
@@ -33,31 +36,50 @@ class RateLimiter:
         now = time.time()
         with self._lock:
             rpm, rpd = self._limits.get(provider, (60, 10000))
-            window = [t for t in self._windows[provider] if now - t < 86400]
-            self._windows[provider] = window
-            minute_count = sum(1 for t in window if now - t < 60)
-            return minute_count < rpm and len(window) < rpd
+            window_24h = self._windows_24h[provider]
+            window_1m = self._windows_1m[provider]
+            cutoff_24h = now - 86400
+            while window_24h and window_24h[0] < cutoff_24h:
+                window_24h.popleft()
+            while window_1m and window_1m[0] < cutoff_24h:
+                window_1m.popleft()
+            cutoff_1m = now - 60
+            while window_1m and window_1m[0] < cutoff_1m:
+                window_1m.popleft()
+            return len(window_1m) < rpm and len(window_24h) < rpd
 
     def record(self, provider: str):
         with self._lock:
             now = time.time()
-            self._windows[provider] = [
-                t for t in self._windows[provider] if now - t < 86400
-            ]
-            self._windows[provider].append(now)
+            window_24h = self._windows_24h[provider]
+            window_1m = self._windows_1m[provider]
+            cutoff_24h = now - 86400
+            while window_24h and window_24h[0] < cutoff_24h:
+                window_24h.popleft()
+            while window_1m and window_1m[0] < cutoff_24h:
+                window_1m.popleft()
+            window_24h.append(now)
+            window_1m.append(now)
 
     def try_record(self, provider: str) -> bool:
         """Atomically check capacity and record a request if allowed."""
         now = time.time()
         with self._lock:
             rpm, rpd = self._limits.get(provider, (60, 10000))
-            window = [t for t in self._windows[provider] if now - t < 86400]
-            minute_count = sum(1 for t in window if now - t < 60)
-            if minute_count >= rpm or len(window) >= rpd:
-                self._windows[provider] = window
+            window_24h = self._windows_24h[provider]
+            window_1m = self._windows_1m[provider]
+            cutoff_24h = now - 86400
+            while window_24h and window_24h[0] < cutoff_24h:
+                window_24h.popleft()
+            while window_1m and window_1m[0] < cutoff_24h:
+                window_1m.popleft()
+            cutoff_1m = now - 60
+            while window_1m and window_1m[0] < cutoff_1m:
+                window_1m.popleft()
+            if len(window_1m) >= rpm or len(window_24h) >= rpd:
                 return False
-            window.append(now)
-            self._windows[provider] = window
+            window_24h.append(now)
+            window_1m.append(now)
             return True
 
     async def wait_if_needed(self, provider: str, max_wait_s: float = 30.0):

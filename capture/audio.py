@@ -242,6 +242,8 @@ class AudioCapture(QObject):
         self._last_interim_at = 0.0
         self._interim_epoch = 0
         self._interim_inflight = False
+        self._interim_lock = threading.Lock()
+        self._groq_chunk_futures = []
         self._trace_session_id = ""
         self._trace_session_started_at = 0.0
         self._trace_raw_audio_logged = False
@@ -427,6 +429,8 @@ class AudioCapture(QObject):
         self._standard_transcription_suspended = False
         self._hardware_capture_suspended = False
         self._final_decode_pending = 0
+        self._final_decode_lock = threading.Lock()
+        self._restart_lock = threading.Lock()
         self._capture_generation = 0
         self._final_submission_generation = 0
         self._last_final_submit_at = 0.0
@@ -475,9 +479,6 @@ class AudioCapture(QObject):
         which reduces variance and avoids paying connection setup on every
         chunk.
         """
-        session = getattr(self, "_groq_http_session", None)
-        if session is not None:
-            return session
         with self._groq_http_session_lock:
             session = getattr(self, "_groq_http_session", None)
             if session is not None:
@@ -495,7 +496,7 @@ class AudioCapture(QObject):
                 logger.debug("Audio: failed to create Groq HTTP session, falling back to one-shot requests: %s", exc)
                 self._groq_http_session = None
                 return None
-        return self._groq_http_session
+            return self._groq_http_session
 
     def _on_state_mute_changed(self, muted: bool):
         logger.debug(f"Audio: State sync -> Muted={muted}")
@@ -504,6 +505,10 @@ class AudioCapture(QObject):
             self._paused = muted
         if not muted:
             self._drain_queue()
+            self._clear_capture_chunk_buffer()
+            with self._session_parts_lock:
+                self._session_transcript_parts = []
+                self._session_transcript_part_providers = []
             logger.debug("Audio: Buffer flushed on unmute.")
 
     def _rearm_ambient_calibration(self) -> None:
@@ -810,30 +815,31 @@ class AudioCapture(QObject):
         Full hot-restart for audio mode changes.
         We stop and reopen streams instead of trying to patch live state.
         """
-        new_mode = self.config.get("capture.audio.mode", "system")
-        with self._lock:
-            was_running = self._running
-            healthy = self._capture_workers_healthy_locked()
-            if was_running and new_mode == self.last_mode and healthy:
-                logger.debug(f"🎙️ Audio: Mode '{new_mode}' already active. Skipping restart.")
-                return
+        with self._restart_lock:
+            new_mode = self.config.get("capture.audio.mode", "system")
+            with self._lock:
+                was_running = self._running
+                healthy = self._capture_workers_healthy_locked()
+                if was_running and new_mode == self.last_mode and healthy:
+                    logger.debug(f"🎙️ Audio: Mode '{new_mode}' already active. Skipping restart.")
+                    return
 
-            if was_running and new_mode == self.last_mode and not healthy:
-                logger.warning(
-                    "Audio: Restarting unhealthy pipeline in-place for mode '%s'",
-                    new_mode,
-                )
-            else:
-                logger.info(f"🎤 Restarting Audio Pipeline: {new_mode}...")
-            self._running = False
-            self._close_streams()
-            self._drain_queue()
-            self.capture_mode = new_mode or "system"
-            self.last_mode = self.capture_mode
+                if was_running and new_mode == self.last_mode and not healthy:
+                    logger.warning(
+                        "Audio: Restarting unhealthy pipeline in-place for mode '%s'",
+                        new_mode,
+                    )
+                else:
+                    logger.info(f"🎤 Restarting Audio Pipeline: {new_mode}...")
+                self._running = False
+                self._close_streams()
+                self._drain_queue()
+                self.capture_mode = new_mode or "system"
+                self.last_mode = self.capture_mode
 
-        if was_running:
-            time.sleep(0.4)
-            self.start()
+            if was_running:
+                time.sleep(0.4)
+                self.start()
 
     def ensure_session_ready(self) -> bool:
         """Best-effort re-arm of capture when a new session begins.
@@ -930,7 +936,7 @@ class AudioCapture(QObject):
         self._active_streams.clear()
 
     def _drain_queue(self):
-        while not self.q.empty():
+        while True:
             try:
                 self.q.get_nowait()
             except queue.Empty:
@@ -972,8 +978,11 @@ class AudioCapture(QObject):
                     self._current_rms = float(np.sqrt(np.mean(chunk ** 2)))
                     self._trace_raw_audio_block(source, self._current_rms, len(chunk))
                 except queue.Full:
+                    # M17 FIX: Use continue instead of break so remaining
+                    # audio data is still chunked and not leaked, avoiding
+                    # discontinuous audio when the queue is temporarily full.
                     logger.debug("Audio queue full; dropping frame")
-                    break
+                    continue
 
             self._capture_chunk_buffer = (
                 data.copy() if data.size else np.empty((0, 1), dtype=np.float32)
@@ -1209,6 +1218,29 @@ class AudioCapture(QObject):
         if frame_count <= 1:
             return indata.astype(np.float32, copy=False)
 
+        # M16 FIX: Use scipy.signal.resample_poly when available for
+        # proper anti-aliasing (low-pass filter before decimation).
+        # Falls back to linear interpolation (np.interp) which can
+        # introduce aliasing artifacts at non-integer rate ratios.
+        try:
+            from scipy.signal import resample_poly
+            from math import gcd
+            up = self.sr
+            down = source_rate
+            g = gcd(up, down)
+            up, down = up // g, down // g
+            resampled = np.empty((0, indata.shape[1]), dtype=np.float32)
+            for ch in range(indata.shape[1]):
+                ch_data = resample_poly(indata[:, ch].astype(np.float64), up, down).astype(np.float32)
+                if resampled.shape[0] == 0:
+                    resampled = np.empty((len(ch_data), indata.shape[1]), dtype=np.float32)
+                resampled[:, ch] = ch_data[:resampled.shape[0]]
+            return resampled
+        except ImportError:
+            pass
+
+        # Fallback: linear interpolation (NOTE: introduces aliasing when
+        # downsampling — prefer installing scipy for production use).
         target_frames = max(1, int(round(frame_count * self.sr / source_rate)))
         src_x = np.linspace(0.0, 1.0, frame_count, endpoint=False)
         dst_x = np.linspace(0.0, 1.0, target_frames, endpoint=False)
@@ -1455,6 +1487,13 @@ class AudioCapture(QObject):
         finally:
             self._close_streams()
             if self._running:
+                # M15 FIX: Log capture thread death and set a state flag so
+                # the health check can detect the failure and trigger recovery.
+                logger.error(
+                    "Audio: capture thread died unexpectedly — setting "
+                    "_capture_thread_failed flag for health monitor."
+                )
+                self._capture_thread_failed = True
                 self._running = False
 
     def set_vad_silence_ms(self, ms: int) -> None:
@@ -1769,7 +1808,8 @@ class AudioCapture(QObject):
         submission_seq = self._submitted_final_seq
         capture_generation = int(getattr(self, "_capture_generation", 0))
         self._final_submission_generation = capture_generation
-        self._final_decode_pending = int(getattr(self, "_final_decode_pending", 0)) + 1
+        with self._final_decode_lock:
+            self._final_decode_pending += 1
         self._last_final_submit_at = time.time()
         meta.setdefault("speech_finalized_at", self._last_final_submit_at)
 
@@ -1791,11 +1831,13 @@ class AudioCapture(QObject):
                     return
                 self._transcribe(buffer, speech_started_at, True, vad_meta=meta)
             finally:
-                self._final_decode_pending = max(0, int(getattr(self, "_final_decode_pending", 0)) - 1)
+                with self._final_decode_lock:
+                    self._final_decode_pending = max(0, self._final_decode_pending - 1)
 
         queued = self._submit_transcription_job(_run_final)
         if not queued:
-            self._final_decode_pending = max(0, int(getattr(self, "_final_decode_pending", 0)) - 1)
+            with self._final_decode_lock:
+                self._final_decode_pending = max(0, self._final_decode_pending - 1)
         return queued
 
     def _force_finalize_utterance(
@@ -1822,6 +1864,12 @@ class AudioCapture(QObject):
             reason,
         )
         self._interim_epoch += 1
+        # M13 FIX: Include peak_rms from the speech buffer so the
+        # downstream noise gate check in _submit_final_transcription
+        # doesn't drop legitimate speech due to missing peak_rms.
+        _peak_rms = max(
+            [float(np.sqrt(np.mean(np.asarray(block) ** 2))) for block in speech_buffer] or [0.0]
+        )
         self._submit_final_transcription(
             list(speech_buffer),
             speech_started_at,
@@ -1834,6 +1882,7 @@ class AudioCapture(QObject):
                 "speech_finalized_at": time.time(),
                 "speech_duration": elapsed,
                 "voiced_blocks": len(speech_buffer),
+                "peak_rms": _peak_rms,
             },
         )
         return [], False, 0, None, None, False
@@ -1848,6 +1897,9 @@ class AudioCapture(QObject):
         utterance_id = ""
         had_mid_utterance_slice = False
         utterance_vad_backend = self._vad_backend_name
+        # M14 FIX: Track peak RMS during the current utterance so it
+        # can be passed to _passes_speech_rms_gate for accurate gating.
+        current_peak_rms = 0.0
 
         # Pre-roll: keep a rolling window of the last PRE_ROLL_BLOCKS blocks
         # BEFORE VAD fires.  Prepended to speech_buffer at onset so Whisper
@@ -1926,7 +1978,13 @@ class AudioCapture(QObject):
             # - Prefer Silero VAD when available.
             # - Fall back to WebRTC VAD, then RMS.
             # - Also gate on dynamic_rms_floor when calibrated.
-            floor_ok = self._passes_speech_rms_gate(rms, is_speaking=is_speaking)
+            # M14 FIX: Pass the tracked peak_rms so the gate can compare
+            # the current block RMS against the utterance's peak for
+            # accurate speech continuation decisions. Wrap in try/except for backward-compatible test mocks.
+            try:
+                floor_ok = self._passes_speech_rms_gate(rms, is_speaking=is_speaking, peak_rms=current_peak_rms)
+            except TypeError:
+                floor_ok = self._passes_speech_rms_gate(rms, is_speaking=is_speaking)
             has_speech = raw_has_speech and floor_ok
 
             # Online adaptation of the noise floor when not speaking and VAD is silent.
@@ -1978,10 +2036,19 @@ class AudioCapture(QObject):
                         self._interim_epoch += 1
                         utterance_vad_backend = backend
                         had_mid_utterance_slice = False
+                        current_peak_rms = rms  # M14 FIX: initialize peak RMS at speech onset
                 else:
                     silence_count = 0
+                    # M14 FIX: Update peak RMS tracking during speech
+                    if rms > current_peak_rms:
+                        current_peak_rms = rms
 
                 if is_speaking and self._max_utterance_exceeded(utterance_started_at):
+                    pre_roll.clear()
+                    if len(speech_buffer) >= 3:
+                        pre_roll.extend(speech_buffer[-3:])
+                    else:
+                        pre_roll.extend(speech_buffer)
                     (
                         speech_buffer,
                         is_speaking,
@@ -2000,7 +2067,6 @@ class AudioCapture(QObject):
                     )
                     voiced_confirm_count = 0
                     utterance_id = ""
-                    pre_roll.clear()
                     continue
 
                 # ── Phase 2: Hybrid Micro-Pause VAD Chunking ──────────────────
@@ -2136,6 +2202,7 @@ class AudioCapture(QObject):
                     utterance_started_at = None
                     utterance_id = ""
                     had_mid_utterance_slice = False
+                    current_peak_rms = 0.0  # M14 FIX: reset peak RMS between utterances
                     # H-A4: clear question-complete hint between utterances so it
                     # cannot leak into a new prompt the user is still forming.
                     self._question_complete_hint = False
@@ -2165,6 +2232,8 @@ class AudioCapture(QObject):
                     pre_roll.clear()
             else:
                 voiced_confirm_count = 0
+                if not is_speaking:
+                    speech_buffer = []
 
             # Best-effort interim transcription while speaking (never blocks VAD loop).
             if (
@@ -2236,13 +2305,17 @@ class AudioCapture(QObject):
         return np.clip(audio * gain, -1.0, 1.0)
 
     def _submit_interim(self, buffer, speech_started_at: float, epoch: int, utterance_id: str = "") -> None:
-        if self._interim_inflight:
-            return
-        if not buffer or len(buffer) < 3:
-            return
+        with self._interim_lock:
+            if self._interim_inflight:
+                return
+            if not buffer or len(buffer) < 3:
+                return
+            self._interim_inflight = True
 
         speech_duration = max(0.0, time.time() - speech_started_at) if speech_started_at else 0.0
         if self._interim_max_speech_s > 0.0 and speech_duration > self._interim_max_speech_s:
+            with self._interim_lock:
+                self._interim_inflight = False
             return
         logger.info(
             "[%s] INTERIM TRANSCRIPTION SUBMIT | elapsed=%.1fms | utterance=%s | speech_duration=%.2fs | blocks=%d | epoch=%d",
@@ -2254,18 +2327,18 @@ class AudioCapture(QObject):
             epoch,
         )
 
-        self._interim_inflight = True
-
         def _run():
             try:
                 self._transcribe_interim(buffer, speech_started_at, epoch, utterance_id=utterance_id)
             finally:
-                self._interim_inflight = False
+                with self._interim_lock:
+                    self._interim_inflight = False
 
         try:
             self._interim_pool.submit(_run)
         except Exception:
-            self._interim_inflight = False
+            with self._interim_lock:
+                self._interim_inflight = False
 
     def _transcribe(self, buffer, speech_started_at=None, is_final: bool = True, vad_meta=None):
         """Route to Groq Cloud or local Faster-Whisper.

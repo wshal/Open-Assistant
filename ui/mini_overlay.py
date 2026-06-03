@@ -1,5 +1,5 @@
 """
-Compact floating mini-overlay — v4.1 (Cleaned & Hardened).
+Compact floating mini-overlay — v1.0.0 (Cleaned & Hardened).
 FIXED: Mode icon resolution and AI response bridging.
 """
 
@@ -64,6 +64,7 @@ class MiniOverlay(QMainWindow):
         self._user_is_scrolling = False
         self._nano_mode = False  # P2.6: ultra-compact nano state
         self._warmup_done = False  # Guard: input locked until AI engines are ready
+        self._last_rendered = ""
 
         # NEURAL UX: Gaze-based transparency
         self._gaze_timer = QTimer(self)
@@ -250,7 +251,10 @@ class MiniOverlay(QMainWindow):
         if not self._warmup_done:
             logger.warning("Mini-HUD: query attempted before warmup — ignoring.")
             self.input.setPlaceholderText("⏳ Still loading, please wait...")
-            QTimer.singleShot(2000, lambda: self.input.setPlaceholderText("⏳ Initializing..."))
+            _reset_timer = QTimer(self)
+            _reset_timer.setSingleShot(True)
+            _reset_timer.timeout.connect(self._reset_loading_placeholder)
+            _reset_timer.start(2000)
             return
 
         self.input.clear()
@@ -273,6 +277,12 @@ class MiniOverlay(QMainWindow):
         self._toggle_expand(True)
         self.set_thinking()
         self.user_query.emit(q)
+
+    def _reset_loading_placeholder(self):
+        try:
+            self.input.setPlaceholderText("⏳ Initializing...")
+        except RuntimeError:
+            pass
 
     def _render_markdown_now(self):
         text = self._raw_buffer
@@ -358,14 +368,17 @@ class MiniOverlay(QMainWindow):
         self.capture_active_response_chunk(text)
         if bool(getattr(self.app, "_history_navigation_active", False)):
             return
-        if not self._raw_buffer:
-            # First chunk: expand panel, clear area, start periodic timer
-            self._toggle_expand(True)
+        is_first = not self._raw_buffer
+        if is_first:
+            # First chunk: clear area, start periodic timer
             self.response_area.clear()
             self.set_thinking()
             self._render_timer.start()
 
         self._raw_buffer += text
+
+        if is_first:
+            self._toggle_expand(True)
 
         # Stop periodic markdown re-renders once a code fence appears to prevent
         # layout wobble while code blocks stream in.
@@ -472,18 +485,18 @@ class MiniOverlay(QMainWindow):
         # M-6: Track the toast, but bind the dismissal timer to ``self`` so that
         # when the overlay is destroyed the singleShot lambda dies with it
         # instead of firing into a deleted Qt widget. ``toast.destroyed`` also
-        # purges the list when the toast goes away early.
+        # purges the dict when the toast goes away early.
         if not hasattr(self, "_active_toasts"):
-            self._active_toasts = []
-        self._active_toasts.append(toast)
+            self._active_toasts = {}
+        toast_id = id(toast)
+        self._active_toasts[toast_id] = toast
         toast.destroyed.connect(
-            lambda _=None, t=toast: self._active_toasts.remove(t)
-            if t in self._active_toasts else None
+            lambda _=None, tid=toast_id: self._active_toasts.pop(tid, None)
         )
 
         def _dismiss():
-            if toast in self._active_toasts:
-                self._active_toasts.remove(toast)
+            if toast_id in self._active_toasts:
+                self._active_toasts.pop(toast_id, None)
             fade = QPropertyAnimation(toast, b"geometry", toast)
             fade.setDuration(300)
             fade.setStartValue(end_rect)
@@ -587,14 +600,14 @@ class MiniOverlay(QMainWindow):
         if not response and not query:
             return
         
-        # P1.2: Show the query + response with index indicator
-        self.set_response(response)
+        # P1.2: Update the response area to include query + index indicator
+        self._raw_buffer = response or ""
+        self._last_rendered = response or ""
         
         # Auto-expand to show the navigated response
         if not self._expanded:
             self._toggle_expand(True)
         
-        # P1.2: Update the response area to include query + index indicator
         indicator = f"Response {i + 1} of {t}"  # Display 1-based index
         html_response = self.md.render(response or "No response")
         
@@ -607,6 +620,7 @@ class MiniOverlay(QMainWindow):
             f"{html_response}"
         )
         self.response_area.setHtml(full_html)
+        self._adjust_height()
 
     def set_thinking(self):
         self.dot.setStyleSheet("color: #f59e0b; font-size: 10px;")
@@ -694,10 +708,14 @@ class MiniOverlay(QMainWindow):
             f"<div style='color:#ef4444; font-size:11px; padding:4px;'>❌ {err}</div>"
         )
         self._toggle_expand(True)
-        # Auto-dismiss after 6 seconds
-        QTimer.singleShot(6000, lambda: (
-            self.response_area.clear() if not self._raw_buffer else None
-        ))
+        # M24 FIX: Parent timer to self so it's destroyed with the widget,
+        # preventing crash if the overlay is deleted before the timer fires.
+        _dismiss_timer = QTimer(self)
+        _dismiss_timer.setSingleShot(True)
+        _dismiss_timer.timeout.connect(
+            lambda: self.response_area.clear() if not self._raw_buffer else None
+        )
+        _dismiss_timer.start(6000)
 
     def scroll_up(self):
         sb = self.response_area.verticalScrollBar()
@@ -737,6 +755,11 @@ class MiniOverlay(QMainWindow):
         Uses the same stylesheet technique as the main overlay to work with WA_TranslucentBackground.
         """
         if not self.isVisible() or not self.app.state.is_mini:
+            return
+
+        # M25 FIX: Skip gaze fade when nano mode is active — its own
+        # compact styling must not be overwritten by the gaze logic.
+        if self._nano_mode:
             return
 
         gaze_enabled = self.config.get("app.gaze_fade.enabled", False)

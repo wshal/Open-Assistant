@@ -1082,6 +1082,105 @@ class TestP2FallbackModelRouter(unittest.TestCase):
         self.assertEqual(emitted_chunks, ["ollama answer"])
         self.assertEqual(errors, [])
 
+    def test_quota_exhaustion_disables_provider_and_falls_back_once(self):
+        from ai.engine import AIEngine
+        from core.config import Config
+
+        cfg = Config()
+        cfg.set("ai.providers.gemini.enabled", True)
+        cfg.set("ai.providers.ollama.enabled", True)
+        cfg.set("ai.text.preferred_providers", ["gemini", "ollama"])
+
+        engine = AIEngine(cfg, MagicMock())
+        engine._router = None
+
+        gemini_mock = MagicMock()
+        gemini_mock.name = "gemini"
+        gemini_mock.enabled = True
+        gemini_mock.is_available.return_value = True
+        gemini_mock.check_rate.return_value = True
+        gemini_mock.has_model.return_value = True
+        gemini_mock.is_disabled.return_value = False
+        gemini_mock.disable = MagicMock()
+
+        gemini_calls = {"count": 0}
+
+        async def fake_gemini_stream(*args, **kwargs):
+            gemini_calls["count"] += 1
+            raise Exception("RESOURCE_EXHAUSTED: You exceeded your current quota")
+            yield "unused"
+
+        gemini_mock.generate_stream = fake_gemini_stream
+
+        ollama_mock = MagicMock()
+        ollama_mock.name = "ollama"
+        ollama_mock.enabled = True
+        ollama_mock.is_available.return_value = True
+        ollama_mock.check_rate.return_value = True
+        ollama_mock.has_model.return_value = True
+        ollama_mock.is_disabled.return_value = False
+        ollama_mock.disable = MagicMock()
+
+        ollama_calls = {"count": 0}
+
+        async def fake_ollama_stream(*args, **kwargs):
+            ollama_calls["count"] += 1
+            yield "ollama answer"
+
+        ollama_mock.generate_stream = fake_ollama_stream
+
+        engine._providers = {"gemini": gemini_mock, "ollama": ollama_mock}
+        emitted_chunks = []
+        engine.response_chunk.connect(emitted_chunks.append)
+        errors = []
+        engine.error_occurred.connect(errors.append)
+
+        async def run_gen():
+            await engine.generate_response(
+                "hello",
+                {"recent_audio": "", "full_audio_history": "", "latest_ocr": ""},
+                origin="manual",
+            )
+
+        _run(run_gen())
+
+        self.assertEqual(gemini_calls["count"], 1)
+        self.assertEqual(ollama_calls["count"], 1)
+        self.assertEqual(emitted_chunks, ["ollama answer"])
+        self.assertEqual(errors, [])
+        gemini_mock.disable.assert_called()
+        self.assertEqual(gemini_mock.disable.call_args.kwargs.get("seconds"), 3600)
+
+    def test_validate_loaded_providers_uses_single_health_probe_by_default(self):
+        from ai.engine import AIEngine
+        from core.config import Config
+
+        cfg = Config()
+        cfg.set("ai.providers.validate_on_init", True)
+        cfg.set("ai.providers.gemini.enabled", True)
+        cfg.set("ai.providers.health_check_attempts", 1)
+
+        engine = AIEngine(cfg, MagicMock())
+
+        probe_count = {"count": 0}
+
+        class _ProbeProvider:
+            name = "gemini"
+            enabled = True
+
+            def supports_health_check(self):
+                return True
+
+            async def health_check(self):
+                probe_count["count"] += 1
+                return False
+
+        engine._providers = {"gemini": _ProbeProvider()}
+
+        _run(engine.validate_loaded_providers())
+
+        self.assertEqual(probe_count["count"], 1)
+
 
 class TestStandbyViewPills(unittest.TestCase):
     """P2: Standby view mode pills and visibility sync."""

@@ -13,6 +13,7 @@ Four-Tier Lookup:
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import logging
@@ -341,8 +342,9 @@ class EmbeddingTier:
     # ------------------------------------------------------------------
 
     def _persist(self) -> None:
-        if not self._dirty or not self._vectors:
-            return
+        with self._data_lock:
+            if not self._dirty or not self._vectors:
+                return
         with self._persist_lock:
             if self._persist_thread and self._persist_thread.is_alive():
                 return
@@ -383,27 +385,29 @@ class EmbeddingTier:
         otherwise the timer chain keeps the process alive in tests and leaks
         threads across repeated engine creations.
         """
-        if self._closed:
-            return
+        with self._data_lock:
+            if self._closed:
+                return
 
-        def _tick():
-            try:
-                self._persist()
-            finally:
-                self._schedule_persist_timer(interval)  # reschedule
-        self._persist_timer = threading.Timer(interval, _tick)
-        self._persist_timer.daemon = True
-        self._persist_timer.start()
+            def _tick():
+                try:
+                    self._persist()
+                finally:
+                    self._schedule_persist_timer(interval)  # reschedule
+            self._persist_timer = threading.Timer(interval, _tick)
+            self._persist_timer.daemon = True
+            self._persist_timer.start()
 
     def close(self) -> None:
         """Issue #11: Cancel the rescheduling timer and flush one last time."""
-        self._closed = True
-        timer = self._persist_timer
-        if timer is not None:
-            try:
-                timer.cancel()
-            except Exception:
-                pass
+        with self._data_lock:
+            self._closed = True
+            timer = self._persist_timer
+            if timer is not None:
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
         try:
             self._persist()
         except Exception:
@@ -470,12 +474,16 @@ class ShortQueryCache:
         self.enable_semantic = bool(enable_semantic)
         self.enable_embedding = bool(enable_embedding)
 
+        # H6 FIX: RLock for thread-safe access to _items, _lru,
+        # _semantic_items, _semantic_lru.  RLock because _prune() is
+        # called re-entrantly from get_with_tier() and set().
+        self._cache_lock = threading.RLock()
         self._items: dict[CacheKey, CacheEntry] = {}
         # Composite key: (signature, mode, context_fp) → CacheKey
         self._semantic_items: dict[Tuple[str, str, str], CacheKey] = {}
-        self._lru: list[CacheKey] = []
+        self._lru = collections.deque()
         # Q17: LRU list for semantic_items (prevents unbounded growth)
-        self._semantic_lru: list[Tuple[str, str, str]] = []
+        self._semantic_lru = collections.deque()
         self._max_semantic_items: int = 512
 
         # Tier 3: embedding index
@@ -571,7 +579,7 @@ class ShortQueryCache:
         for k in expired:
             self._items.pop(k, None)
         if expired:
-            self._lru = [k for k in self._lru if k in self._items]
+            self._lru = collections.deque(k for k in self._lru if k in self._items)
 
         if self.max_items <= 0:
             self._items.clear()
@@ -581,7 +589,7 @@ class ShortQueryCache:
             return
 
         while len(self._items) > self.max_items and self._lru:
-            k = self._lru.pop(0)
+            k = self._lru.popleft()
             self._items.pop(k, None)
 
         # Garbage-collect orphaned semantic entries and sync LRU list (Q17)
@@ -589,7 +597,7 @@ class ShortQueryCache:
         self._semantic_items = {sk: ck for sk, ck in self._semantic_items.items() if ck in active_keys}
         # Rebuild LRU to match surviving keys (removes dangling references)
         surviving_sem = set(self._semantic_items.keys())
-        self._semantic_lru = [sk for sk in self._semantic_lru if sk in surviving_sem]
+        self._semantic_lru = collections.deque(sk for sk in self._semantic_lru if sk in surviving_sem)
 
         # Prune embedding tier (runs cheaply — just checks timestamps)
         if self._embed:
@@ -613,41 +621,47 @@ class ShortQueryCache:
         """
         if self.ttl_s <= 0 or self.max_items <= 0:
             return None, 0
-        self._prune()
 
-        # ── Tier 1: Exact match ──────────────────────────────────────────────
-        key = CacheKey(str(mode or "general"), _norm_query(query), context_fp, history_fp)
-        entry = self._items.get(key)
-        if entry and entry.expires_at > time.time():
-            self._touch_lru(key)
-            if _telemetry:
-                _telemetry.record_cache_hit(tier=1)
-            return entry, 1
+        # H6 FIX: Serialize all cache lookups under the cache lock.
+        with self._cache_lock:
+            self._prune()
 
-        # ── Tier 2: Semantic Signature ────────────────────────────────────────
-        if self.enable_semantic:
-            signature = self._get_semantic_signature(query)
-            sem_lookup_key = (signature, key.mode, key.context_fp)
-            semantic_key = self._semantic_items.get(sem_lookup_key)
-            if semantic_key:
-                entry = self._items.get(semantic_key)
-                if entry and entry.expires_at > time.time():
-                    self._touch_lru(semantic_key)
-                    if _telemetry:
-                        _telemetry.record_cache_hit(tier=2)
-                    return entry, 2
+            # ── Tier 1: Exact match ──────────────────────────────────────────────
+            key = CacheKey(str(mode or "general"), _norm_query(query), context_fp, history_fp)
+            entry = self._items.get(key)
+            if entry and entry.expires_at > time.time():
+                self._touch_lru(key)
+                if _telemetry:
+                    _telemetry.record_cache_hit(tier=1)
+                return entry, 1
+
+            # ── Tier 2: Semantic Signature ────────────────────────────────────────
+            if self.enable_semantic:
+                signature = self._get_semantic_signature(query)
+                sem_lookup_key = (signature, key.mode, key.context_fp)
+                semantic_key = self._semantic_items.get(sem_lookup_key)
+                if semantic_key:
+                    entry = self._items.get(semantic_key)
+                    if entry and entry.expires_at > time.time():
+                        self._touch_lru(semantic_key)
+                        if _telemetry:
+                            _telemetry.record_cache_hit(tier=2)
+                        return entry, 2
 
         # ── Tier 3: Embedding Similarity ──────────────────────────────────────
+        # Run outside the lock — embedding search is CPU-heavy (~15ms) and
+        # the EmbeddingTier has its own internal _data_lock.
         if self._embed:
             rec = self._embed.find(query, mode=key.mode, context_fp=key.context_fp)
             if rec:
                 embed_key = CacheKey(rec.mode, rec.cache_query, rec.context_fp, rec.history_fp)
-                entry = self._items.get(embed_key)
-                if entry and entry.expires_at > time.time():
-                    self._touch_lru(embed_key)
-                    if _telemetry:
-                        _telemetry.record_cache_hit(tier=3)
-                    return entry, 3
+                with self._cache_lock:
+                    entry = self._items.get(embed_key)
+                    if entry and entry.expires_at > time.time():
+                        self._touch_lru(embed_key)
+                        if _telemetry:
+                            _telemetry.record_cache_hit(tier=3)
+                        return entry, 3
 
         # ── Tier 4: Conservative Fuzzy ─────────────────────────────────────────
         if not self.enable_fuzzy:
@@ -673,31 +687,32 @@ class ShortQueryCache:
             boost_tokens.discard("")  # remove empty strings
         best_key = None
         best_score = 0.0
-        for k in list(self._items.keys()):
-            if k.mode != key.mode or k.context_fp != context_fp or k.history_fp != history_fp:
-                continue
-            kt = set(k.query.split())
-            if not kt:
-                continue
-            inter = len(q_tokens & kt)
-            union = len(q_tokens | kt)
-            score = inter / union if union else 0.0
-            # Q16: Boost score if candidate shares entity tokens with prior turn
-            if boost_tokens and kt & boost_tokens:
-                score *= 1.2
-                logger.debug(
-                    "[Q16 Boost] score %.3f boosted to %.3f for '%s'",
-                    score / 1.2, score, k.query[:60],
-                )
-            if score > best_score:
-                best_score = score
-                best_key = k
-        if best_key and best_score >= self.fuzzy_threshold:
-            e = self._items.get(best_key)
-            if e and e.expires_at > time.time():
-                if _telemetry:
-                    _telemetry.record_cache_hit(tier=4)
-                return e, 4
+        with self._cache_lock:
+            for k in list(self._items.keys()):
+                if k.mode != key.mode or k.context_fp != context_fp or k.history_fp != history_fp:
+                    continue
+                kt = set(k.query.split())
+                if not kt:
+                    continue
+                inter = len(q_tokens & kt)
+                union = len(q_tokens | kt)
+                score = inter / union if union else 0.0
+                # Q16: Boost score if candidate shares entity tokens with prior turn
+                if boost_tokens and kt & boost_tokens:
+                    score *= 1.2
+                    logger.debug(
+                        "[Q16 Boost] score %.3f boosted to %.3f for '%s'",
+                        score / 1.2, score, k.query[:60],
+                    )
+                if score > best_score:
+                    best_score = score
+                    best_key = k
+            if best_key and best_score >= self.fuzzy_threshold:
+                e = self._items.get(best_key)
+                if e and e.expires_at > time.time():
+                    if _telemetry:
+                        _telemetry.record_cache_hit(tier=4)
+                    return e, 4
 
         if _telemetry:
             _telemetry.record_cache_miss()
@@ -743,29 +758,34 @@ class ShortQueryCache:
             expires_at=now + self.ttl_s,
         )
 
-        # Tier 1: Exact
-        self._items[key] = entry
+        # H6 FIX: Serialize all cache mutations under the cache lock.
+        with self._cache_lock:
+            # Tier 1: Exact
+            self._items[key] = entry
 
-        # Q17: Evict oldest semantic entry when cap is exceeded
-        if self.enable_semantic:
-            try:
-                signature = self._get_semantic_signature(query)
-                sem_key = (signature, key.mode, key.context_fp)
-                if sem_key not in self._semantic_items:
-                    # New entry — check cap
-                    while len(self._semantic_items) >= self._max_semantic_items and self._semantic_lru:
-                        oldest = self._semantic_lru.pop(0)
-                        self._semantic_items.pop(oldest, None)
-                        logger.debug("[Q17 LRU] Evicted semantic_item key: %s", oldest)
-                self._semantic_items[sem_key] = key
-                # Track LRU order for this sem_key
+            # Q17: Evict oldest semantic entry when cap is exceeded
+            if self.enable_semantic:
                 try:
-                    self._semantic_lru.remove(sem_key)
-                except ValueError:
+                    signature = self._get_semantic_signature(query)
+                    sem_key = (signature, key.mode, key.context_fp)
+                    if sem_key not in self._semantic_items:
+                        # New entry — check cap
+                        while len(self._semantic_items) >= self._max_semantic_items and self._semantic_lru:
+                            oldest = self._semantic_lru.popleft()
+                            self._semantic_items.pop(oldest, None)
+                            logger.debug("[Q17 LRU] Evicted semantic_item key: %s", oldest)
+                    self._semantic_items[sem_key] = key
+                    # Track LRU order for this sem_key
+                    try:
+                        self._semantic_lru.remove(sem_key)
+                    except ValueError:
+                        pass
+                    self._semantic_lru.append(sem_key)
+                except Exception:
                     pass
-                self._semantic_lru.append(sem_key)
-            except Exception:
-                pass
+
+            self._touch_lru(key)
+            self._prune()
 
         # Tier 3: Embedding (runs in background thread — never blocks the response path)
         if self._embed:
@@ -780,9 +800,6 @@ class ShortQueryCache:
                 self._embed_queue.put((query, rec), timeout=0.1)
             except queue.Full:
                 pass
-
-        self._touch_lru(key)
-        self._prune()
 
     def _touch_lru(self, key: CacheKey) -> None:
         try:

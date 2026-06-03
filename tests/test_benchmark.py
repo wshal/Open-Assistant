@@ -25,7 +25,7 @@ console = Console()
 
 
 async def run_benchmark(config):
-    console.print("\n[bold cyan]OpenAssist AI v3.0 - Provider Benchmark[/bold cyan]\n")
+    console.print("\n[bold cyan]OpenAssist AI v1.0.0 - Provider Benchmark[/bold cyan]\n")
     providers = init_providers(config)
     if not providers:
         console.print("[red]No providers![/red]")

@@ -1,5 +1,5 @@
 """
-OpenAssist AI v4.1 — Main Application Controller (Midnight Hardened).
+OpenAssist AI v1.0.0 — Main Application Controller (Midnight Hardened).
 RESTORED: Smooth Gliding (60fps / 5px steps), HUD navigation, and click-through.
 FIXED: Standby warmup signal bridge and non-blocking hardware hot-apply.
 RESTORATION: Automatic Knowledge Sync (RAG) during warmup.
@@ -10,6 +10,7 @@ import asyncio
 import re
 import threading
 import time
+import uuid
 import shutil
 from pathlib import Path
 from PyQt6.QtWidgets import QApplication
@@ -101,6 +102,9 @@ class OpenAssistApp(QObject):
         self._current_response_start_time = None
         self._last_query_time = 0.0
         self._click_through = False
+        # M36 FIX: Use itertools.count for atomic increment across threads.
+        import itertools
+        self._generation_epoch_counter = itertools.count(1)
         self._generation_epoch = 0
         self._screen_analysis_pending = False
         self._pending_request_metadata = None
@@ -419,6 +423,10 @@ class OpenAssistApp(QObject):
         elif detector and hasattr(detector, "reset_fragment_buffer"):
             detector.reset_fragment_buffer(reason or "turn-reset")
 
+    def _make_turn_id(self, origin: str, request_epoch: int) -> str:
+        """Create a unique turn ownership token for the current request."""
+        return f"{origin}:{request_epoch}:{uuid.uuid4().hex}"
+
     def _sanitize_standard_speech_meta_response(self, text: str, request_metadata=None) -> str:
         cleaned = (text or "").strip()
         metadata = request_metadata or {}
@@ -657,7 +665,8 @@ class OpenAssistApp(QObject):
             try:
                 # 1. Hardware Cooldown
                 self.audio.restart()
-                self.hotkeys.restart()
+                # M33 FIX: hotkeys interacts with Qt objects; schedule on main thread.
+                QTimer.singleShot(0, self.hotkeys.restart)
 
                 # 2. Process Warmup
                 # Close old provider network resources (e.g. Ollama aiohttp sessions)
@@ -813,6 +822,13 @@ class OpenAssistApp(QObject):
 
         if current in menu_views:
             logger.info("Close request from %s -> returning to standby surface", source)
+            if getattr(self, "session_active", False):
+                if self.mini_mode:
+                    self.overlay.hide()
+                    return self._present_window(self.mini_overlay, focus=False)
+                else:
+                    self.overlay.show_chat_view()
+                    return self._present_window(self.overlay, focus=False)
             return OpenAssistApp._restore_standby_surface(self, focus=False)
 
         if getattr(self, "session_active", False):
@@ -974,6 +990,13 @@ class OpenAssistApp(QObject):
         request_metadata = dict(self._pending_request_metadata or {})
         request_metadata.setdefault("request_started_at", self._current_request_start)
         request_metadata.setdefault("origin", s)
+        request_epoch = self._generation_epoch
+        turn_id_factory = getattr(self, "_make_turn_id", None)
+        if callable(turn_id_factory):
+            turn_id = request_metadata.get("turn_id") or turn_id_factory(s, request_epoch)
+        else:
+            turn_id = request_metadata.get("turn_id") or f"{s}:{request_epoch}:{uuid.uuid4().hex}"
+        request_metadata["turn_id"] = turn_id
         if isinstance(c, dict) and c.get("auto_answer"):
             request_metadata["auto_mode"] = True
             request_metadata["auto_answer"] = True
@@ -989,7 +1012,11 @@ class OpenAssistApp(QObject):
         except Exception:
             pass
         self._pending_request_metadata = None
-        request_epoch = self._generation_epoch
+        if hasattr(self.ai, "set_foreground_turn_id"):
+            try:
+                self.ai.set_foreground_turn_id(turn_id)
+            except Exception:
+                pass
 
         asyncio.run_coroutine_threadsafe(
             self._process_ai(q, s, c, request_epoch, request_metadata), self.loop
@@ -1171,6 +1198,16 @@ class OpenAssistApp(QObject):
             return
 
         request_epoch = self._generation_epoch
+        turn_id_factory = getattr(self, "_make_turn_id", None)
+        if callable(turn_id_factory):
+            turn_id = turn_id_factory("quick", request_epoch)
+        else:
+            turn_id = f"quick:{request_epoch}:{uuid.uuid4().hex}"
+        if hasattr(self.ai, "set_foreground_turn_id"):
+            try:
+                self.ai.set_foreground_turn_id(turn_id)
+            except Exception:
+                pass
         self.overlay.update_transcript("Preparing quick context answer...")
 
         async def _quick_answer_flow():
@@ -1212,6 +1249,7 @@ class OpenAssistApp(QObject):
                 snapshot,
                 screen_context=screen_text,
                 audio_context=audio_text,
+                turn_id=turn_id,
             )
 
         asyncio.run_coroutine_threadsafe(_quick_answer_flow(), self.loop)
@@ -1724,8 +1762,11 @@ class OpenAssistApp(QObject):
         """Best-effort detached restart for script and packaged app runs."""
         try:
             if getattr(sys, "frozen", False):
-                return QProcess.startDetached(sys.executable, sys.argv[1:])
-            return QProcess.startDetached(sys.executable, sys.argv)
+                # M35 FIX: PyQt6 startDetached() returns (success, pid) tuple.
+                success, _pid = QProcess.startDetached(sys.executable, sys.argv[1:])
+                return success
+            success, _pid = QProcess.startDetached(sys.executable, sys.argv)
+            return success
         except Exception as e:
             logger.error(f"Factory reset restart failed: {e}")
             return False
@@ -1761,7 +1802,7 @@ class OpenAssistApp(QObject):
     def start_new_session(self):
         """Start a clean session: wipe all previous content and begin fresh."""
         session_start_time = time.time()
-        self._generation_epoch += 1
+        self._generation_epoch = next(self._generation_epoch_counter)
         self._session_start_time = session_start_time
         session_id = f"session_{self._generation_epoch}_{int(session_start_time*1000)%100000}"
         self._current_session_id = session_id
@@ -1771,6 +1812,11 @@ class OpenAssistApp(QObject):
         )
 
         self.ai.cancel()
+        if hasattr(self.ai, "reset_session_failures"):
+            try:
+                self.ai.reset_session_failures()
+            except Exception:
+                pass
         self.nexus.clear()
         self.history.start_new_session()
         audio_enabled = bool(self.config.get("capture.audio.enabled", True))
@@ -1866,7 +1912,7 @@ class OpenAssistApp(QObject):
 
     def end_session(self):
         """Fully terminate the active session: cancel AI, wipe content, archive history."""
-        self._generation_epoch += 1
+        self._generation_epoch = next(self._generation_epoch_counter)
         self.ai.cancel()
         self._screen_analysis_pending = False
         self.session_active = False
@@ -1997,14 +2043,30 @@ class OpenAssistApp(QObject):
             self.overlay.update_transcript("Listening for context...", state="listening")
 
     def set_current_mode(self, name):
-        for m_name, btn in self.mode_buttons.items():
-            is_active = m_name == name
-            btn.setChecked(is_active)
-            btn.setStyleSheet(self.ACTIVE_STYLE if is_active else self.NORMAL_STYLE)
+        """Update the active AI mode by name (e.g. 'general', 'coding', 'interview').
+
+        Persists the selection to config and notifies the UI overlays.
+        Previously referenced undefined self.mode_buttons — fixed to use
+        the config + overlay update path that the rest of the app uses.
+        """
+        self.config.set("ai.mode", name)
+        if hasattr(self, "overlay"):
+            self.overlay.update_mode(name)
+        if hasattr(self, "mini_overlay"):
+            self.mini_overlay.update_mode(name)
 
     def toggle_mini_mode(self):
         self.mini_mode = not self.mini_mode
         self.state.is_mini = self.mini_mode
+        # M34 FIX: Actually show/hide the correct overlay views when toggling.
+        if self.mini_mode:
+            self.overlay.hide()
+            self.mini_overlay.show()
+            self.mini_overlay.raise_()
+        else:
+            self.mini_overlay.hide()
+            self.overlay.show()
+            self.overlay.raise_()
         self._refresh_window_invariants()
         # P3.1: Sync history UI when switching modes to preserve navigation state
         self._sync_history_ui()
@@ -2105,19 +2167,8 @@ class OpenAssistApp(QObject):
 
         # ── Standard (non-live) transcription path ─────────────────────────────
         self.overlay.update_transcript(t)
-        request_metadata = None
-        if transcription_metrics:
-            speech_to_transcript_ms = transcription_metrics.get("speech_to_transcript_ms")
-            transcribe_only_ms = transcription_metrics.get("transcribe_only_ms")
-            if speech_to_transcript_ms is not None:
-                logger.info(
-                    "[%s] \u23f1\ufe0f  Transcription latency | speech\u2192transcript=%.0fms | transcribe_only=%.0fms",
-                    session_id, speech_to_transcript_ms, transcribe_only_ms or 0,
-                )
-            request_metadata = {
-                **transcription_metrics,
-                "transcript_received_at": time.time(),
-            }
+        # M37 FIX: Reuse request_metadata built above (L2085-2097) instead of
+        # rebuilding it and double-logging transcription latency.
 
         # ── Background RAG Prefetch ────────────────────────────────────────────
         if self.loop and self.loop.is_running() and hasattr(self.ai, "prefetch_rag"):

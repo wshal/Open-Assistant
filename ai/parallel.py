@@ -44,6 +44,9 @@ class ParallelInference:
         winner_name = None
         winner_stream = None
         first_chunk = None
+        # H8 FIX: Collect loser streams so we can aclose() them to
+        # release their underlying HTTP connections.
+        loser_streams = []
 
         try:
             for coro in asyncio.as_completed(tasks):
@@ -57,6 +60,16 @@ class ParallelInference:
             for task_obj in tasks:
                 if not task_obj.done():
                     task_obj.cancel()
+
+            # H8 FIX: Collect completed loser streams for cleanup.
+            for task_obj in tasks:
+                if task_obj.done() and not task_obj.cancelled():
+                    try:
+                        _name, _chunk, _stream = task_obj.result()
+                        if _stream is not None and _stream is not winner_stream:
+                            loser_streams.append(_stream)
+                    except Exception:
+                        pass
 
             if winner_name is None:
                 raise Exception("All parallel providers failed to produce a first chunk")
@@ -72,6 +85,12 @@ class ParallelInference:
                 if not task_obj.done():
                     task_obj.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            # H8 FIX: Properly close all loser async generator streams.
+            for stream in loser_streams:
+                try:
+                    await stream.aclose()
+                except Exception:
+                    pass
 
     async def generate(self, system: str, user: str, task: str = "general", tier: str = None) -> str:
         targets = []

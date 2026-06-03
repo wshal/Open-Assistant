@@ -258,6 +258,10 @@ class Config:
         # at startup.
         self._data["ai"]["providers"].setdefault("validate_on_init", False)
         self._data["ai"]["providers"].setdefault("health_check_timeout", 4)
+        # Keep provider probing to a single low-cost attempt by default.
+        # Retries are useful for flaky networks, but they also amplify quota
+        # churn when a provider is already exhausted.
+        self._data["ai"]["providers"].setdefault("health_check_attempts", 1)
         self._data["ai"]["providers"].setdefault("groq", {})
         # Periodic pings can reduce first-token latency after idle gaps, but
         # each ping is still a Groq API request and can consume free-tier RPM.
@@ -306,8 +310,11 @@ class Config:
         self._data["capture"]["audio"].setdefault("whisper_model", "small.en")
         self._data["capture"]["audio"].setdefault("prefer_free_cloud", False)
         self._data["capture"]["audio"].setdefault("cloud_final_max_s", 12.0)
-        self._data["capture"]["audio"].setdefault("interim.beam_size", 1)
-        self._data["capture"]["audio"].setdefault("interim.max_pending_finals", 1)
+        # H14 FIX: These must be nested dicts, not flat dot-notation keys,
+        # because config.get() splits on "." for path traversal.
+        self._data["capture"]["audio"].setdefault("interim", {})
+        self._data["capture"]["audio"]["interim"].setdefault("beam_size", 1)
+        self._data["capture"]["audio"]["interim"].setdefault("max_pending_finals", 1)
         self._data["capture"]["audio"].setdefault("whisper_system_beam_size", 1)
         self._data["capture"]["audio"].setdefault("whisper_cpu_threads", 0)
         self._data["capture"]["audio"].setdefault("allow_stereo_mix", True)

@@ -2,8 +2,10 @@ from pynput import keyboard
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 from PyQt6.QtWidgets import QApplication
 import ctypes
-from ctypes import wintypes
 import sys
+# M38 FIX: wintypes is Windows-only; importing on macOS/Linux crashes.
+if sys.platform == "win32":
+    from ctypes import wintypes
 import threading
 import time
 from utils.logger import setup_logger
@@ -128,7 +130,9 @@ class HotkeyManager:
         self.cleanup_timer.start(5000)
 
         # Reset transient hotkey state if the application loses focus.
-        QApplication.instance().focusChanged.connect(self._on_focus_changed)
+        _qapp = QApplication.instance()
+        if _qapp is not None:
+            _qapp.focusChanged.connect(self._on_focus_changed)
 
     def _on_focus_changed(self, old, new):
         if new is None:

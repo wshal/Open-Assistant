@@ -1,5 +1,5 @@
 """
-Onboarding Wizard - OpenAssist AI v4.1
+Onboarding Wizard - OpenAssist AI v1.0.0
 First-run setup wizard to guide users through initial configuration.
 """
 
@@ -298,6 +298,17 @@ class OnboardingWizard(QWidget):
 
         clear_layout(self.content_layout)
 
+        # Explicitly remove step-specific attributes to avoid accessing deleted wrappers
+        for attr in ["provider_combo", "provider_card", "provider_status_icon", 
+                     "provider_test_btn", "provider_link_btn", "lbl_key", 
+                     "api_key_input", "provider_detail", "input_container", 
+                     "ai_mode", "audio_mode", "chk_gaze"]:
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except AttributeError:
+                    pass
+
         # Show/hide back button
         self.btn_back.setVisible(step > 0)
 
@@ -342,8 +353,8 @@ class OnboardingWizard(QWidget):
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
+        # M31 FIX: Removed duplicate addWidget(title) — already added at line 335.
         self.content_layout.addSpacing(10) # Gap after icon
-        self.content_layout.addWidget(title)
         self.content_layout.addSpacing(10)  # Tiny gap for tagline
         self.content_layout.addWidget(desc)
 
@@ -780,13 +791,16 @@ class OnboardingWizard(QWidget):
                 previous_provider = self.wizard_state.get("provider", selected_provider)
 
                 if hasattr(self, "api_key_input"):
-                    self.wizard_state["api_keys"][previous_provider] = (
-                        self.api_key_input.text().strip()
-                    )
-                    if previous_provider != selected_provider:
-                        self.wizard_state["api_keys"][selected_provider] = (
-                            self.wizard_state["api_keys"].get(selected_provider, "")
+                    try:
+                        self.wizard_state["api_keys"][previous_provider] = (
+                            self.api_key_input.text().strip()
                         )
+                        if previous_provider != selected_provider:
+                            self.wizard_state["api_keys"][selected_provider] = (
+                                self.wizard_state["api_keys"].get(selected_provider, "")
+                            )
+                    except RuntimeError:
+                        pass
 
                 # Update key for just THIS provider in-memory
                 self.wizard_state["provider"] = selected_provider
@@ -809,6 +823,14 @@ class OnboardingWizard(QWidget):
         # Update summary UI if we are entering or in the summary step
         self._update_summary()
 
+    def _safe_api_key_text(self) -> str:
+        if hasattr(self, "api_key_input"):
+            try:
+                return self.api_key_input.text().strip()
+            except RuntimeError:
+                pass
+        return ""
+
     def _on_provider_changed(self, idx):
         """Update API key input when provider changes in Screen 2. Sync with in-memory state."""
         providers = ["groq", "cerebras", "gemini", "ollama"]
@@ -816,11 +838,18 @@ class OnboardingWizard(QWidget):
 
         prev_provider = self.wizard_state.get("provider", p)
         if hasattr(self, "api_key_input"):
-            self.wizard_state["api_keys"][prev_provider] = self.api_key_input.text().strip()
+            try:
+                self.wizard_state["api_keys"][prev_provider] = self.api_key_input.text().strip()
+            except RuntimeError:
+                pass
         self.wizard_state["provider"] = p
         
         # In-memory restoration
-        self.api_key_input.setText(self.wizard_state["api_keys"].get(p, ""))
+        if hasattr(self, "api_key_input"):
+            try:
+                self.api_key_input.setText(self.wizard_state["api_keys"].get(p, ""))
+            except RuntimeError:
+                pass
         
         self._refresh_provider_link(p)
         self._apply_provider_test_state(p)
@@ -842,11 +871,15 @@ class OnboardingWizard(QWidget):
             "Local engine" if provider_id == "ollama" else "Connection"
         )
         self.lbl_key.setText("Endpoint" if provider_id == "ollama" else "API Key")
-        self.api_key_input.setPlaceholderText(
-            "Optional Ollama endpoint (default: http://localhost:11434)"
-            if provider_id == "ollama"
-            else "Enter your API key..."
-        )
+        if hasattr(self, "api_key_input"):
+            try:
+                self.api_key_input.setPlaceholderText(
+                    "Optional Ollama endpoint (default: http://localhost:11434)"
+                    if provider_id == "ollama"
+                    else "Enter your API key..."
+                )
+            except RuntimeError:
+                pass
         self.provider_link_btn.setToolTip(
             f"Open {provider_meta.get('name', provider_id)} to "
             f"{'install the local engine' if provider_id == 'ollama' else 'create or copy an API key'}."
@@ -916,7 +949,7 @@ class OnboardingWizard(QWidget):
         if provider_id == "ollama":
             self.provider_test_btn.setEnabled(True)
         else:
-            self.provider_test_btn.setEnabled(bool(self.api_key_input.text().strip()))
+            self.provider_test_btn.setEnabled(bool(self._safe_api_key_text()))
         self.provider_test_btn.setText("TEST")
         if clear_previous_result:
             self.provider_status_icon.setText("\u26aa")
@@ -956,16 +989,41 @@ class OnboardingWizard(QWidget):
         )
         self.provider_detail.setText(detail)
         self.provider_test_btn.setText("RETEST")
-        self.provider_test_btn.setEnabled(True if provider_id == "ollama" else bool(self.api_key_input.text().strip()))
+        self.provider_test_btn.setEnabled(True if provider_id == "ollama" else bool(self._safe_api_key_text()))
 
     def _test_selected_provider(self):
         provider_id = self.wizard_state.get("provider", "groq")
         if self._provider_test_cooldowns.get(provider_id, False):
             return
 
+        ai = getattr(self.app, "ai", None)
+        if provider_id != "ollama" and ai is not None:
+            provider = getattr(ai, "providers", {}).get(provider_id)
+            if provider is not None and hasattr(provider, "is_disabled") and provider.is_disabled():
+                remaining = getattr(provider, "cooldown_remaining_s", lambda: 0)()
+                reason = getattr(provider, "disabled_reason", lambda: "")()
+                if reason and "quota" in reason.lower():
+                    self._set_provider_test_idle(provider_id, clear_previous_result=False)
+                    self.provider_detail.setStyleSheet(
+                        "color: #fda4af; font-size: 10px; background: transparent;"
+                    )
+                    self.provider_detail.setText(
+                        f"Skipped live test: recent quota limit ({remaining}s remaining)."
+                    )
+                    self.provider_status_icon.setText("\u23f3")
+                    self.provider_status_icon.setStyleSheet(
+                        "background: transparent; font-size: 11px; color: #fda4af;"
+                    )
+                    logger.info(
+                        "[Onboarding] Skipping provider test for %s due to active quota cooldown (%ss remaining)",
+                        provider_id,
+                        remaining,
+                    )
+                    return
+
         key_override = ""
         if provider_id != "ollama":
-            key_override = self.api_key_input.text().strip()
+            key_override = self._safe_api_key_text()
             if not key_override:
                 self._set_provider_test_idle(provider_id, clear_previous_result=False)
                 self.provider_detail.setStyleSheet(
@@ -1073,7 +1131,6 @@ class OnboardingWizard(QWidget):
         try:
             w = getattr(self, "_provider_test_worker", None)
             if w is not None and w.isRunning():
-                w.quit()
                 w.wait(2000)
         except Exception:
             pass

@@ -280,11 +280,15 @@ class ProcessUtils:
 
     @staticmethod
     def _linux_active_title() -> str:
-        result = subprocess.run(
-            ["xdotool", "getactivewindow", "getwindowname"],
-            capture_output=True, text=True, timeout=2
-        )
-        return result.stdout.strip()
+        try:
+            result = subprocess.run(
+                ["xdotool", "getactivewindow", "getwindowname"],
+                capture_output=True, text=True, timeout=2
+            )
+            return result.stdout.strip()
+        except FileNotFoundError:
+            logger.warning("xdotool not found on Linux; active title tracking disabled.")
+            return ""
 
     @staticmethod
     def get_active_window_rect() -> Optional[Tuple[int, int, int, int]]:
@@ -486,7 +490,6 @@ class ProcessUtils:
                         "slack",
                         "discord",
                         "obs",
-                        "obsidian",
                         "webex",
                         "skypeforlinux",
                         "anydesk",

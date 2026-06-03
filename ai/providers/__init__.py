@@ -135,7 +135,7 @@ def init_providers(config) -> dict:
 
     if skipped:
         logger.info("Skipping unconfigured providers: %s", ", ".join(skipped))
-    if providers and bool(config.get("ai.providers.validate_on_init", True)):
+    if providers and bool(config.get("ai.providers.validate_on_init", False)):
         # Validation is now kicked off by AIEngine.warmup() on the app loop so
         # it runs in parallel with Whisper, OCR, and the rest of startup.
         # Keeping it out of this hot path removes a large synchronous stall.

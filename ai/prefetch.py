@@ -11,6 +11,7 @@ Heuristic (from the spec):
 import re
 import time
 import threading
+from collections import deque
 from typing import Optional, Set, Callable, Dict
 
 from utils.logger import setup_logger
@@ -191,8 +192,10 @@ _NOISE_SYMBOLS: Set[str] = {
 # with a small bounded LRU; for unchanged screens the call collapses to a dict
 # lookup.
 _EXTRACT_SYMBOLS_CACHE: Dict[int, list[str]] = {}
-_EXTRACT_SYMBOLS_CACHE_ORDER: list[int] = []
+_EXTRACT_SYMBOLS_CACHE_ORDER = deque()
 _EXTRACT_SYMBOLS_CACHE_MAX = 32
+# M11 FIX: Module-level cache is accessed from multiple threads.
+_EXTRACT_SYMBOLS_CACHE_LOCK = threading.Lock()
 
 
 def _extract_symbols(text: str) -> list[str]:
@@ -200,9 +203,11 @@ def _extract_symbols(text: str) -> list[str]:
     if not text:
         return []
     key = hash(text)
-    cached = _EXTRACT_SYMBOLS_CACHE.get(key)
-    if cached is not None:
-        return list(cached)
+    # M11 FIX: Thread-safe cache access.
+    with _EXTRACT_SYMBOLS_CACHE_LOCK:
+        cached = _EXTRACT_SYMBOLS_CACHE.get(key)
+        if cached is not None:
+            return list(cached)
 
     seen: Set[str] = set()
     results = []
@@ -217,11 +222,12 @@ def _extract_symbols(text: str) -> list[str]:
                 seen.add(name)
                 results.append(name)
 
-    _EXTRACT_SYMBOLS_CACHE[key] = list(results)
-    _EXTRACT_SYMBOLS_CACHE_ORDER.append(key)
-    if len(_EXTRACT_SYMBOLS_CACHE_ORDER) > _EXTRACT_SYMBOLS_CACHE_MAX:
-        old = _EXTRACT_SYMBOLS_CACHE_ORDER.pop(0)
-        _EXTRACT_SYMBOLS_CACHE.pop(old, None)
+    with _EXTRACT_SYMBOLS_CACHE_LOCK:
+        _EXTRACT_SYMBOLS_CACHE[key] = list(results)
+        _EXTRACT_SYMBOLS_CACHE_ORDER.append(key)
+        if len(_EXTRACT_SYMBOLS_CACHE_ORDER) > _EXTRACT_SYMBOLS_CACHE_MAX:
+            old = _EXTRACT_SYMBOLS_CACHE_ORDER.popleft()
+            _EXTRACT_SYMBOLS_CACHE.pop(old, None)
     return results
 
 

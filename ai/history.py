@@ -357,33 +357,39 @@ class ResponseHistory:
 
     def clear(self):
         """Emergency Wipe: Purge memory and ALL session files from disk."""
+        # H9 FIX: Hold a single lock for the entire operation so other threads
+        # cannot observe partially-cleared state between the two phases.
         with self._lock:
             self.entries.clear()
             self.current_index = -1
             self.screen_analyses = []
 
-        # RESTORATION: Total Disk Purge logic
-        logger.warning("🚨 EMERGENCY DISK PURGE INITIATED")
-        try:
-            # 1. Delete all .enc files in history directory
-            for enc_file in self.history_dir.glob("*.enc"):
-                try:
-                    enc_file.unlink()
-                    logger.debug(f"Removed trace: {enc_file.name}")
-                except Exception as e:
-                    logger.error(f"Failed to remove {enc_file}: {e}")
+            # RESTORATION: Total Disk Purge logic
+            logger.warning("🚨 EMERGENCY DISK PURGE INITIATED")
+            try:
+                # 1. Delete all .enc files in history directory
+                for enc_file in self.history_dir.glob("*.enc"):
+                    try:
+                        enc_file.unlink()
+                        logger.debug(f"Removed trace: {enc_file.name}")
+                    except Exception as e:
+                        logger.error(f"Failed to remove {enc_file}: {e}")
 
-            # 2. Re-initialize empty state
-            with self._lock:
+                # 2. Re-initialize empty state
                 self.sessions = []
                 self.current_session_id = self._new_session_id()
                 self.current_storage = SecureStorage(
                     str(self.history_dir / f"{self.current_session_id}.enc")
                 )
-            self.index_storage.set("sessions_index", [])
 
+            except Exception as e:
+                logger.error(f"Global purge failed: {e}")
+
+        # Persist outside the lock (index_storage has its own thread safety)
+        try:
+            self.index_storage.set("sessions_index", [])
         except Exception as e:
-            logger.error(f"Global purge failed: {e}")
+            logger.error(f"Failed to persist empty sessions index: {e}")
 
         logger.info("🗑️ Global history and disk traces cleared")
 

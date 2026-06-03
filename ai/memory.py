@@ -129,6 +129,8 @@ class LongTermMemory:
         if not query or not response:
             return
 
+        mode = (mode or "general").strip().lower()
+
         def _do_store():
             try:
                 doc = f"Q: {query.strip()}\nA: {response.strip()[:_MAX_RESPONSE_STORE_CHARS]}"
@@ -164,6 +166,8 @@ class LongTermMemory:
             return []
         if not query:
             return []
+
+        mode = (mode or "").strip().lower()
 
         try:
             with self._lock:

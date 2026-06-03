@@ -15,6 +15,8 @@ from utils.text_utils import (
     sanitize_query_label,
 )
 
+logger = logging.getLogger(__name__)
+
 # Lazy-loaded intent classifier (embedding-based)
 _intent_classifier = None
 _intent_classifier_loaded = False
@@ -35,7 +37,35 @@ def _get_intent_classifier():
     return _intent_classifier
 
 
+def _ensure_auto_mode_state(app) -> None:
+    if app is None:
+        return
+    if not hasattr(app, "_auto_answer_context"):
+        try:
+            from ai.auto_mode_runtime import init_auto_mode_state
+            init_auto_mode_state(app)
+        except Exception:
+            app._auto_answer_context = ""
+            app._auto_answer_context_at = 0.0
+            app._auto_answer_last_dispatched_query = ""
+            app._auto_answer_last_dispatched_at = 0.0
+            app._auto_interim_stable_key = ""
+            app._auto_interim_stable_at = 0.0
+            app._auto_interim_pending_query = ""
+            app._auto_interim_pending_raw = ""
+            app._auto_interim_pending_seq = 0
+            app._auto_final_pending_query = ""
+            app._auto_final_pending_raw = ""
+            app._auto_final_pending_metadata = None
+            app._auto_final_pending_session_id = ""
+            app._auto_final_pending_seq = 0
+            app._auto_final_pending_at = 0.0
+            app._pending_incomplete_audio_query = ""
+            app._pending_incomplete_audio_at = 0.0
+
+
 def _auto_learn(text: str, intent: str, *, scores=None, app=None) -> None:
+    _ensure_auto_mode_state(app)
     """Teach the intent classifier from a live session outcome.
 
     Only learns when:
@@ -75,8 +105,6 @@ def _auto_learn(text: str, intent: str, *, scores=None, app=None) -> None:
 
 if TYPE_CHECKING:
     from core.app import OpenAssistApp
-
-logger = logging.getLogger(__name__)
 
 
 _INCOMPLETE_TRAILING_WORDS = {
@@ -122,6 +150,7 @@ def _norm_query_key(text: str) -> str:
 
 
 def _reset_session_context_if_stale(app: "OpenAssistApp", session_id: str) -> None:
+    _ensure_auto_mode_state(app)
     """Clear injected preamble context after the response window has passed.
 
     Called via QTimer 45s after dispatch. Only clears if no new dispatch has
@@ -203,6 +232,7 @@ def _looks_like_standalone_speculative_question(text: str) -> bool:
 
 
 def _mark_auto_context(app: "OpenAssistApp", text: str) -> None:
+    _ensure_auto_mode_state(app)
     text = " ".join((text or "").split()).strip()
     if not text:
         return
@@ -228,6 +258,7 @@ def _mark_auto_context(app: "OpenAssistApp", text: str) -> None:
 
 
 def _candidate_from_context(app: "OpenAssistApp", text: str) -> str:
+    _ensure_auto_mode_state(app)
     cleaned = (sanitize_query_label(text) or text or "").strip()
     context = (getattr(app, "_auto_answer_context", "") or "").strip()
     if context and cleaned:
@@ -247,6 +278,7 @@ def _candidate_from_context(app: "OpenAssistApp", text: str) -> str:
 
 
 def _is_actionable_auto_query(app: "OpenAssistApp", text: str) -> bool:
+    _ensure_auto_mode_state(app)
     if not text:
         return False
     clause = text.rstrip("?").strip()
@@ -266,6 +298,7 @@ def _is_actionable_auto_query(app: "OpenAssistApp", text: str) -> bool:
 
 
 def _recent_auto_dispatch_matches(app: "OpenAssistApp", candidate: str, window_s: float = 8.0) -> bool:
+    _ensure_auto_mode_state(app)
     suppressed = (getattr(app, "_auto_answer_last_dispatched_query", "") or "").strip()
     dispatched_at = float(getattr(app, "_auto_answer_last_dispatched_at", 0.0) or 0.0)
     if not suppressed or dispatched_at <= 0.0 or (time.time() - dispatched_at) > window_s:
@@ -274,6 +307,7 @@ def _recent_auto_dispatch_matches(app: "OpenAssistApp", candidate: str, window_s
 
 
 def _audio_processing_busy(app: "OpenAssistApp") -> bool:
+    _ensure_auto_mode_state(app)
     audio = getattr(app, "audio", None)
     if audio and hasattr(audio, "has_pending_transcription_jobs"):
         try:
@@ -406,6 +440,7 @@ def _final_dispatch_delay_ms(app: "OpenAssistApp", raw: str, candidate: str) -> 
 
 
 def _clear_pending_final_dispatch(app: "OpenAssistApp") -> None:
+    _ensure_auto_mode_state(app)
     app._auto_final_pending_query = ""
     app._auto_final_pending_raw = ""
     app._auto_final_pending_metadata = None
@@ -421,6 +456,7 @@ def _dispatch_auto_query(
     request_metadata: dict | None = None,
     speculative: bool = False,
 ) -> None:
+    _ensure_auto_mode_state(app)
     # ── Push accumulated preamble into session context BEFORE clearing it ────
     # _mark_auto_context() builds a rich head+tail window of everything the
     # interviewer has said so far ("Imagine we have a monolithic app backed by a
@@ -473,6 +509,7 @@ def _dispatch_auto_query(
 
 
 def _dispatch_pending_final_if_current(app: "OpenAssistApp", seq: int) -> None:
+    _ensure_auto_mode_state(app)
     if int(getattr(app, "_auto_final_pending_seq", 0) or 0) != seq:
         return
     candidate = (getattr(app, "_auto_final_pending_query", "") or "").strip()
@@ -518,6 +555,7 @@ def _schedule_final_dispatch(
     *,
     delay_ms: int | None = None,
 ) -> None:
+    _ensure_auto_mode_state(app)
     app._auto_final_pending_query = candidate
     app._auto_final_pending_raw = raw
     app._auto_final_pending_metadata = dict(request_metadata or {})
@@ -549,6 +587,7 @@ def _merge_pending_final_dispatch(
     session_id: str,
     request_metadata: dict | None,
 ) -> bool:
+    _ensure_auto_mode_state(app)
     pending = (getattr(app, "_auto_final_pending_query", "") or "").strip()
     if not pending:
         return False
@@ -583,6 +622,7 @@ def _merge_pending_final_dispatch(
 
 
 def _dispatch_auto_interim_if_current(app: "OpenAssistApp", seq: int, session_id: str) -> None:
+    _ensure_auto_mode_state(app)
     if int(getattr(app, "_auto_interim_pending_seq", 0) or 0) != seq:
         return
     candidate = (getattr(app, "_auto_interim_pending_query", "") or "").strip()
@@ -611,6 +651,7 @@ def handle_auto_interim_transcription(
     text: str,
     session_id: str,
 ) -> bool:
+    _ensure_auto_mode_state(app)
     """Speculatively answer only very complete-looking interim questions."""
     if not getattr(app, "_auto_mode_requested", lambda: False)():
         return False
@@ -677,6 +718,7 @@ def handle_auto_final_transcription(
     session_id: str,
     request_metadata: dict | None = None,
 ) -> bool:
+    _ensure_auto_mode_state(app)
     """Whisper-first auto-answer mode.
 
     Auto Mode keeps the standard local ASR and provider pipeline, but treats

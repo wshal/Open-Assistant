@@ -161,9 +161,16 @@ class NexusTimelineView(QWidget):
                 w.deleteLater()
 
         # Auto-scroll to bottom
-        QTimer.singleShot(30, lambda: self.scroll.verticalScrollBar().setValue(
-            self.scroll.verticalScrollBar().maximum()
-        ))
+        _scroll_timer = QTimer(self)
+        _scroll_timer.setSingleShot(True)
+        _scroll_timer.timeout.connect(self._scroll_to_bottom)
+        _scroll_timer.start(30)
+
+    def _scroll_to_bottom(self):
+        try:
+            self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
+        except RuntimeError:
+            pass
 
     def _get_nexus_events(self):
         """Pull the flat event list from Nexus (returns list of dicts)."""

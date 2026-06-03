@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from typing import Dict
+from PyQt6.QtCore import QObject, pyqtSignal
 
 
 @dataclass
@@ -115,10 +116,13 @@ THEMES: Dict[str, Theme] = {
 }
 
 
-class ThemeEngine:
+class ThemeEngine(QObject):
     """Apply themes to the application."""
 
+    theme_changed = pyqtSignal(str)
+
     def __init__(self, config):
+        super().__init__()
         self.config = config
         theme_name = config.get("app.theme", "midnight")
         self.current = THEMES.get(theme_name, THEMES["midnight"])
@@ -127,6 +131,7 @@ class ThemeEngine:
         if name in THEMES:
             self.current = THEMES[name]
             self.config.set("app.theme", name)
+            self.theme_changed.emit(name)
 
     def get_overlay_stylesheet(self) -> str:
         t = self.current
@@ -136,7 +141,7 @@ class ThemeEngine:
                 border: 1px solid {t.border};
                 border-radius: 14px;
             }}
-            QTextEdit {{
+            #box QTextEdit {{
                 background: {t.bg_secondary};
                 color: {t.text_primary};
                 border: 1px solid {t.border};
@@ -145,7 +150,7 @@ class ThemeEngine:
                 font-size: 13px;
                 font-family: 'Cascadia Code', 'Fira Code', monospace;
             }}
-            QLineEdit {{
+            #box QLineEdit {{
                 background: {t.bg_input};
                 color: {t.text_primary};
                 border: 1px solid {t.border};
@@ -153,23 +158,23 @@ class ThemeEngine:
                 padding: 9px 18px;
                 font-size: 13px;
             }}
-            QLineEdit:focus {{
+            #box QLineEdit:focus {{
                 border-color: {t.accent};
             }}
-            QPushButton#sendButton {{
+            #box QPushButton#sendButton {{
                 background: {t.accent};
                 color: white;
                 border: none;
                 border-radius: 18px;
                 font-weight: bold;
             }}
-            QPushButton#sendButton:hover {{
+            #box QPushButton#sendButton:hover {{
                 background: {t.accent_hover};
             }}
-            QLabel {{
+            #box QLabel {{
                 color: {t.text_secondary};
             }}
-            QComboBox {{
+            #box QComboBox {{
                 background: {t.bg_input};
                 color: {t.text_secondary};
                 border: 1px solid {t.border};

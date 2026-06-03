@@ -55,9 +55,10 @@ class OCREngine:
         self._loaded = False
         self._lock = threading.Lock()
         self._backends: list[tuple[str, Any]] = []  # Populated by _ensure_loaded()
-        # M-7: Track whether this instance actually called CoInitialize so we
-        # only call CoUninitialize once in shutdown(), and only on Windows.
-        self._co_initialized = False
+        # M-7: Track COM initialisation per-thread so we only call
+        # CoUninitialize on threads that actually called CoInitialize.
+        # Using threading.local() because COM apartment state is per-thread.
+        self._co_local = threading.local()
         self._unavailable_reason = ""
         self._unavailable_logged = False
 
@@ -73,6 +74,38 @@ class OCREngine:
             "winrt": "winrt",
         }
         return aliases.get(raw, raw)
+
+    # ── Per-thread COM helpers ─────────────────────────────────────────────
+
+    def _ensure_com_initialized(self) -> None:
+        """Call CoInitialize on the current thread if not already done.
+
+        COM apartment state is per-thread — each thread that uses WinRT
+        must have its own CoInitialize/CoUninitialize pair.  We track
+        this via threading.local() so shutdown() can pair correctly.
+        """
+        if getattr(self._co_local, "initialized", False):
+            return
+        try:
+            import ctypes
+            hr = ctypes.windll.ole32.CoInitialize(0)
+            # S_OK == 0, S_FALSE == 1 (already init'd, still needs Uninit)
+            if hr in (0, 1):
+                self._co_local.initialized = True
+        except Exception:
+            pass
+
+    def _uninitialize_com_this_thread(self) -> None:
+        """Pair a previous CoInitialize on *this* thread."""
+        if not getattr(self._co_local, "initialized", False):
+            return
+        try:
+            import ctypes
+            ctypes.windll.ole32.CoUninitialize()
+        except Exception:
+            pass
+        finally:
+            self._co_local.initialized = False
 
     # ── Backend loading ─────────────────────────────────────────────────────
 
@@ -108,13 +141,8 @@ class OCREngine:
 
     def _try_load_winrt(self):
         try:
-            import ctypes
-            # Ensure COM is initialized on this thread (required for WinRT in thread pools)
-            # M-7: Track success so shutdown() can pair this with CoUninitialize.
-            hr = ctypes.windll.ole32.CoInitialize(0)
-            # S_OK == 0, S_FALSE == 1 (already init'd, still needs Uninit), RPC_E_CHANGED_MODE == 0x80010106
-            if hr in (0, 1):
-                self._co_initialized = True
+            # Ensure COM is initialized on the loading thread.
+            self._ensure_com_initialized()
 
             import winrt.windows.media.ocr as ocr
             from winrt.windows.globalization import Language
@@ -133,17 +161,10 @@ class OCREngine:
     def shutdown(self) -> None:
         """Release backend handles and pair CoInitialize with CoUninitialize.
 
-        M-7: Without this, every OCR-using process leaked one COM
-        initialisation per thread that touched the WinRT engine.
+        Only uninitializes COM on the calling thread — which is correct
+        because COM apartment state is per-thread.
         """
-        if self._co_initialized:
-            try:
-                import ctypes
-                ctypes.windll.ole32.CoUninitialize()
-            except Exception:
-                pass
-            finally:
-                self._co_initialized = False
+        self._uninitialize_com_this_thread()
         self.engine = None
         self._backends = []
         self._loaded = False
@@ -323,7 +344,16 @@ class OCREngine:
     # ── WinRT extract ────────────────────────────────────────────────────────
 
     async def _extract_winrt(self, engine, img: Image.Image) -> Tuple[Optional[str], List[Box]]:
+        # M21 FIX: Track WinRT objects for explicit cleanup to prevent
+        # memory growth under sustained OCR load.
+        stream = None
+        writer = None
+        bitmap = None
         try:
+            # Ensure COM is initialized on the current thread — this may be
+            # a different thread than the one that called _try_load_winrt().
+            self._ensure_com_initialized()
+
             import winrt.windows.graphics.imaging as imaging
             import winrt.windows.storage.streams as streams
 
@@ -358,3 +388,21 @@ class OCREngine:
         except Exception as exc:
             logger.warning("[OCR] WinRT OCR failed: %s", exc)
             return None, []
+        finally:
+            # M21 FIX: Explicitly close WinRT stream/bitmap objects to
+            # prevent IRandomAccessStream and SoftwareBitmap leaks.
+            if bitmap is not None:
+                try:
+                    bitmap.close()
+                except Exception:
+                    pass
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass

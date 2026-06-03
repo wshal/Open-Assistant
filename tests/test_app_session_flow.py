@@ -1,5 +1,6 @@
 import unittest
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -323,6 +324,9 @@ class MiniOverlayStub:
     def show(self):
         self.show_calls += 1
 
+    def raise_(self):
+        self.raise_calls = getattr(self, "raise_calls", 0) + 1
+
     def update_audio_state(self, muted):
         pass
 
@@ -423,6 +427,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             session_active=False,
             _last_query="stale query",
             _generation_epoch=0,
+            _generation_epoch_counter=__import__("itertools").count(1),
             _screen_analysis_pending=False,
             _click_through=False,
             _screen_share_active=False,
@@ -792,12 +797,13 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         app.screen = SimpleNamespace(capture_context=lambda: captures.append(True))
         quick_calls = []
 
-        async def fake_quick(snapshot, screen_context="", audio_context=""):
+        async def fake_quick(snapshot, screen_context="", audio_context="", turn_id=""):
             quick_calls.append(
                 {
                     "screen": screen_context,
                     "audio": audio_context,
                     "snapshot": snapshot,
+                    "turn_id": turn_id,
                 }
             )
 
@@ -837,7 +843,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         app.screen = SimpleNamespace(capture_context=fake_capture_context)
 
-        async def fake_quick(snapshot, screen_context="", audio_context=""):
+        async def fake_quick(snapshot, screen_context="", audio_context="", turn_id=""):
             return ""
 
         app.ai = SimpleNamespace(generate_quick_response=fake_quick)
@@ -852,6 +858,54 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             "Quick answer missing cached context. Refreshing screen once...",
             app.overlay.transcript_updates,
         )
+
+    def test_quick_answer_threads_turn_id_from_audio_fixture(self):
+        app = self._build_app()
+        app._ai_lock_ready = SimpleNamespace(wait=lambda timeout=2: True)
+        app.loop = object()
+        app.session_active = True
+
+        fixture_path = (
+            Path(__file__).resolve().parents[1]
+            / "tests"
+            / "fixtures"
+            / "audio_ground_truth"
+            / "react_what_is_react_01.wav.json"
+        )
+        fixture_data = json.loads(fixture_path.read_text(encoding="utf-8"))
+        transcript = fixture_data["expected_transcript"]
+
+        app.nexus = SimpleNamespace(
+            get_snapshot=lambda: {
+                "recent_audio": transcript,
+                "full_audio_history": transcript,
+                "latest_ocr": "",
+            }
+        )
+        app.audio = SimpleNamespace(get_transcript=lambda: "")
+        captured = {}
+
+        async def fake_quick(snapshot, screen_context="", audio_context="", turn_id=""):
+            captured["snapshot"] = snapshot
+            captured["screen"] = screen_context
+            captured["audio"] = audio_context
+            captured["turn_id"] = turn_id
+
+        app.ai = SimpleNamespace(
+            generate_quick_response=fake_quick,
+            set_foreground_turn_id=lambda turn_id: captured.setdefault("set_turn_id", turn_id),
+        )
+
+        with patch(
+            "core.app.asyncio.run_coroutine_threadsafe",
+            side_effect=lambda coro, loop: __import__("asyncio").run(coro),
+        ):
+            OpenAssistApp.quick_answer(app)
+
+        self.assertEqual(captured["audio"], transcript)
+        self.assertEqual(captured["screen"], "")
+        self.assertTrue(captured["turn_id"].startswith("quick:"))
+        self.assertEqual(captured["turn_id"], captured["set_turn_id"])
 
     def test_end_session_resets_state_and_returns_to_standby(self):
         app = self._build_app()

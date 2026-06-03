@@ -117,11 +117,21 @@ class SecureStorage:
         try:
             if os.name == "nt":
                 import ctypes  # type: ignore[import-not-found]
+                import subprocess
 
                 FILE_ATTRIBUTE_HIDDEN = 0x02
                 ctypes.windll.kernel32.SetFileAttributesW(
                     str(key_path), FILE_ATTRIBUTE_HIDDEN
                 )
+                try:
+                    username = os.environ.get("USERNAME") or os.getlogin()
+                    subprocess.run(
+                        ["icacls", str(key_path), "/inheritance:r", "/grant:r", f"{username}:F"],
+                        capture_output=True,
+                        check=False,
+                    )
+                except Exception as acl_exc:
+                    logger.warning("SecureStorage: Windows ACL harden failed: %s", acl_exc)
             else:
                 os.chmod(key_path, 0o600)
         except Exception as exc:
@@ -280,8 +290,10 @@ class SecureStorage:
         count = 0
         for pid, key in keys.items():
             if isinstance(key, str) and key.strip():
-                self.set_api_key(pid, key)
+                self._data[f"api_key_{pid}"] = key
                 count += 1
+        if count > 0:
+            self._save()
         return count
 
     # ── Portable (password-based) export/import ─────────────────────────────
@@ -343,8 +355,10 @@ class SecureStorage:
         count = 0
         for pid, key in keys.items():
             if isinstance(key, str) and key.strip():
-                self.set_api_key(pid, key)
+                self._data[f"api_key_{pid}"] = key
                 count += 1
+        if count > 0:
+            self._save()
         return count
 
     def clear_all(self):

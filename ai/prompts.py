@@ -8,7 +8,13 @@ from utils.text_utils import normalize_transcript
 # ── Prompt injection guard ──────────────────────────────────────────────────
 _MAX_SESSION_CONTEXT_LEN = 2000
 _INJECTION_PATTERN = re.compile(
-    r'(?i)(ignore|disregard|forget|override).{0,40}(previous|prior|above|instruction|system|prompt)',
+    r'(?i)('
+    r'(?:ignore|disregard|forget|override|bypass|negate|overwrite|skip|cancel|reset|disable)\b.{0,60}\b(?:previous|prior|above|instruction|system|prompt|rule|constraint|guideline|setting|safety|context|persona|role|model)'
+    r'|'
+    r'(?:previous|prior|above|instruction|system|prompt|rule|constraint|guideline|setting|safety|context|persona|role|model)\b.{0,60}\b(?:ignore|disregard|forget|override|bypass|negate|overwrite|skip|cancel|reset|disable)'
+    r'|'
+    r'\b(?:jailbreak|dan mode|developer mode|do anything now|bypass filter|safety guidelines|system prompt)\b'
+    r')',
 )
 
 

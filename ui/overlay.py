@@ -1,5 +1,5 @@
 """
-Main overlay window - v4.1 (Layer 4 Hardened).
+Main overlay window - v1.0.0 (Layer 4 Hardened).
 RESTORED: Markdown Render Debounce (150ms) and Manual Scroll Lock.
 FIXED: Connection of transcript and audio-status bridges.
 P0.1 FIX: Removed duplicate CRLF class definition artifact.
@@ -52,6 +52,9 @@ class OverlayWindow(QMainWindow):
         self._user_is_scrolling = False
         self._prev_stack_index = 0
         self._prev_stack_widget = None
+        self._pending_thinking = False
+        self._history_navigation_header = ""
+        self._source_badge = ""
 
         self.md = MarkdownRenderer()
 
@@ -419,6 +422,7 @@ class OverlayWindow(QMainWindow):
         self.btn_analyze_screen = QPushButton("ANALYZE SCREEN")
         self.btn_analyze_screen.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_analyze_screen.setToolTip("Capture the current screen and analyze it with live session context")
+        self.btn_analyze_screen.setFixedWidth(145)
         self.btn_analyze_screen.setStyleSheet("""
             QPushButton {
                 background: rgba(56,189,248,30);
@@ -492,7 +496,7 @@ class OverlayWindow(QMainWindow):
         badge = getattr(self, "_source_badge", "")
         q_html = (
             f"<div style='color: #64748b; font-size: 10px; margin-bottom: 5px;'>"
-            f"<b>QUERY:</b> {self._current_query}{badge}</div>"
+            f"<b>QUERY:</b> {escape(self._current_query)}{badge}</div>"
             if self._current_query
             else ""
         )
@@ -709,19 +713,19 @@ class OverlayWindow(QMainWindow):
         anim.start()
         
         # M-6: Bind dismissal timer to ``self`` and auto-purge ``_active_toasts``
-        # via the toast's destroyed signal so the list never accumulates dead
+        # via the toast's destroyed signal so the dict never accumulates dead
         # references when the parent is closed before the timer fires.
         if not hasattr(self, "_active_toasts"):
-            self._active_toasts = []
-        self._active_toasts.append(toast)
+            self._active_toasts = {}
+        toast_id = id(toast)
+        self._active_toasts[toast_id] = toast
         toast.destroyed.connect(
-            lambda _=None, t=toast: self._active_toasts.remove(t)
-            if t in self._active_toasts else None
+            lambda _=None, tid=toast_id: self._active_toasts.pop(tid, None)
         )
 
         def _dismiss():
-            if toast in self._active_toasts:
-                self._active_toasts.remove(toast)
+            if toast_id in self._active_toasts:
+                self._active_toasts.pop(toast_id, None)
             fade = QPropertyAnimation(toast, b"geometry", toast)
             fade.setDuration(300)
             fade.setStartValue(end_rect)
@@ -1328,15 +1332,18 @@ class OverlayWindow(QMainWindow):
             self.move(e.globalPosition().toPoint() - self._drag_pos)
 
     def mouseReleaseEvent(self, e):
-        self._drag = False
-        # Q9: Persist overlay position so it survives restarts
-        pos = self.pos()
-        try:
-            self.config.set("app.overlay_x", pos.x())
-            self.config.set("app.overlay_y", pos.y())
-            logger.debug("[Q9 Position] Saved overlay position: (%d, %d)", pos.x(), pos.y())
-        except Exception as _e:
-            logger.debug("[Q9 Position] Could not save position: %s", _e)
+        if self._drag:
+            self._drag = False
+            # Q9: Persist overlay position so it survives restarts
+            pos = self.pos()
+            try:
+                self.config.set("app.overlay_x", pos.x())
+                self.config.set("app.overlay_y", pos.y())
+                logger.debug("[Q9 Position] Saved overlay position: (%d, %d)", pos.x(), pos.y())
+            except Exception as _e:
+                logger.debug("[Q9 Position] Could not save position: %s", _e)
+        else:
+            self._drag = False
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -1350,6 +1357,9 @@ class OverlayWindow(QMainWindow):
     def hideEvent(self, e):
         if hasattr(self, "_gaze_timer") and self._gaze_timer.isActive():
             self._gaze_timer.stop()
+        # M23 FIX: Stop the periodic markdown render timer on hide.
+        if hasattr(self, "_render_timer") and self._render_timer.isActive():
+            self._render_timer.stop()
         super().hideEvent(e)
         if hasattr(self.app, "hotkeys"):
             self.app.hotkeys.reset_state()

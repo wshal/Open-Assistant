@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "OpenAssist AI"
-APP_VERSION = "4.0.0"
+APP_VERSION = "1.0.0"
 APP_ID = "com.openassist.ai"
 
 
@@ -29,7 +29,9 @@ def _get_user_data_dir() -> Path:
         exe_dir = Path(sys.executable).parent  # folder containing the .exe
         data_dir = exe_dir / "OpenAssist_Data"
     else:                                       # running from source
-        data_dir = Path(".")                    # project root (current behaviour)
+        # M40 FIX: Path(".") depends on CWD which varies by launch method.
+        # Use the script's own directory as the stable project root.
+        data_dir = Path(__file__).resolve().parent.parent  # core/constants.py → project root
 
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir

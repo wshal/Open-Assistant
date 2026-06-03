@@ -290,6 +290,73 @@ class TestQuickAnswerModeAware(unittest.TestCase):
         engine, profile, _ = self._make_engine("exam")
         self.assertIn("answer", profile.quick_answer_query.lower())
 
+    def test_quick_answer_turn_guard_suppresses_stale_output(self):
+        engine, _, _ = self._make_engine("interview")
+        chunks = []
+        completes = []
+        engine.response_chunk.connect(chunks.append)
+        engine.response_complete.connect(completes.append)
+
+        state = {}
+
+        async def fake_stream(sys_p, user_p):
+            yield "first "
+            state["first_seen"].set()
+            await state["release_second"].wait()
+            yield "second"
+
+        engine._providers["groq"].generate_stream.side_effect = fake_stream
+
+        async def run_flow():
+            state["first_seen"] = asyncio.Event()
+            state["release_second"] = asyncio.Event()
+            task = asyncio.create_task(
+                engine.generate_quick_response(
+                    {},
+                    screen_context="",
+                    audio_context="what is react",
+                    turn_id="turn-a",
+                )
+            )
+            await asyncio.wait_for(state["first_seen"].wait(), timeout=1.0)
+            engine.set_foreground_turn_id("turn-b")
+            state["release_second"].set()
+            return await asyncio.wait_for(task, timeout=1.0)
+
+        result = self._run(run_flow())
+        self.assertEqual(result, "")
+        self.assertEqual(chunks, ["first "])
+        self.assertEqual(completes, [])
+        engine.history.add.assert_not_called()
+
+    def test_generate_response_skips_stale_history_and_completion(self):
+        engine, _, _ = self._make_engine("interview")
+        chunks = []
+        completes = []
+        engine.response_chunk.connect(chunks.append)
+        engine.response_complete.connect(completes.append)
+        engine.set_foreground_turn_id("turn-b")
+
+        async def fake_stream(sys_p, user_p):
+            yield "stale result"
+
+        engine._providers["groq"].generate_stream.side_effect = fake_stream
+
+        self._run(
+            engine.generate_response(
+                query="what is react",
+                nexus_snapshot={},
+                origin="manual",
+                request_metadata={"turn_id": "turn-a"},
+                screen_context="",
+                audio_context="",
+            )
+        )
+
+        self.assertEqual(chunks, [])
+        self.assertEqual(completes, [])
+        engine.history.add.assert_not_called()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. PromptBuilder quick-answer format injection

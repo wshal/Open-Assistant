@@ -156,8 +156,12 @@ class Telemetry:
         total_requests = total_hits + self.cache_misses.value
         hit_rate = round(total_hits / total_requests * 100, 1) if total_requests else 0.0
 
+        # H18 FIX: Snapshot the dict under the cer_lock to prevent
+        # RuntimeError from concurrent record_ocr_cer() insertions.
         ocr_cer_by_engine_stats = {}
-        for engine, hist in self.ocr_cer_by_engine.items():
+        with self._cer_lock:
+            cer_snapshot = dict(self.ocr_cer_by_engine)
+        for engine, hist in cer_snapshot.items():
             ocr_cer_by_engine_stats[engine] = hist.stats()
 
         return {

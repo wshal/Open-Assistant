@@ -1,5 +1,5 @@
 """
-Screen capture with change detection — v4.1 (Layer 3 Hardened).
+Screen capture with change detection — v1.0.0 (Layer 3 Hardened).
 RESTORED: Dynamic Monitor Selection.
 FIXED: Active region tracking for Smart Crop (Vision Focus).
 """
@@ -8,6 +8,7 @@ import asyncio
 import io
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from PIL import Image
@@ -124,8 +125,9 @@ class ScreenCapture(QObject):
             (k for k in states.keys() if k != active),
             key=lambda k: states.get(k, _WindowState()).last_seen,
         )
+        victims = deque(victims)
         while len(states) > max_items and victims:
-            states.pop(victims.pop(0), None)
+            states.pop(victims.popleft(), None)
             telemetry.record_cache_eviction("screen_window_state")
 
     def _sync_active_state(self) -> None:
@@ -191,6 +193,8 @@ class ScreenCapture(QObject):
                 if (index % 8) == 7:
                     hex_string.append(hex(decimal_value)[2:].rjust(2, '0'))
                     decimal_value = 0
+            if len(diff) % 8 != 0:
+                hex_string.append(hex(decimal_value)[2:].rjust(2, '0'))
                     
             return ''.join(hex_string)
         except Exception as e:
@@ -344,7 +348,10 @@ class ScreenCapture(QObject):
         except Exception:
             pass
 
-        img = self._screenshot()
+        # M19 FIX: Use run_in_executor to avoid blocking the async event
+        # loop with the synchronous _screenshot() OS-level screen grab.
+        loop = asyncio.get_running_loop()
+        img = await loop.run_in_executor(None, self._screenshot)
         if img is None:
             return b"", ""
 
@@ -502,6 +509,14 @@ class ScreenCapture(QObject):
                         telemetry.record_roi(w, h, source="active_window")
                         sct_img = sct.grab(bbox)
                         img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                        # M18 FIX: Apply the same downscale that the
+                        # full-screen path uses so 4K active-window
+                        # captures don't overload OCR.
+                        if img.width > self._max_w:
+                            ratio = self._max_w / img.width
+                            new_h = int(img.height * ratio)
+                            img = img.resize((self._max_w, new_h), Image.LANCZOS)
+                            telemetry.record_roi(img.width, img.height, source="downscaled_active_window")
                         return img
 
                 # Fallback: Capture the entire screen containing the cursor
@@ -557,8 +572,10 @@ class ScreenCapture(QObject):
         new = (new_text or "").strip()
         if not old:
             return bool(new)
+        # M20 FIX: Detect when screen content becomes empty (e.g.
+        # switching to desktop) so stale OCR context is cleared.
         if not new:
-            return False
+            return True
         if len(old) < 3 or len(new) < 3:
             return old != new
 

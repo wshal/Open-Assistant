@@ -4,7 +4,7 @@ C='\033[0;36m'; G='\033[0;32m'; Y='\033[1;33m'; N='\033[0m'
 
 echo -e "${C}"
 echo "╔═════════════════════════════════════════╗"
-echo "║    🧠 OpenAssist AI v3.0 — Setup        ║"
+echo "║    🧠 OpenAssist AI v1.0.0 — Setup      ║"
 echo "║    Ultimate Free AI Assistant            ║"
 echo "╚═════════════════════════════════════════╝"
 echo -e "${N}"
@@ -26,8 +26,36 @@ esac
 
 # Ollama
 echo -e "${Y}🦙 Ollama...${N}"
-command -v ollama &>/dev/null || (curl -fsSL https://ollama.com/install.sh | sh 2>/dev/null || true)
-command -v ollama &>/dev/null && ollama pull gemma3:4b 2>/dev/null &
+if ! command -v ollama &>/dev/null; then
+    case "$(uname -s)" in
+        Linux*)
+            echo "Ollama not found. Installing via the official installer..."
+            tmp_install="$(mktemp)"
+            curl -fsSL https://ollama.com/install.sh -o "$tmp_install"
+            sh "$tmp_install"
+            rm -f "$tmp_install"
+            ;;
+        Darwin*)
+            if command -v brew &>/dev/null; then
+                echo "Ollama not found. Installing via Homebrew..."
+                brew install ollama
+            else
+                echo -e "${Y}[!] Ollama is not installed and Homebrew was not found.${N}"
+                echo -e "${Y}    Install Ollama manually from https://ollama.com${N}"
+            fi
+            ;;
+        *)
+            echo -e "${Y}[!] Ollama is not installed. Please download and install it manually from https://ollama.com${N}"
+            ;;
+    esac
+fi
+
+if command -v ollama &>/dev/null; then
+    echo "Pulling model qwen2.5:7b..."
+    ollama pull qwen2.5:7b
+else
+    echo -e "${Y}[!] Skipping model pull because Ollama is unavailable.${N}"
+fi
 
 mkdir -p data/vectordb knowledge/documents logs
 [ ! -f .env ] && cp .env.example .env

@@ -139,7 +139,12 @@ class ContextStore:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             if self._path.exists():
                 raw = self._path.read_text(encoding="utf-8")
-                self._data = json.loads(raw)
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    self._data = parsed
+                else:
+                    logger.warning("ContextStore data on disk is not a dictionary, ignoring.")
+                    self._data = {"presets": {}, "last_context": ""}
         except Exception as e:
             logger.warning(f"ContextStore load failed (using defaults): {e}")
             self._data = {"presets": {}, "last_context": ""}

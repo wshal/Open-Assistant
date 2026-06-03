@@ -80,7 +80,9 @@ class AnthropicProvider(BaseProvider):
         self._pre_request()
         model = self.get_model(tier)
         t0 = time.time()
-        total_tok = 0
+        # M46 FIX: accumulate text length instead of counting chunks as tokens;
+        # prefer actual usage metadata from the final message when available.
+        accumulated_len = 0
 
         try:
             async with self.client.messages.stream(
@@ -92,8 +94,18 @@ class AnthropicProvider(BaseProvider):
             ) as stream:
                 async for text in stream.text_stream:
                     if text:
-                        total_tok += 1
+                        accumulated_len += len(text)
                         yield text
+
+            # M46 FIX: use actual token counts from the final message if available
+            try:
+                final = await stream.get_final_message()
+                if final and final.usage:
+                    total_tok = final.usage.input_tokens + final.usage.output_tokens
+                else:
+                    total_tok = max(1, accumulated_len // 4)
+            except Exception:
+                total_tok = max(1, accumulated_len // 4)
 
             self.stats.record(total_tok, time.time() - t0)
         except Exception as e:
