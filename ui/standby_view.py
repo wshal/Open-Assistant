@@ -11,9 +11,11 @@ Refined for:
 
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListView,
     QProgressBar,
     QPushButton,
     QSizePolicy,
@@ -135,6 +137,58 @@ class StandbyView(QWidget):
             padding: 9px 14px;
             font-size: 10px;
             font-weight: bold;
+        }
+    """
+
+    COMBO_STYLE = """
+        QComboBox {
+            color: #c0caff;
+            background: rgba(22, 24, 40, 180);
+            border: 1px solid rgba(99, 102, 241, 40);
+            border-radius: 10px;
+            padding: 8px 14px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        QComboBox:hover {
+            background: rgba(40, 42, 65, 220);
+            border: 1px solid rgba(129, 140, 248, 80);
+            color: #ffffff;
+        }
+        QComboBox::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 30px;
+            border-left: 1px solid rgba(99, 102, 241, 30);
+            border-top-right-radius: 10px;
+            border-bottom-right-radius: 10px;
+            background: transparent;
+        }
+        QComboBox::down-arrow {
+            image: url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMCIgaGVpZ2h0PSI2IiB2aWV3Qm94PSIwIDAgMTAgNiI+PHBhdGggZD0iTTEgMWw0IDQgNC00IiBmaWxsPSJub25lIiBzdHJva2U9IiM5NGEzYjgiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+PC9zdmc+);
+            width: 10px;
+            height: 6px;
+        }
+        QComboBox::down-arrow:hover {
+            image: url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMCIgaGVpZ2h0PSI2IiB2aWV3Qm94PSIwIDAgMTAgNiI+PHBhdGggZD0iTTEgMWw0IDQgNC00IiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmZmZmYiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+PC9zdmc+);
+        }
+        QComboBox QAbstractItemView {
+            background-color: rgba(20, 21, 38, 250);
+            border: 1px solid rgba(99, 102, 241, 60);
+            border-radius: 10px;
+            color: #c0caff;
+            selection-background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #5b4cf1, stop:1 #8b5cf6);
+            selection-color: white;
+            outline: 0px;
+        }
+        QComboBox QAbstractItemView::item {
+            min-height: 32px;
+            padding-left: 10px;
+            color: #c0caff;
+        }
+        QComboBox QAbstractItemView::item:hover {
+            background-color: rgba(99, 102, 241, 40);
+            color: white;
         }
     """
 
@@ -276,30 +330,64 @@ class StandbyView(QWidget):
 
         layout.addSpacing(16)
 
-        # ── AI MODES ─────────────────────────────────────────────────────────
-        lbl_m = QLabel("CAPTURE MODE")
+        # ── OPERATION MODE ───────────────────────────────────────────────────
+        lbl_op = QLabel("OPERATION MODE")
+        lbl_op.setStyleSheet(self._SS_SECTION)
+        lbl_op.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(lbl_op)
+
+        layout.addSpacing(10)
+
+        op_row = QHBoxLayout()
+        op_row.setSpacing(10)
+
+        self.btn_standard = QPushButton("STANDARD")
+        self.btn_standard.setCheckable(True)
+        self.btn_standard.setFixedHeight(38)
+        self.btn_standard.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_standard.clicked.connect(self._on_standard_clicked)
+        self.btn_standard.setStyleSheet(self.STYLE_ACTIVE)
+        op_row.addWidget(self.btn_standard)
+
+        self.btn_auto = QPushButton("AUTO-ANSWER")
+        self.btn_auto.setCheckable(True)
+        self.btn_auto.setFixedHeight(38)
+        self.btn_auto.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_auto.clicked.connect(self._on_auto_clicked)
+        self.btn_auto.setStyleSheet(self.STYLE_INACTIVE)
+        op_row.addWidget(self.btn_auto)
+
+        layout.addLayout(op_row)
+        layout.addSpacing(16)
+
+        # ── AI MODES (Container widget to toggle visibility) ────────────────
+        self.mode_grid_widget = QWidget()
+        self.mode_grid_widget.setStyleSheet("background: transparent;")
+        grid_layout = QVBoxLayout(self.mode_grid_widget)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.setSpacing(0)
+
+        lbl_m = QLabel("CAPTURE MODE PROFILE")
         lbl_m.setStyleSheet(self._SS_SECTION)
         lbl_m.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(lbl_m)
+        grid_layout.addWidget(lbl_m)
 
-        layout.addSpacing(14)
+        grid_layout.addSpacing(12)
 
+        self.mode_combo = QComboBox()
+        self.mode_combo.setView(QListView())
+        self.mode_combo.setStyleSheet(self.COMBO_STYLE)
+        self.mode_combo.setFixedHeight(38)
+        self.mode_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        # Populate options
         for row_data in self.MODE_OPTIONS:
-            row = QHBoxLayout()
-            row.setSpacing(10)
             for icon, name in row_data:
-                btn = QPushButton(f"{icon}  {name}")
-                btn.setCheckable(True)
-                btn.setFixedHeight(38)
-                btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                btn.clicked.connect(
-                    lambda checked=False, n=name.lower(): self._on_mode_btn_clicked(n)
-                )
-                btn.setStyleSheet(self.STYLE_INACTIVE)
-                row.addWidget(btn)
-                self.mode_buttons[name.lower()] = btn
-            layout.addLayout(row)
-            layout.addSpacing(8)
+                self.mode_combo.addItem(f"{icon}  {name}", name.lower())
+
+        self.mode_combo.currentIndexChanged.connect(self._on_combo_index_changed)
+        grid_layout.addWidget(self.mode_combo)
+        grid_layout.addSpacing(8)
 
         # ── Context chip ─────────────────────────────────────────────────────
         # Shows auto-suggested or user-active context beneath the mode grid.
@@ -308,7 +396,9 @@ class StandbyView(QWidget):
         self._ctx_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._ctx_chip.setFixedHeight(20)
         self._ctx_chip.hide()
-        layout.addWidget(self._ctx_chip)
+        grid_layout.addWidget(self._ctx_chip)
+
+        layout.addWidget(self.mode_grid_widget)
 
         layout.addSpacing(4)
 
@@ -676,20 +766,32 @@ class StandbyView(QWidget):
 
     # ── Mode / audio selection ────────────────────────────────────────────────
 
+    def _on_combo_index_changed(self, index):
+        if index < 0:
+            return
+        name = self.mode_combo.itemData(index)
+        if name:
+            logger.debug("Combo selected mode: '%s'", name)
+            self.mode_selected.emit(name)
+
     def _on_mode_btn_clicked(self, name):
+        """Kept for backward compatibility."""
         self.set_current_mode(name)
         self.mode_selected.emit(name)
 
     def set_current_mode(self, name):
-        """Force the active mode button to the highlighted style."""
+        """Force the active mode inside the combo box."""
         if not name:
             return
         target = str(name).strip().lower()
         logger.debug("Injecting Mode Highlight: '%s'", target)
-        for mode_name, btn in self.mode_buttons.items():
-            active = mode_name == target
-            btn.setChecked(active)
-            btn.setStyleSheet(self.STYLE_ACTIVE if active else self.STYLE_INACTIVE)
+        if hasattr(self, "mode_combo"):
+            self.mode_combo.blockSignals(True)
+            for i in range(self.mode_combo.count()):
+                if self.mode_combo.itemData(i) == target:
+                    self.mode_combo.setCurrentIndex(i)
+                    break
+            self.mode_combo.blockSignals(False)
 
     def _on_audio_btn_clicked(self, name):
         self.set_current_audio_source(name)
@@ -799,6 +901,20 @@ class StandbyView(QWidget):
             self.start_btn.setText("START SESSION")
             self.start_btn.setStyleSheet(self.START_BUTTON_STYLE)
 
+    def _on_standard_clicked(self):
+        app = self._resolve_app()
+        if app:
+            if app.config.get("ai.auto_mode.enabled", False):
+                app.toggle_auto_mode()
+        self.refresh_highlights()
+
+    def _on_auto_clicked(self):
+        app = self._resolve_app()
+        if app:
+            if not app.config.get("ai.auto_mode.enabled", False):
+                app.toggle_auto_mode()
+        self.refresh_highlights()
+
     # ── Boot sync ─────────────────────────────────────────────────────────────
 
     def _apply_initial_highlights(self):
@@ -807,9 +923,7 @@ class StandbyView(QWidget):
         if not self._boot_sync_logged:
             logger.info("Boot sync: mode='%s', audio='%s'", mode, audio)
             self._boot_sync_logged = True
-        self.set_current_mode(mode)
-        self.set_current_audio_source(audio)
-        self.refresh_auto_mode_hint()
+        self.refresh_highlights(mode, audio)
 
     def refresh_highlights(self, mode=None, audio=None):
         """Force refresh selection states from explicit values or resolved state."""
@@ -821,6 +935,21 @@ class StandbyView(QWidget):
         self.set_current_mode(mode or resolved_mode)
         self.set_current_audio_source(audio or resolved_audio)
         self.refresh_auto_mode_hint()
+
+        # Update Standard/Auto pills and mode grid visibility
+        app = self._resolve_app()
+        config = getattr(app, "config", None)
+        auto_enabled = bool(config.get("ai.auto_mode.enabled", False)) if config else False
+
+        if hasattr(self, "btn_auto") and hasattr(self, "btn_standard"):
+            self.btn_auto.setChecked(auto_enabled)
+            self.btn_auto.setStyleSheet(self.STYLE_ACTIVE if auto_enabled else self.STYLE_INACTIVE)
+            
+            self.btn_standard.setChecked(not auto_enabled)
+            self.btn_standard.setStyleSheet(self.STYLE_INACTIVE if auto_enabled else self.STYLE_ACTIVE)
+        
+        if hasattr(self, "mode_grid_widget"):
+            self.mode_grid_widget.setVisible(not auto_enabled)
 
     def _resolve_initial_selection(self):
         """State-first resolution of active selections. Robustly traverses parent tree to find app."""

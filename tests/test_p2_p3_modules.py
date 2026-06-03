@@ -911,5 +911,251 @@ class TestTier3DevServerIntents(unittest.TestCase):
         self.assertIsNone(result, "run in dev mode must be blocked after security hardening")
 
 
+class TestP2ASRVADCustomization(unittest.TestCase):
+    """P2: Settings tab and live VAD threshold updates."""
+
+    def test_save_vad_thresholds_applies_live(self):
+        from core.config import Config
+        from ui.settings_view import SettingsView
+        from PyQt6.QtWidgets import QApplication
+
+        # Ensure QApplication is initialized (required to instantiate QSliders)
+        app_qt = QApplication.instance() or QApplication([])
+
+        cfg = Config()
+        cfg.set("capture.audio.vad.inter_turn_start_silence_ms", 400)
+        cfg.set("capture.audio.vad.stop_silence_ms", 700)
+
+        app_mock = MagicMock()
+        app_mock.state.session_context = ""
+        audio_mock = MagicMock()
+        audio_mock.block_ms = 30
+        app_mock.audio = audio_mock
+        app_mock.config = cfg
+
+        view = SettingsView(cfg, app_mock)
+        self.assertTrue(hasattr(view, "vad_start_slider"))
+        self.assertTrue(hasattr(view, "vad_stop_slider"))
+
+        # Set new values on sliders
+        view.vad_start_slider.setValue(600)
+        view.vad_stop_slider.setValue(1500)
+
+        # Call _save_all
+        view._save_all()
+
+        # Check config values were persisted
+        self.assertEqual(cfg.get("capture.audio.vad.inter_turn_start_silence_ms"), 600)
+        self.assertEqual(cfg.get("capture.audio.vad.stop_silence_ms"), 1500)
+
+        # Check live-apply on audio mock
+        self.assertEqual(audio_mock._inter_turn_start_silence_ms, 600)
+        self.assertEqual(audio_mock._inter_turn_start_silence_blocks, 20)
+        audio_mock.set_vad_silence_ms.assert_called_with(1500)
+
+
+class TestP2FallbackModelRouter(unittest.TestCase):
+    """P2: Fallback routing to local Ollama on cloud HTTP 429/503 errors."""
+
+    def test_rate_limit_or_unavailable_error_detection(self):
+        from ai.engine import AIEngine
+        engine = AIEngine(MagicMock(), MagicMock())
+
+        self.assertTrue(engine._is_rate_limit_or_unavailable_error(Exception("429 rate limit reached")))
+        self.assertTrue(engine._is_rate_limit_or_unavailable_error(Exception("HTTP error 503 service unavailable")))
+        self.assertTrue(engine._is_rate_limit_or_unavailable_error(Exception("groq: overloaded")))
+        self.assertFalse(engine._is_rate_limit_or_unavailable_error(Exception("connection timeout")))
+        self.assertFalse(engine._is_rate_limit_or_unavailable_error(Exception("invalid API key")))
+
+    def test_dynamic_fallback_routes_to_ollama_on_429(self):
+        from ai.engine import AIEngine
+        from core.config import Config
+
+        cfg = Config()
+        cfg.set("ai.providers.groq.enabled", True)
+        cfg.set("ai.providers.ollama.enabled", True)
+
+        engine = AIEngine(cfg, MagicMock())
+
+        groq_mock = MagicMock()
+        groq_mock.name = "groq"
+        groq_mock.enabled = True
+        groq_mock.is_available.return_value = True
+        groq_mock.check_rate.return_value = True
+        
+        async def fake_stream(*args, **kwargs):
+            raise Exception("HTTP 429 Too Many Requests")
+            yield "unused"
+        groq_mock.generate_stream = fake_stream
+
+        ollama_mock = MagicMock()
+        ollama_mock.name = "ollama"
+        ollama_mock.enabled = True
+        ollama_mock.is_available.return_value = True
+        ollama_mock.check_rate.return_value = True
+        
+        async def fake_ollama_stream(*args, **kwargs):
+            yield "ollama answer"
+        ollama_mock.generate_stream = fake_ollama_stream
+
+        engine._providers = {"groq": groq_mock, "ollama": ollama_mock}
+        cfg.set("ai.text.preferred_providers", ["groq", "ollama"])
+
+        emitted_chunks = []
+        engine.response_chunk.connect(emitted_chunks.append)
+        errors = []
+        engine.error_occurred.connect(errors.append)
+
+        async def run_gen():
+            await engine.generate_response("hello", {"recent_audio": "", "full_audio_history": "", "latest_ocr": ""}, origin="manual")
+
+        _run(run_gen())
+
+        # Ollama should have been dynamically prioritized and stream should succeed
+        self.assertEqual(emitted_chunks, ["ollama answer"])
+        self.assertEqual(errors, [])
+
+    def test_fallback_skips_down_providers(self):
+        from ai.engine import AIEngine
+        from core.config import Config
+
+        cfg = Config()
+        cfg.set("ai.providers.groq.enabled", True)
+        cfg.set("ai.providers.gemini.enabled", True)
+        cfg.set("ai.providers.ollama.enabled", True)
+
+        engine = AIEngine(cfg, MagicMock())
+
+        groq_mock = MagicMock()
+        groq_mock.name = "groq"
+        groq_mock.enabled = True
+        groq_mock.is_available.return_value = True
+        groq_mock.check_rate.return_value = True
+        groq_mock.is_disabled.return_value = False
+        
+        async def fake_groq_stream(*args, **kwargs):
+            raise Exception("connection timeout")
+            yield "unused"
+        groq_mock.generate_stream = fake_groq_stream
+
+        gemini_mock = MagicMock()
+        gemini_mock.name = "gemini"
+        gemini_mock.enabled = True
+        gemini_mock.is_available.return_value = True
+        gemini_mock.check_rate.return_value = True
+        gemini_mock.is_disabled.return_value = False
+        
+        async def fake_gemini_stream(*args, **kwargs):
+            yield "gemini answer"
+        gemini_mock.generate_stream = fake_gemini_stream
+
+        ollama_mock = MagicMock()
+        ollama_mock.name = "ollama"
+        ollama_mock.enabled = True
+        ollama_mock.is_available.return_value = True
+        ollama_mock.check_rate.return_value = True
+        ollama_mock.is_disabled.return_value = False
+        
+        async def fake_ollama_stream(*args, **kwargs):
+            yield "ollama answer"
+        ollama_mock.generate_stream = fake_ollama_stream
+
+        engine._providers = {"groq": groq_mock, "gemini": gemini_mock, "ollama": ollama_mock}
+        cfg.set("ai.text.preferred_providers", ["groq", "gemini", "ollama"])
+
+        # Mark gemini down in the health cache
+        engine._provider_health_cache = {
+            "gemini": {"state": "down", "reason": "Bad API key", "updated_at": 1234}
+        }
+
+        emitted_chunks = []
+        engine.response_chunk.connect(emitted_chunks.append)
+        errors = []
+        engine.error_occurred.connect(errors.append)
+
+        async def run_gen():
+            await engine.generate_response("hello", {"recent_audio": "", "full_audio_history": "", "latest_ocr": ""}, origin="manual")
+
+        _run(run_gen())
+
+        # Gemini should be skipped, routing directly to Ollama
+        self.assertEqual(emitted_chunks, ["ollama answer"])
+        self.assertEqual(errors, [])
+
+
+class TestStandbyViewPills(unittest.TestCase):
+    """P2: Standby view mode pills and visibility sync."""
+
+    def test_standby_mode_pills_reflect_config_and_toggle(self):
+        from ui.standby_view import StandbyView
+        from core.config import Config
+        from PyQt6.QtWidgets import QApplication, QWidget
+
+        # Ensure QApplication is initialized
+        app_qt = QApplication.instance() or QApplication([])
+
+        cfg = Config()
+        cfg.set("ai.auto_mode.enabled", False)
+
+        app_mock = MagicMock()
+        app_mock.config = cfg
+        app_mock.state = MagicMock()
+        app_mock.state.mode = "general"
+        app_mock.state.audio_source = "system"
+
+        class DummyParent(QWidget):
+            def __init__(self):
+                super().__init__()
+                self.app = app_mock
+
+        parent_widget = DummyParent()
+        view = StandbyView(parent_widget)
+        self.assertTrue(hasattr(view, "btn_standard"))
+        self.assertTrue(hasattr(view, "btn_auto"))
+        self.assertTrue(hasattr(view, "mode_grid_widget"))
+        self.assertTrue(hasattr(view, "mode_combo"))
+
+        # Check dropdown items
+        combo_items = [view.mode_combo.itemData(i) for i in range(view.mode_combo.count())]
+        self.assertIn("general", combo_items)
+        self.assertIn("interview", combo_items)
+        self.assertIn("coding", combo_items)
+        self.assertIn("meeting", combo_items)
+
+        # Check signal emission when selection changes
+        emitted_modes = []
+        view.mode_selected.connect(emitted_modes.append)
+        view.mode_combo.setCurrentIndex(1)  # should select interview
+        self.assertIn("interview", emitted_modes)
+
+        # 1. Standard mode active (ai.auto_mode.enabled = False)
+        cfg.set("ai.auto_mode.enabled", False)
+        view.refresh_highlights()
+        self.assertTrue(view.btn_standard.isChecked())
+        self.assertFalse(view.btn_auto.isChecked())
+        self.assertFalse(view.mode_grid_widget.isHidden())
+
+        # 2. Auto mode active (ai.auto_mode.enabled = True)
+        cfg.set("ai.auto_mode.enabled", True)
+        view.refresh_highlights()
+        self.assertFalse(view.btn_standard.isChecked())
+        self.assertTrue(view.btn_auto.isChecked())
+        self.assertTrue(view.mode_grid_widget.isHidden())
+
+        # 3. Test clicks
+        app_mock.toggle_auto_mode = MagicMock()
+        
+        # When clicking standard, it should toggle off if it was enabled
+        cfg.set("ai.auto_mode.enabled", True)
+        view._on_standard_clicked()
+        app_mock.toggle_auto_mode.assert_called_once()
+        
+        # When clicking auto, it should toggle on if it was disabled
+        app_mock.toggle_auto_mode.reset_mock()
+        cfg.set("ai.auto_mode.enabled", False)
+        view._on_auto_clicked()
+        app_mock.toggle_auto_mode.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
