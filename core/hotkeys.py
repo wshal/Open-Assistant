@@ -29,10 +29,17 @@ class NativeHotkeyThread(threading.Thread):
         self.thread_id = None
         self._registered_ids = []
         self.WM_HOTKEY = 0x0312
+        self._started_event = threading.Event()
 
     def run(self):
-        self.thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
         user32 = ctypes.windll.user32
+        msg = wintypes.MSG()
+        # Force Win32 message queue creation on this thread if available (for tests using stubs)
+        if hasattr(user32, "PeekMessageW"):
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+
+        self.thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+        self._started_event.set()
 
         # AGGRESSIVE CLEANUP: Flush all potential IDs (100-200) to ensure a clean slate
         # NOTE: RegisterHotKey is thread-specific, but we clean up to be safe.
@@ -66,23 +73,28 @@ class NativeHotkeyThread(threading.Thread):
                     )
                 current_id += 1
 
-        msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
             if msg.message == self.WM_HOTKEY:
                 self.manager._handle_native_trigger(msg.wParam)
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
-    def stop(self):
-        # Unregister all before dying
-        user32 = ctypes.windll.user32
+        # Windows-native UnregisterHotKey must run on the same thread that registered them.
         for hid in self._registered_ids:
             user32.UnregisterHotKey(None, hid)
-            
-        if self.thread_id:
-            # Post WM_QUIT to exit the GetMessage loop
-            ctypes.windll.user32.PostThreadMessageW(self.thread_id, 0x0012, 0, 0)
-            logger.debug("🛑 Native Hotkey thread termination signal sent")
+        logger.debug("Native Hotkey thread clean unregistration completed")
+
+    def stop(self):
+        if self.is_alive():
+            # Wait for thread loop initialization so thread_id is guaranteed to be set
+            self._started_event.wait(timeout=0.5)
+            if self.thread_id:
+                # Post WM_QUIT to exit the GetMessage loop
+                # S-1: Validate that PostThreadMessage actually succeeded.
+                if ctypes.windll.user32.PostThreadMessageW(self.thread_id, 0x0012, 0, 0):
+                    logger.debug("🛑 Native Hotkey thread termination signal sent")
+                else:
+                    logger.warning("Native Hotkey thread termination signal failed to post")
 
 
 class HotkeyManager:

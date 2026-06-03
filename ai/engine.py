@@ -40,6 +40,7 @@ class AIEngine(QObject):
     background_complete = pyqtSignal(str, str)  # (query, response)
     error_occurred = pyqtSignal(str)
     provider_status = pyqtSignal(dict)  # Emits health for UI dashboard
+    provider_selected = pyqtSignal(str)  # Emits active provider ID (e.g. "groq", "gemini", "ollama", "cache", etc.)
 
     def __init__(self, config, history: ResponseHistory, rag=None, mode_manager=None):
         super().__init__()
@@ -682,6 +683,7 @@ class AIEngine(QObject):
         RESTORED: Main async generation task.
         Control flow managed by the App Master Loop.
         """
+        self.provider_selected.emit("AUTO")
         cancel_token = 0
         if not bg_mode:
             cancel_token = self._begin_foreground_generation()
@@ -823,6 +825,7 @@ class AIEngine(QObject):
                         "had_rag": False,
                     },
                 )
+                self.provider_selected.emit("CACHE")
                 for ch in self._chunk_response(cached.response, chunk_size=8):
                     if _cancelled():
                         return
@@ -881,14 +884,33 @@ class AIEngine(QObject):
             )
 
             try:
-                full_response = await self._parallel.generate(
+                full_response = ""
+                winning_provider = "parallel"
+                async for provider_name, chunk in self._parallel.generate_stream(
                     sys_prompt, user_msg, task=mode_id
-                )
+                ):
+                    if _cancelled():
+                        return
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                        winning_provider = provider_name
+                        self.provider_selected.emit(provider_name)
+
+                    full_response += chunk
+                    if not bg_mode:
+                        self._emit_response_chunk_for_turn(chunk, turn_id=current_turn_id, bg_mode=bg_mode)
 
                 if _cancelled():
                     return
 
                 latency_ms = (time.time() - start_time) * 1000
+                stage_timings_p = {
+                    **stage_timings,
+                    "request_to_complete_ms": (time.time() - request_started_at) * 1000,
+                }
+                if first_token_time is not None:
+                    stage_timings_p["request_to_first_token_ms"] = (first_token_time - start_time) * 1000
+
                 self.history.add(
                     query,
                     full_response,
@@ -897,31 +919,13 @@ class AIEngine(QObject):
                     latency=latency_ms,
                     metadata={
                         "background": bg_mode,
-                        "stage_timings": {
-                            **stage_timings,
-                            "request_to_complete_ms": (time.time() - request_started_at) * 1000,
-                        },
+                        "stage_timings": stage_timings_p,
                         "request_metadata": request_metadata,
+                        "had_screen": bool((screen_context or "").strip()),
+                        "had_audio": bool((audio_context or "").strip()),
+                        "had_rag": False,
                     },
                 )
-
-                # P0.4 FIX: Emit chunks so the UI shows streaming feedback.
-                # Parallel returns a full string — stream it in word-level batches
-                # (~50 chars each) so append_response() fires and the user sees
-                # text appearing progressively rather than a blank-then-flash.
-                words = full_response.split(" ")
-                batch, batch_size = [], 50
-                for word in words:
-                    batch.append(word)
-                    chunk = " ".join(batch) + " "
-                    if len(chunk) >= batch_size:
-                        if not bg_mode:
-                            self._emit_response_chunk_for_turn(chunk, turn_id=current_turn_id, bg_mode=bg_mode)
-                        batch = []
-                        await asyncio.sleep(0)  # yield to event loop between batches
-                if batch:
-                    if not bg_mode:
-                        self._emit_response_chunk_for_turn(" ".join(batch), turn_id=current_turn_id, bg_mode=bg_mode)
 
                 if not bg_mode:
                     self._emit_response_complete_for_turn(full_response, turn_id=current_turn_id, bg_mode=bg_mode)
@@ -1238,13 +1242,25 @@ class AIEngine(QObject):
             generation_succeeded = False
             provider_retry_timeouts_ms = {}
 
-            # Build a fallback queue: preferred list minus already-selected primary
-            fallback_queue = [
-                pid for pid in preferred_providers
-                if pid != provider.name
-                and pid in self._providers
-                and getattr(self._providers[pid], "enabled", False)
-            ]
+            # Build a fallback queue: preferred list minus already-selected primary, filtered by live health
+            fallback_queue = []
+            for pid in preferred_providers:
+                if pid == provider.name or pid not in self._providers:
+                    continue
+                prov = self._providers[pid]
+                if not getattr(prov, "enabled", False):
+                    continue
+                
+                # Check live health status from standby/background validations
+                health = self._provider_health_cache.get(pid, {})
+                if health.get("state") == "down":
+                    logger.info(
+                        f"AI: Skipping '{pid}' in fallback queue because it is marked down "
+                        f"(reason: {health.get('reason', 'unknown')})"
+                    )
+                    continue
+                
+                fallback_queue.append(pid)
 
             current_provider = provider
             while True:
@@ -1272,6 +1288,7 @@ class AIEngine(QObject):
                             stage_timings["request_to_first_token_ms"] = (
                                 first_token_time - request_started_at
                             ) * 1000
+                            self.provider_selected.emit(current_provider.name)
                         if not bg_mode:
                             self._emit_response_chunk_for_turn(chunk, turn_id=current_turn_id, bg_mode=bg_mode)
                     generation_succeeded = True
@@ -1304,6 +1321,18 @@ class AIEngine(QObject):
                     self._maybe_cooldown_provider(current_provider, stream_err)
                     self._mark_provider_failed_for_session(current_provider.name)
                     full_response = ""  # Discard any partial output
+
+                    # Fallback Model Router: Shifting to local Ollama on 429/503 errors
+                    if current_provider.name != "ollama" and self._is_rate_limit_or_unavailable_error(stream_err):
+                        ollama_provider = self._providers.get("ollama")
+                        if ollama_provider and getattr(ollama_provider, "enabled", False):
+                            if "ollama" in fallback_queue:
+                                fallback_queue.remove("ollama")
+                            fallback_queue.insert(0, "ollama")
+                            logger.info(
+                                f"AI: Detected 429/503 error on cloud provider '{current_provider.name}'. "
+                                f"Dynamically routing next fallback to local Ollama."
+                            )
 
                     while fallback_queue and fallback_queue[0] in self._session_failed_providers:
                         fallback_queue.pop(0)
@@ -1672,6 +1701,7 @@ class AIEngine(QObject):
                     return ""
                 if first_token_time is None:
                     first_token_time = time.time()
+                    self.provider_selected.emit(provider.name)
                 full_response += chunk
                 self.response_chunk.emit(chunk)
 
@@ -2362,6 +2392,14 @@ class AIEngine(QObject):
         if complexity == "reasoning":
             return ["gemini", "groq", "cerebras", "together", "ollama"]
         return list(self._provider_priority)
+
+    def _is_rate_limit_or_unavailable_error(self, err: Exception) -> bool:
+        err_str = str(err).lower()
+        if "429" in err_str or "rate_limit" in err_str or "rate limit" in err_str or "too many requests" in err_str:
+            return True
+        if "503" in err_str or "service_unavailable" in err_str or "service unavailable" in err_str or "overloaded" in err_str or "502" in err_str or "bad gateway" in err_str or "unavailable" in err_str:
+            return True
+        return False
 
     def _select_provider(self, mode, complexity: str, preferred: List[str], strict_preferred: bool = False):
         """

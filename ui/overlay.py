@@ -112,7 +112,6 @@ class OverlayWindow(QMainWindow):
         # Reduce header clutter during an active session.
         if hasattr(self, "btn_timeline"):
             self.btn_timeline.setVisible(False)
-        self.set_analysis_provider_badge()
         self.update_audio_state(self.app.state.is_muted)
         self.update_auto_mode_state(
             bool(self.config.get("ai.auto_mode.enabled", False)),
@@ -135,7 +134,6 @@ class OverlayWindow(QMainWindow):
             self.btn_timeline.setVisible(True)
         self._session_timer.stop()
         self.session_timer.setText("00:00")
-        self.set_analysis_provider_badge()
 
         # Reset standby subtitle so user knows the slate is clean and ready
         if hasattr(self, "standby_view"):
@@ -401,12 +399,6 @@ class OverlayWindow(QMainWindow):
         tl.addWidget(self.transcript_lbl)
         cv_layout.addWidget(self.transcript_bar)
 
-        self.analysis_badge = QLabel("")
-        self.analysis_badge.setVisible(False)
-        self.analysis_badge.setStyleSheet(
-            "background: rgba(56,189,248,30); color: #7dd3fc; border: 1px solid rgba(56,189,248,76); border-radius: 10px; padding: 5px 9px; margin: 0 5px 2px 5px; font-size: 10px; font-weight: 700;"
-        )
-        cv_layout.addWidget(self.analysis_badge)
 
         self.input = QLineEdit()
         self.input.setPlaceholderText("Ask about the live session or use Analyze Screen...")
@@ -927,19 +919,13 @@ class OverlayWindow(QMainWindow):
     def set_analysis_provider_badge(self, provider: str = None, pending: bool = False):
         if pending:
             self._start_analyze_button_animation()
-            self.analysis_badge.setText("Analyzing screen...")
-            self.analysis_badge.setVisible(True)
             return
 
         if provider:
             self._show_analyze_button_success()
-            self.analysis_badge.setText(f"Analyzed via {provider.capitalize()}")
-            self.analysis_badge.setVisible(True)
             return
 
         self._stop_analyze_button_animation()
-        self.analysis_badge.clear()
-        self.analysis_badge.setVisible(False)
 
     def update_audio_state(self, muted):
         self.audio_status.setText("🔇" if muted else "🎙️")
@@ -1300,7 +1286,7 @@ class OverlayWindow(QMainWindow):
         if enabled:
             self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
             self.box.setStyleSheet(
-                "#box { background: rgba(12,12,25,100); border: 1px solid rgba(80,85,255,10); border-radius: 14px; }"
+                "#box { background: rgba(12,12,25,100); border: 1px solid #8b5cf6; border-radius: 14px; }"
             )
             self.response_area.setStyleSheet(
                 "background: transparent; color: rgba(208,208,232,150); border: none; font-size: 13px;"
@@ -1318,6 +1304,7 @@ class OverlayWindow(QMainWindow):
         # Use app.mini_mode check to prevent showing the hidden "Max" window when in mini mode
         if not self.app.mini_mode and self.isVisible():
             self.show()
+
 
     def scroll_up(self):
         sb = self.response_area.verticalScrollBar()

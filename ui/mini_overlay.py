@@ -620,8 +620,14 @@ class MiniOverlay(QMainWindow):
     def set_click_through(self, enabled: bool):
         if enabled:
             self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
+            self.bar.setStyleSheet(
+                "background: rgba(20,20,35,100); border: 1px solid #8b5cf6; border-radius: 24px;"
+            )
         else:
             self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, False)
+            self.bar.setStyleSheet(
+                "background: rgba(20,20,35,250); border: 1px solid rgba(80,80,150,80); border-radius: 24px;"
+            )
 
         # Only refresh if we are the currently active HUD mode to prevent hidden window popups
         if self.app.mini_mode and self.isVisible():

@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QComboBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QSlider,
     QScrollArea, QFrame, QMessageBox
 )
 from PyQt6.QtCore import Qt, QMetaObject, Q_ARG
@@ -177,6 +177,113 @@ class CaptureTabMixin:
         sep3.setFixedHeight(1)
         sep3.setStyleSheet("background: rgba(255,255,255,12);")
         l.addWidget(sep3)
+
+        # VAD sliders
+        lbl_vad_start = self._make_section_label("VAD START SILENCE THRESHOLD")
+        l.addWidget(lbl_vad_start)
+
+        vad_start_row = QHBoxLayout()
+        self.vad_start_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vad_start_slider.setRange(100, 2000)
+        self.vad_start_slider.setSingleStep(50)
+        self.vad_start_slider.setPageStep(200)
+        self.vad_start_slider.setValue(
+            int(self.config.get("capture.audio.vad.inter_turn_start_silence_ms", 400))
+        )
+        self.vad_start_slider.setStyleSheet(
+            """
+            QSlider::groove:horizontal {
+                background: rgba(255,255,255,20);
+                height: 6px;
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #6366f1;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: white;
+                width: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+            }
+            """
+        )
+        self.vad_start_value = QLabel(f"{self.vad_start_slider.value()}ms")
+        self.vad_start_value.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; font-weight: 700; background: transparent;"
+        )
+        self.vad_start_slider.valueChanged.connect(
+            lambda val: self.vad_start_value.setText(f"{val}ms")
+        )
+        vad_start_row.addWidget(self.vad_start_slider, 1)
+        vad_start_row.addWidget(self.vad_start_value)
+        l.addLayout(vad_start_row)
+
+        desc_vad_start = QLabel(
+            "Controls the delay (in milliseconds) before the microphone begins listening for speech after a response is complete."
+        )
+        desc_vad_start.setWordWrap(True)
+        desc_vad_start.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+        l.addWidget(desc_vad_start)
+
+        sep_vad = QFrame()
+        sep_vad.setFixedHeight(1)
+        sep_vad.setStyleSheet("background: rgba(255,255,255,12);")
+        l.addWidget(sep_vad)
+
+        lbl_vad_stop = self._make_section_label("VAD STOP SILENCE THRESHOLD")
+        l.addWidget(lbl_vad_stop)
+
+        vad_stop_row = QHBoxLayout()
+        self.vad_stop_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vad_stop_slider.setRange(200, 3000)
+        self.vad_stop_slider.setSingleStep(100)
+        self.vad_stop_slider.setPageStep(300)
+        self.vad_stop_slider.setValue(
+            int(self.config.get("capture.audio.vad.stop_silence_ms", 700))
+        )
+        self.vad_stop_slider.setStyleSheet(
+            """
+            QSlider::groove:horizontal {
+                background: rgba(255,255,255,20);
+                height: 6px;
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #10b981;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: white;
+                width: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+            }
+            """
+        )
+        self.vad_stop_value = QLabel(f"{self.vad_stop_slider.value()}ms")
+        self.vad_stop_value.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; font-weight: 700; background: transparent;"
+        )
+        self.vad_stop_slider.valueChanged.connect(
+            lambda val: self.vad_stop_value.setText(f"{val}ms")
+        )
+        vad_stop_row.addWidget(self.vad_stop_slider, 1)
+        vad_stop_row.addWidget(self.vad_stop_value)
+        l.addLayout(vad_stop_row)
+
+        desc_vad_stop = QLabel(
+            "Controls the amount of silence (in milliseconds) required before the app determines that speech has ended and triggers an AI response."
+        )
+        desc_vad_stop.setWordWrap(True)
+        desc_vad_stop.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+        l.addWidget(desc_vad_stop)
+
+        sep_vad2 = QFrame()
+        sep_vad2.setFixedHeight(1)
+        sep_vad2.setStyleSheet("background: rgba(255,255,255,12);")
+        l.addWidget(sep_vad2)
 
         lbl2 = self._make_section_label("VISION ENGINE")
         l.addWidget(lbl2)

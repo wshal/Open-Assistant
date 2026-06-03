@@ -1519,15 +1519,17 @@ class OpenAssistApp(QObject):
             if hasattr(ai.detector, "set_sensitivity"):
                 ai.detector.set_sensitivity(profile.detector_sensitivity)
 
-        # Propagate VAD silence window from the mode profile — live, no restart
+        # Propagate VAD silence window from the mode profile (or config override) — live, no restart
+        custom_stop = self.config.get("capture.audio.vad.stop_silence_ms")
+        effective_vad = custom_stop if custom_stop is not None else profile.vad_silence_ms
         if hasattr(self.audio, "set_vad_silence_ms"):
-            self.audio.set_vad_silence_ms(profile.vad_silence_ms)
+            self.audio.set_vad_silence_ms(effective_vad)
 
         logger.info(
             f"🔄 Mode Switched: {mode.upper()} | "
             f"ollama_hint={profile.ollama_model_hint} | "
             f"sensitivity={profile.detector_sensitivity:.2f} | "
-            f"vad={profile.vad_silence_ms}ms"
+            f"vad={effective_vad}ms"
         )
 
         # ── Context auto-suggest ─────────────────────────────────────────────

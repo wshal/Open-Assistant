@@ -239,8 +239,13 @@ class OCREngine:
         if img.width < 420 or img.height < 180:
             return None
 
-        left = min(max(0, self._editor_left_crop_px), max(0, img.width - 80))
-        top = min(max(0, self._editor_top_crop_px), max(0, img.height - 80))
+        # Calculate adaptive offsets: e.g. 5% left margin, 8% top margin
+        # Respect custom overrides in config if user has modified them (not default 70/60)
+        left_target = int(img.width * 0.05) if self._editor_left_crop_px == 70 else self._editor_left_crop_px
+        top_target = int(img.height * 0.08) if self._editor_top_crop_px == 60 else self._editor_top_crop_px
+
+        left = min(max(0, left_target), max(0, img.width - 80))
+        top = min(max(0, top_target), max(0, img.height - 80))
         # Bug 8 fix: use `or` — a single non-zero axis (e.g. title-bar only) is a valid crop
         if left <= 0 and top <= 0:
             return None

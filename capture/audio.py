@@ -1842,6 +1842,7 @@ class AudioCapture(QObject):
         speech_buffer = []
         is_speaking = False
         silence_count = 0
+        voiced_confirm_count = 0
         speech_started_at = None
         utterance_started_at = None
         utterance_id = ""
@@ -1921,7 +1922,6 @@ class AudioCapture(QObject):
                     # If we exited due to deadline-while-speaking, fall through and
                     # process this block normally so we don't drop the user's words.
 
-
             # Speech detection:
             # - Prefer Silero VAD when available.
             # - Fall back to WebRTC VAD, then RMS.
@@ -1929,41 +1929,59 @@ class AudioCapture(QObject):
             floor_ok = self._passes_speech_rms_gate(rms, is_speaking=is_speaking)
             has_speech = raw_has_speech and floor_ok
 
+            # Online adaptation of the noise floor when not speaking and VAD is silent.
+            # Only update if the calibration phase has finished.
+            if not is_speaking and not raw_has_speech:
+                if self._dynamic_rms_floor > 0.0:
+                    # Slow exponential moving average (EMA)
+                    alpha = 0.95 if rms > self._dynamic_rms_floor else 0.99
+                    # Max out at a safe limit to avoid swallowing quiet speech
+                    target_floor = min(rms, 0.015)
+                    self._dynamic_rms_floor = alpha * self._dynamic_rms_floor + (1 - alpha) * target_floor
+                    # Enforce minimum threshold
+                    self._dynamic_rms_floor = max(self._dynamic_rms_floor, 0.001)
+
             if has_speech or is_speaking:
                 speech_buffer.append(data)
             elif not is_speaking:
                 # Not yet speaking — keep this block as potential pre-roll.
                 pre_roll.append(data)
+
             if has_speech:
-                silence_count = 0
                 if not is_speaking:
-                    utterance_id = self._next_trace_utterance_id()
-                    logger.debug(
-                        "Audio: Speech started (raw=%s, rms=%.5f, backend=%s)",
-                        raw_has_speech,
-                        rms,
-                        backend,
-                    )
-                    logger.info(
-                        "[%s] SPEECH DETECTED | elapsed=%.1fms | utterance=%s | backend=%s | rms=%.5f",
-                        self._trace_session_id or "audio",
-                        self._trace_elapsed_ms(),
-                        utterance_id,
-                        backend,
-                        rms,
-                    )
-                    # Prepend pre-roll blocks so Whisper sees the onset context.
-                    if pre_roll:
-                        speech_buffer = list(pre_roll) + speech_buffer
-                        pre_roll.clear()
-                    speech_started_at = time.time()
-                    utterance_started_at = speech_started_at
-                    self._last_interim_at = 0.0
-                    self._interim_epoch += 1
-                    utterance_vad_backend = backend
-                    had_mid_utterance_slice = False
-                is_speaking = True
-                if self._max_utterance_exceeded(utterance_started_at):
+                    voiced_confirm_count += 1
+                    if voiced_confirm_count >= self._required_start_confirm_blocks():
+                        is_speaking = True
+                        utterance_id = self._next_trace_utterance_id()
+                        logger.debug(
+                            "Audio: Speech started (raw=%s, rms=%.5f, backend=%s, confirmed_blocks=%d)",
+                            raw_has_speech,
+                            rms,
+                            backend,
+                            voiced_confirm_count,
+                        )
+                        logger.info(
+                            "[%s] SPEECH DETECTED | elapsed=%.1fms | utterance=%s | backend=%s | rms=%.5f",
+                            self._trace_session_id or "audio",
+                            self._trace_elapsed_ms(),
+                            utterance_id,
+                            backend,
+                            rms,
+                        )
+                        # Prepend pre-roll blocks so Whisper sees the onset context.
+                        if pre_roll:
+                            speech_buffer = list(pre_roll) + speech_buffer
+                            pre_roll.clear()
+                        speech_started_at = time.time()
+                        utterance_started_at = speech_started_at
+                        self._last_interim_at = 0.0
+                        self._interim_epoch += 1
+                        utterance_vad_backend = backend
+                        had_mid_utterance_slice = False
+                else:
+                    silence_count = 0
+
+                if is_speaking and self._max_utterance_exceeded(utterance_started_at):
                     (
                         speech_buffer,
                         is_speaking,
@@ -1980,6 +1998,7 @@ class AudioCapture(QObject):
                         reason="continuous-speech",
                         utterance_id=utterance_id,
                     )
+                    voiced_confirm_count = 0
                     utterance_id = ""
                     pre_roll.clear()
                     continue
@@ -2111,6 +2130,7 @@ class AudioCapture(QObject):
                     )
                     speech_buffer = []
                     is_speaking = False
+                    voiced_confirm_count = 0
                     silence_count = 0
                     speech_started_at = None
                     utterance_started_at = None
@@ -2140,8 +2160,11 @@ class AudioCapture(QObject):
                         reason="silence-tail",
                         utterance_id=utterance_id,
                     )
+                    voiced_confirm_count = 0
                     utterance_id = ""
                     pre_roll.clear()
+            else:
+                voiced_confirm_count = 0
 
             # Best-effort interim transcription while speaking (never blocks VAD loop).
             if (

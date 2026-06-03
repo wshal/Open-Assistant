@@ -88,6 +88,10 @@ class ParallelStub:
     async def generate(self, system, user, task="general", tier=None):
         return "parallel answer"
 
+    async def generate_stream(self, system, user, task="general", tier=None):
+        yield "groq", "parallel "
+        yield "groq", "answer"
+
 
 class ProviderStub:
     enabled = True
@@ -1147,6 +1151,79 @@ class AudioCaptureLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(speech_started_at)
         self.assertEqual(vad_meta["vad_backend"], "webrtc")
         self.assertEqual(vad_meta["end_silence_ms"], 0)
+
+    def test_process_loop_requires_consecutive_start_confirm_blocks(self):
+        import queue
+        audio = AudioCapture(ConfigStub({}))
+        audio._ambient_calib_remaining = 0
+        audio._required_start_confirm_blocks = lambda: 3
+        
+        # Test case: feed blocks of speech, silence, speech, speech.
+        # Since the silence resets the confirm count, speaking should not start.
+        blocks_data = [
+            (True, 0.02),
+            (False, 0.001),
+            (True, 0.02),
+            (True, 0.02),
+        ]
+        
+        detected_states = []
+        def fake_detect_speech(block, rms):
+            idx = len(detected_states)
+            has_speech = blocks_data[idx][0]
+            detected_states.append(has_speech)
+            return has_speech, "webrtc"
+            
+        audio._detect_speech = fake_detect_speech
+        audio._passes_speech_rms_gate = lambda rms, is_speaking: True
+        audio._next_trace_utterance_id = Mock(return_value="utt_test")
+        
+        class MockQueue:
+            def __init__(self):
+                self.count = 0
+            def get(self, timeout=None):
+                if self.count < len(blocks_data):
+                    val = np.zeros((audio.block_size,), dtype=np.float32)
+                    self.count += 1
+                    return val
+                audio._running = False
+                raise queue.Empty()
+                
+        audio.q = MockQueue()
+        audio._running = True
+        
+        audio._process_loop()
+        audio._next_trace_utterance_id.assert_not_called()
+
+    def test_process_loop_dynamic_noise_floor_ema_adaptation(self):
+        import queue
+        audio = AudioCapture(ConfigStub({}))
+        audio._ambient_calib_remaining = 0
+        audio._dynamic_rms_floor = 0.010
+        
+        audio._detect_speech = lambda block, rms: (False, "webrtc")
+        audio._passes_speech_rms_gate = lambda rms, is_speaking: True
+        
+        class MockQueueWithRms:
+            def __init__(self):
+                self.count = 0
+            def get(self, timeout=None):
+                if self.count < 1:
+                    # Rms of ones * 0.002 is 0.002
+                    val = np.ones((audio.block_size,), dtype=np.float32) * 0.002
+                    self.count += 1
+                    return val
+                audio._running = False
+                raise queue.Empty()
+                
+        audio.q = MockQueueWithRms()
+        audio._running = True
+        
+        audio._process_loop()
+        # Alpha is 0.99 since rms < dynamic_rms_floor.
+        # target = min(0.002, 0.015) = 0.002.
+        # New floor = 0.99 * 0.010 + 0.01 * 0.002 = 0.00992.
+        self.assertAlmostEqual(audio._dynamic_rms_floor, 0.00992, places=6)
 
     def test_chunked_short_tail_flushes_accumulated_final_instead_of_dropping(self):
         audio = AudioCapture(ConfigStub({}))

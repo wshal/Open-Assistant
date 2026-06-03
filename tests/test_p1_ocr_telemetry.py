@@ -45,7 +45,7 @@ class OCREngineSingleBackendTests(unittest.TestCase):
             Image.new("RGB", (800, 300), "#0f172a"),
             "VS Code - Open Assist\n1\n2\n3\nconst ready = true;",
         )
-        self.assertEqual(crop, (70, 60, 800, 300))
+        self.assertEqual(crop, (40, 24, 800, 300))
 
     def test_noise_penalty_prefers_cropped_text_without_window_chrome(self):
         engine = OCREngine(ConfigStub())
