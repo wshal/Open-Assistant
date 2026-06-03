@@ -623,9 +623,9 @@ class AudioCapture(QObject):
         """
         try:
             import torch
-            if not torch.cuda.is_available():
+            if not hasattr(torch, "cuda") or not torch.cuda.is_available():
                 return "cpu", "int8", 0.0, ""
-        except ImportError:
+        except Exception:
             return "cpu", "int8", 0.0, ""
 
         # Try to get free VRAM via pynvml (most accurate)
