@@ -2732,11 +2732,11 @@ class AIEngine(QObject):
         }
         for pid, prov in list(self._providers.items()):
             cached = self._provider_health_cache.get(pid, {})
-            state = str(cached.get("state", "active") or "active")
+            state = str(cached.get("state", "configured") or "configured")
             info = {
                 "state": state,
                 "selected": pid == self._active_provider_id,
-                "usable": state in {"active", "cooldown", "configured"},  # M4 FIX: match line ~521
+                "usable": state in {"active", "cooldown", "configured"},
             }
 
             if hasattr(prov, "is_disabled") and prov.is_disabled():
