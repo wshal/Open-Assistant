@@ -116,10 +116,7 @@ class GroqProvider(BaseProvider):
         self._pre_request()
         model = self.get_model(tier)
         t0 = time.time()
-        # M48 FIX: track accumulated text length AND capture usage from final
-        # chunk for consistent token counting with non-streaming mode.
-        accumulated_len = 0
-        stream_usage = None
+        tok = 0
         try:
             stream = await self.client.chat.completions.create(
                 model=model,
@@ -130,21 +127,15 @@ class GroqProvider(BaseProvider):
                 max_tokens=self.max_tokens,
                 temperature=0.7,
                 stream=True,
-                stream_options={"include_usage": True},
             )
             async for chunk in stream:
-                # M48 FIX: capture usage metadata from final streaming chunk
-                if hasattr(chunk, 'usage') and chunk.usage:
-                    stream_usage = chunk.usage
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
                 c = delta.content if delta else None
                 if c:
-                    accumulated_len += len(c)
+                    tok += max(1, len(c) // 4)
                     yield c
-            # M48 FIX: prefer actual usage over estimate
-            tok = stream_usage.total_tokens if stream_usage else max(1, accumulated_len // 4)
             self.stats.record(tok, time.time() - t0)
         except Exception:
             self.stats.record_error()
