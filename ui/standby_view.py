@@ -361,7 +361,15 @@ class StandbyView(QWidget):
         layout.addLayout(op_row)
         layout.addSpacing(16)
 
-        # ── AI MODES (Container widget to toggle visibility) ────────────────
+        # ── AI MODES Container (Fixed height to prevent layout shifts) ────────
+        self.mode_container = QWidget()
+        self.mode_container.setFixedHeight(135)
+        self.mode_container.setStyleSheet("background: transparent;")
+        mode_container_layout = QVBoxLayout(self.mode_container)
+        mode_container_layout.setContentsMargins(0, 0, 0, 0)
+        mode_container_layout.setSpacing(0)
+
+        # ── Standard mode widgets container ──
         self.mode_grid_widget = QWidget()
         self.mode_grid_widget.setStyleSheet("background: transparent;")
         grid_layout = QVBoxLayout(self.mode_grid_widget)
@@ -391,28 +399,81 @@ class StandbyView(QWidget):
         grid_layout.addSpacing(8)
 
         # ── Context chip ─────────────────────────────────────────────────────
-        # Shows auto-suggested or user-active context beneath the mode grid.
-        # Hidden until a mode with a matching preset is selected.
         self._ctx_chip = QLabel()
         self._ctx_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._ctx_chip.setFixedHeight(20)
         self._ctx_chip.hide()
         grid_layout.addWidget(self._ctx_chip)
 
-        layout.addWidget(self.mode_grid_widget)
+        mode_container_layout.addWidget(self.mode_grid_widget)
 
-        layout.addSpacing(10)
+        self.mode_hint_spacing = QWidget()
+        self.mode_hint_spacing.setFixedHeight(6)
+        self.mode_hint_spacing.setStyleSheet("background: transparent;")
+        mode_container_layout.addWidget(self.mode_hint_spacing)
 
         self.auto_mode_hint = QLabel()
         self.auto_mode_hint.setWordWrap(True)
         self.auto_mode_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.auto_mode_hint.setStyleSheet(
-            "color: #64748b; font-size: 10px; line-height: 1.35; "
+            "color: #cbd5e1; font-size: 10px; line-height: 1.35; "
             "background: rgba(255,255,255,4); border: 1px solid rgba(255,255,255,10); "
             "border-radius: 10px; padding: 8px 12px;"
         )
-        layout.addWidget(self.auto_mode_hint)
+        mode_container_layout.addWidget(self.auto_mode_hint)
 
+        # ── Auto mode visual card (shown only when Auto mode is active) ──────
+        self.auto_mode_card = QFrame()
+        self.auto_mode_card.setStyleSheet("""
+            QFrame {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 rgba(99,102,241,18), stop:1 rgba(139,92,246,10));
+                border: 1px solid rgba(99,102,241,35);
+                border-radius: 12px;
+            }
+        """)
+        self.auto_mode_card.setFixedHeight(128)
+        card_layout = QVBoxLayout(self.auto_mode_card)
+        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setSpacing(6)
+        card_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        card_title = QLabel("✨ NEURAL LISTENING AGENT ACTIVE")
+        card_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_title.setStyleSheet("""
+            color: #a78bfa;
+            font-size: 10px;
+            font-weight: 900;
+            background: transparent;
+            border: none;
+        """)
+        card_layout.addWidget(card_title)
+
+        card_desc = QLabel("Listens to continuous speech\nDetects questions and responds instantly")
+        card_desc.setWordWrap(True)
+        card_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_desc.setStyleSheet("""
+            color: #cbd5e1;
+            font-size: 10px;
+            line-height: 1.35;
+            background: transparent;
+            border: none;
+        """)
+        card_layout.addWidget(card_desc)
+
+        card_status = QLabel("🎙️ WHISPER VAD ACTIVE  |  CONTINUOUS RUNTIME")
+        card_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_status.setStyleSheet("""
+            color: #64748b;
+            font-size: 8px;
+            font-weight: 800;
+            background: transparent;
+            border: none;
+        """)
+        card_layout.addWidget(card_status)
+
+        mode_container_layout.addWidget(self.auto_mode_card)
+
+        layout.addWidget(self.mode_container)
         layout.addSpacing(14)
 
         # ── CAPTURE SOURCE ───────────────────────────────────────────────────
@@ -972,6 +1033,12 @@ class StandbyView(QWidget):
         
         if hasattr(self, "mode_grid_widget"):
             self.mode_grid_widget.setVisible(not auto_enabled)
+        if hasattr(self, "auto_mode_hint"):
+            self.auto_mode_hint.setVisible(not auto_enabled)
+        if hasattr(self, "mode_hint_spacing"):
+            self.mode_hint_spacing.setVisible(not auto_enabled)
+        if hasattr(self, "auto_mode_card"):
+            self.auto_mode_card.setVisible(auto_enabled)
 
     def _resolve_initial_selection(self):
         """State-first resolution of active selections. Robustly traverses parent tree to find app."""

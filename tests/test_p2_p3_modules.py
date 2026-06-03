@@ -1213,6 +1213,12 @@ class TestStandbyViewPills(unittest.TestCase):
         self.assertTrue(hasattr(view, "btn_auto"))
         self.assertTrue(hasattr(view, "mode_grid_widget"))
         self.assertTrue(hasattr(view, "mode_combo"))
+        self.assertTrue(hasattr(view, "mode_container"))
+        self.assertTrue(hasattr(view, "auto_mode_card"))
+
+        # Verify fixed height bounds
+        self.assertEqual(view.mode_container.minimumHeight(), 135)
+        self.assertEqual(view.mode_container.maximumHeight(), 135)
 
         # Check dropdown items
         combo_items = [view.mode_combo.itemData(i) for i in range(view.mode_combo.count())]
@@ -1233,6 +1239,8 @@ class TestStandbyViewPills(unittest.TestCase):
         self.assertTrue(view.btn_standard.isChecked())
         self.assertFalse(view.btn_auto.isChecked())
         self.assertFalse(view.mode_grid_widget.isHidden())
+        self.assertFalse(view.auto_mode_hint.isHidden())
+        self.assertTrue(view.auto_mode_card.isHidden())
 
         # 2. Auto mode active (ai.auto_mode.enabled = True)
         cfg.set("ai.auto_mode.enabled", True)
@@ -1240,6 +1248,8 @@ class TestStandbyViewPills(unittest.TestCase):
         self.assertFalse(view.btn_standard.isChecked())
         self.assertTrue(view.btn_auto.isChecked())
         self.assertTrue(view.mode_grid_widget.isHidden())
+        self.assertTrue(view.auto_mode_hint.isHidden())
+        self.assertFalse(view.auto_mode_card.isHidden())
 
         # 3. Test clicks
         app_mock.toggle_auto_mode = MagicMock()
