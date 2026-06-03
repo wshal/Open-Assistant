@@ -42,6 +42,10 @@ def build():
             "--collect-all", "chromadb",
             "--exclude-module", "tkinter",
             "--exclude-module", "matplotlib",
+            "--exclude-module", "torch",
+            "--exclude-module", "easyocr",
+            "--exclude-module", "sentence_transformers",
+            "--exclude-module", "cv2",
             "--noconfirm",
             "--clean",
             "main.py"
