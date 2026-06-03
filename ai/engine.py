@@ -338,10 +338,16 @@ class AIEngine(QObject):
             reason == "quota exhausted"
             or (reason == "429 rate limit" and self._is_quota_exhausted_error(exc))
         ):
-            seconds = 3600  # effectively session-length disable
+            # Reduce session-length disable from 3600s to 120s for quota errors.
+            # Free-tier TPM buckets (e.g. Groq 6000 TPM) refill in ~60s, so a
+            # 120s cooldown gives the bucket time to recover without burning the
+            # entire session on a dead provider. This is a noisy-neighbor safeguard,
+            # not a hard ban.
+            seconds = 120
             logger.info(
-                "AI: %s hit quota limit — disabling for session (3600s) to avoid retry storms",
+                "AI: %s hit quota limit — disabling for %ds to let TPM bucket recover",
                 getattr(provider, "name", "?"),
+                seconds,
             )
         try:
             if provider and hasattr(provider, "disable"):

@@ -1149,7 +1149,7 @@ class TestP2FallbackModelRouter(unittest.TestCase):
         self.assertEqual(emitted_chunks, ["ollama answer"])
         self.assertEqual(errors, [])
         gemini_mock.disable.assert_called()
-        self.assertEqual(gemini_mock.disable.call_args.kwargs.get("seconds"), 3600)
+        self.assertEqual(gemini_mock.disable.call_args.kwargs.get("seconds"), 120)
 
     def test_validate_loaded_providers_uses_single_health_probe_by_default(self):
         from ai.engine import AIEngine
