@@ -1002,11 +1002,16 @@ class StandbyView(QWidget):
 
     def _apply_initial_highlights(self):
         """Hardened boot sync with forced defaults."""
-        mode, audio = self._resolve_initial_selection()
-        if not self._boot_sync_logged:
-            logger.info("Boot sync: mode='%s', audio='%s'", mode, audio)
-            self._boot_sync_logged = True
-        self.refresh_highlights(mode, audio)
+        # BUG-7 FIX: guard against RuntimeError if the widget was destroyed
+        # before the QTimer.singleShot fires (rapid restarts / test teardown).
+        try:
+            mode, audio = self._resolve_initial_selection()
+            if not self._boot_sync_logged:
+                logger.info("Boot sync: mode='%s', audio='%s'", mode, audio)
+                self._boot_sync_logged = True
+            self.refresh_highlights(mode, audio)
+        except RuntimeError:
+            pass  # Widget was deleted before the deferred callback fired
 
     def refresh_highlights(self, mode=None, audio=None):
         """Force refresh selection states from explicit values or resolved state."""
@@ -1073,5 +1078,13 @@ class StandbyView(QWidget):
         if self._boot_sync_scheduled:
             return
         self._boot_sync_scheduled = True
+        # BUG-7 FIX: wrap each singleShot callback in a lambda that absorbs
+        # RuntimeError in case the widget is destroyed before the timer fires.
+        def _safe_highlights():
+            try:
+                self._apply_initial_highlights()
+            except RuntimeError:
+                pass
         for delay_ms in (100, 500, 1500):
-            QTimer.singleShot(delay_ms, self._apply_initial_highlights)
+            QTimer.singleShot(delay_ms, _safe_highlights)
+

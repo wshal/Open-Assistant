@@ -13,7 +13,12 @@ from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-_STORE_PATH = Path("data/context_presets.json")
+from core.constants import HISTORY_DIR as _HISTORY_DIR
+
+# BUG-3 FIX: was Path("data/context_presets.json") — CWD-relative, broke in
+# frozen/exe builds and when launched from a different directory.  Use the
+# same absolute data directory as all other persistent files.
+_STORE_PATH = Path(_HISTORY_DIR).parent / "context_presets.json"
 
 # Built-in general presets shipped with the app.
 # Users can overwrite or add their own on top of these.

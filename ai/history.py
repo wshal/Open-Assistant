@@ -258,6 +258,15 @@ class ResponseHistory:
         provider: str,
         metadata: dict = None,
     ):
+        # BUG-5 FIX: Perform disk I/O outside the lock, consistent with add().
+        # Previously index_storage.set() and _save_unlocked() were called while
+        # holding self._lock, blocking UI calls to get_last() for the full
+        # encrypted-write duration. Now we snapshot the state we need, release
+        # the lock, then write — same pattern as the carefully-designed add().
+        sessions_snapshot = None
+        entries_snapshot = None
+        analyses_snapshot = None
+
         with self._lock:
             self._ensure_current_session_meta()
             self.screen_analyses.append(
@@ -269,8 +278,19 @@ class ResponseHistory:
                     "metadata": metadata or {},
                 }
             )
-            self.index_storage.set("sessions_index", self.sessions)
-            self._save_unlocked()
+            sessions_snapshot = list(self.sessions)
+            entries_snapshot = [asdict(e) for e in self.entries]
+            analyses_snapshot = list(self.screen_analyses)
+
+        try:
+            self.index_storage.set("sessions_index", sessions_snapshot)
+        except Exception as _e:
+            logger.error("Failed to save session index after screen analysis: %s", _e)
+        try:
+            self.current_storage.set("history_data", entries_snapshot)
+            self.current_storage.set("screen_analysis_data", analyses_snapshot)
+        except Exception as _e:
+            logger.error("Failed to save screen analysis data: %s", _e)
 
     def get_screen_analyses(self) -> List[dict]:
         with self._lock:

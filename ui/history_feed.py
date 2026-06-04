@@ -54,7 +54,7 @@ class _AutoResizingTextBrowser(QTextBrowser):
         self.setStyleSheet("background: transparent;")
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.document().documentSizeChanged.connect(self._adjust_height)
+        self.document().documentLayoutChanged.connect(self._adjust_height)
 
     def _adjust_height(self):
         size = self.document().size()

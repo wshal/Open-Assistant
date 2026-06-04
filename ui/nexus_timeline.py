@@ -113,6 +113,14 @@ class NexusTimelineView(QWidget):
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.log_layout.insertWidget(0, self._empty_label)
 
+        # BUG-4 FIX: create a single reusable single-shot scroll timer instead
+        # of allocating a new QTimer on every _refresh() call (every 2s).
+        # New-per-call timers are never stored, accumulate as Qt children, and
+        # all fire — causing redundant scroll-to-bottom work every cycle.
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.timeout.connect(self._scroll_to_bottom)
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def activate(self):
@@ -160,11 +168,10 @@ class NexusTimelineView(QWidget):
             if w is not None:
                 w.deleteLater()
 
-        # Auto-scroll to bottom
-        _scroll_timer = QTimer(self)
-        _scroll_timer.setSingleShot(True)
-        _scroll_timer.timeout.connect(self._scroll_to_bottom)
-        _scroll_timer.start(30)
+        # BUG-4 FIX: reuse the single _scroll_timer instead of creating a new
+        # QTimer on every call.  start() on an already-running single-shot is
+        # safe — it just resets the countdown.
+        self._scroll_timer.start(30)
 
     def _scroll_to_bottom(self):
         try:

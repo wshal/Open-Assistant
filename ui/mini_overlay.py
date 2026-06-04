@@ -65,6 +65,9 @@ class MiniOverlay(QMainWindow):
         self._nano_mode = False  # P2.6: ultra-compact nano state
         self._warmup_done = False  # Guard: input locked until AI engines are ready
         self._last_rendered = ""
+        self._reset_placeholder_timer = QTimer(self)
+        self._reset_placeholder_timer.setSingleShot(True)
+        self._reset_placeholder_timer.timeout.connect(self._reset_loading_placeholder)
 
         # NEURAL UX: Gaze-based transparency
         self._gaze_timer = QTimer(self)
@@ -251,10 +254,10 @@ class MiniOverlay(QMainWindow):
         if not self._warmup_done:
             logger.warning("Mini-HUD: query attempted before warmup — ignoring.")
             self.input.setPlaceholderText("⏳ Still loading, please wait...")
-            _reset_timer = QTimer(self)
-            _reset_timer.setSingleShot(True)
-            _reset_timer.timeout.connect(self._reset_loading_placeholder)
-            _reset_timer.start(2000)
+            # Reuse one single-shot timer so repeated warmup attempts simply
+            # restart the same countdown instead of spawning extra timers.
+            self._reset_placeholder_timer.stop()
+            self._reset_placeholder_timer.start(2000)
             return
 
         self.input.clear()

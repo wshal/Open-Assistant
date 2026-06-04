@@ -76,6 +76,13 @@ class MarkdownRenderer:
         if not text:
             return ""
 
+        # BUG-2 FIX: Reset code-block parsing state at the start of every call
+        # so stale state from a prior (possibly truncated) render cannot bleed
+        # into this one and cause all content to be silently swallowed as code.
+        self._in_code_block = False
+        self._code_lang = ""
+        self._code_buffer = []
+
         # Pre-clean: Remove any corrupted HTML style attributes
         text = re.sub(r'style="color:\s*#[^"]*";?', "", text)
 
