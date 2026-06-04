@@ -1,14 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('config.yaml', '.')]
+datas = []
+
 binaries = []
 hiddenimports = ['google.genai', 'groq', 'mistralai', 'cohere', 'together', 'anthropic', 'ollama', 'faster_whisper', 'chromadb', 'rapidocr_onnxruntime', 'sounddevice', 'pynput', 'scipy']
-tmp_ret = collect_all('rapidocr_onnxruntime')
+
+
+def _collect_all_safe(module_name):
+    try:
+        return collect_all(module_name)
+    except ImportError:
+        return ([], [], [])
+
+
+tmp_ret = _collect_all_safe('rapidocr_onnxruntime')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('faster_whisper')
+tmp_ret = _collect_all_safe('faster_whisper')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('chromadb')
+tmp_ret = _collect_all_safe('chromadb')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = _collect_all_safe('pyaudiowpatch')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = _collect_all_safe('sounddevice')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = _collect_all_safe('soundcard')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 

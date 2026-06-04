@@ -334,9 +334,17 @@ class OpenAssistApp(QObject):
             full_text,
             req_meta,
         )
-        if rendered_text != full_text and getattr(self.history, "entries", None):
+        if rendered_text != full_text:
             try:
-                self.history.entries[-1]["response"] = rendered_text
+                updater = getattr(self.history, "update_last_response", None)
+                if callable(updater) and updater(rendered_text):
+                    pass
+                elif getattr(self.history, "entries", None):
+                    last = self.history.entries[-1]
+                    if isinstance(last, dict):
+                        last["response"] = rendered_text
+                    elif hasattr(last, "response"):
+                        last.response = rendered_text
             except Exception:
                 pass
 

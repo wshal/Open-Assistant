@@ -225,6 +225,32 @@ class ResponseHistory:
         with self._lock:
             return self.entries[-n:]
 
+    def update_last_response(self, response: str) -> bool:
+        """Update the most recent history entry's response in memory.
+
+        The history layer normally stores ``HistoryEntry`` dataclasses, but a
+        few tests and compatibility shims still inject dictionaries directly.
+        Supporting both keeps the runtime path robust without forcing callers
+        to know the concrete storage shape.
+        """
+        with self._lock:
+            if not self.entries:
+                return False
+
+            last = self.entries[-1]
+            if isinstance(last, dict):
+                last["response"] = response
+                return True
+
+            if hasattr(last, "response"):
+                try:
+                    last.response = response
+                    return True
+                except Exception:
+                    return False
+
+            return False
+
     def add_screen_analysis(
         self,
         prompt: str,

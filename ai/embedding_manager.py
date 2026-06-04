@@ -1,9 +1,13 @@
 import os
+import sys
 import threading
 import logging
 import io
 import contextlib
+from pathlib import Path
 import numpy as np
+
+from core.constants import CACHE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +44,21 @@ class EmbeddingManager:
                 return
 
             try:
-                os.environ.setdefault("FASTEMBED_CACHE_PATH", "./data/cache/fastembed")
-                # Silence HF Hub authentication noise (we only use public cached models)
-                os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                default_cache_dir = (
+                    Path(CACHE_DIR) / "fastembed"
+                    if getattr(sys, "frozen", False)
+                    else Path(__file__).resolve().parent.parent / "data" / "cache" / "fastembed"
+                )
+                cache_dir = os.environ.setdefault(
+                    "FASTEMBED_CACHE_PATH",
+                    str(default_cache_dir),
+                )
+                # If cached model exists, go offline; otherwise allow download
+                model_cached = os.path.exists(os.path.join(cache_dir, "models--qdrant--bge-small-en-v1.5-onnx-q"))
+                if model_cached:
+                    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                else:
+                    os.environ.pop("HF_HUB_OFFLINE", None)
                 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
                 from fastembed import TextEmbedding
                 self._model = TextEmbedding(model_name=self._model_name)

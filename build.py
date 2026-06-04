@@ -3,7 +3,9 @@
 import os
 import sys
 import subprocess
+import shutil
 from pathlib import Path
+
 
 
 def build():
@@ -53,6 +55,27 @@ def build():
 
     print(f"Running: {' '.join(cmd[:5])}...")
     subprocess.run(cmd, check=True)
+
+    dist_root = Path("dist/OpenAssist-AI")
+    packaged_data_root = dist_root / "OpenAssist_Data"
+    copied = []
+
+    # Copy fastembed cached model to build directory if it exists
+    src_cache = Path("data/cache/fastembed")
+    if src_cache.exists():
+        dst_cache = packaged_data_root / "data/cache/fastembed"
+        dst_cache.parent.mkdir(parents=True, exist_ok=True)
+        if dst_cache.exists():
+            shutil.rmtree(dst_cache)
+        try:
+            shutil.copytree(src_cache, dst_cache, symlinks=False)
+            print("[OK] Copied fastembed cached model to build directory.")
+            copied.append("data/cache/fastembed")
+        except Exception as e:
+            print(f"[WARN] Warning: could not copy fastembed cache to build: {e}")
+
+    if copied:
+        print(f"[OK] Copied runtime data into packaged app: {', '.join(copied)}")
 
     print("\nBuild complete!")
     print("Output: dist/OpenAssist-AI/")

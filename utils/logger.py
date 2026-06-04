@@ -24,8 +24,17 @@ def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
             if not _initialized:
                 _setup_root_logger(log_level)
                 _initialized = True
+    else:
+        root = logging.getLogger()
+        if log_level < root.level:
+            root.setLevel(log_level)
+            for handler in root.handlers:
+                if isinstance(handler, RotatingFileHandler):
+                    handler.setLevel(logging.DEBUG)
+                else:
+                    handler.setLevel(log_level)
     logger = logging.getLogger(name)
-    logger.setLevel(log_level)
+    logger.setLevel(logging.NOTSET)
     return logger
 
 

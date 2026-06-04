@@ -1286,8 +1286,8 @@ class AudioCapture(QObject):
                     resampled = np.empty((len(ch_data), indata.shape[1]), dtype=np.float32)
                 resampled[:, ch] = ch_data[:resampled.shape[0]]
             return resampled
-        except ImportError:
-            pass
+        except Exception as exc:
+            logger.debug("scipy resample_poly unavailable, using linear interpolation fallback: %s", exc)
 
         # Fallback: linear interpolation (NOTE: introduces aliasing when
         # downsampling — prefer installing scipy for production use).

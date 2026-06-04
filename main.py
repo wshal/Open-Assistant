@@ -5,6 +5,7 @@ import sys
 import os
 import signal
 import argparse
+import importlib.util
 import traceback
 import warnings
 from pathlib import Path
@@ -29,6 +30,22 @@ if sys.platform == "win32":
         ssl.SSLContext.load_default_certs = patched_load
     except Exception:
         pass
+
+def _block_pyinstaller_namespace_stub(mod_name: str) -> None:
+    """Stop empty namespace stubs from shadowing real ImportError paths."""
+    spec = importlib.util.find_spec(mod_name)
+    if spec is None:
+        return
+    if spec.origin is None and spec.submodule_search_locations is not None:
+        sys.modules[mod_name] = None
+
+
+if getattr(sys, "frozen", False):
+    # PyInstaller can leave empty namespace stubs behind for excluded modules.
+    # Mark them as unavailable so downstream imports fail cleanly instead of
+    # half-importing and crashing deep inside dependency code.
+    for mod_name in ("torch", "cv2", "sentence_transformers", "easyocr"):
+        _block_pyinstaller_namespace_stub(mod_name)
 
 from core.config import Config
 from core.app import OpenAssistApp
@@ -108,11 +125,12 @@ def cleanup_old_instances():
                     if skip_next:
                         skip_next = False
                         continue
-                    # -c, -m, -W, -X etc. consume the next arg or are the end
-                    if arg in ('-c', '-m', '-W', '-X', '-u', '-O', '-B', '-E', '-i', '-q', '-s', '-S', '-v'):
-                        # -c and -m mean what follows is code/module, not a file
-                        if arg in ('-c', '-m'):
-                            break  # not a script invocation we care about
+                    # -c and -m mean what follows is code/module, not a file.
+                    if arg in ('-c', '-m'):
+                        break  # not a script invocation we care about
+                    # Only flags that actually consume a following value should
+                    # skip that next token. Pure switches like -q/-s/-v do not.
+                    if arg in ('-W', '-X'):
                         skip_next = True
                         continue
                     if arg.startswith('-'):

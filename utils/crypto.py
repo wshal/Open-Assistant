@@ -38,13 +38,22 @@ class SecureStorage:
         if self.filepath.exists():
             return
 
-        legacy_path = Path("data") / "settings.enc"
-        try:
-            if legacy_path.resolve() == self.filepath.resolve():
-                return
-        except Exception:
-            pass
-        if not legacy_path.exists():
+        candidate_paths = [
+            Path("data") / "settings.enc",
+            Path("settings.enc"),
+        ]
+        legacy_path = None
+        for candidate in candidate_paths:
+            try:
+                if candidate.resolve() == self.filepath.resolve():
+                    continue
+            except Exception:
+                pass
+            if candidate.exists():
+                legacy_path = candidate
+                break
+
+        if legacy_path is None:
             return
 
         try:
