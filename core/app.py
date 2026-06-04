@@ -1840,6 +1840,13 @@ class OpenAssistApp(QObject):
             logger.info(
                 f"[{session_id}] 🎤 Audio ready check | ready={audio_ready} | elapsed={audio_elapsed:.1f}ms"
             )
+            if audio_ready and hasattr(self.audio, "wait_until_ready"):
+                wait_start = time.time()
+                audio_ready = bool(self.audio.wait_until_ready(timeout_s=10.0))
+                wait_elapsed = (time.time() - wait_start) * 1000
+                logger.info(
+                    f"[{session_id}] 🎤 Audio warmup wait | ready={audio_ready} | elapsed={wait_elapsed:.1f}ms"
+                )
         elif hasattr(self.audio, "start"):
             self.audio.start()
             audio_ready = bool(getattr(self.audio, "running", True))

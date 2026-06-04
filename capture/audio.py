@@ -92,6 +92,8 @@ class AudioCapture(QObject):
         self._muted = False
         self._capture_thread = None
         self._process_thread = None
+        self._capture_ready_event = threading.Event()
+        self._whisper_ready_event = threading.Event()
         self.q = queue.Queue(maxsize=100)
         self.transcripts = collections.deque(
             maxlen=config.get("performance.max_history", 50)
@@ -658,6 +660,7 @@ class AudioCapture(QObject):
     def _ensure_whisper_loaded(self):
         with self._model_lock:
             if self._model_loaded:
+                self._whisper_ready_event.set()
                 return
             try:
                 from faster_whisper import WhisperModel
@@ -710,6 +713,7 @@ class AudioCapture(QObject):
                         cpu_threads=self._whisper_cpu_threads if device == "cpu" else 0,
                     )
                     self._model_loaded = True
+                    self._whisper_ready_event.set()
                     logger.info(
                         f"✅ Whisper Ready: {self._model_name} on {device} ({compute})"
                     )
@@ -728,6 +732,7 @@ class AudioCapture(QObject):
                             cpu_threads=self._whisper_cpu_threads,
                         )
                         self._model_loaded = True
+                        self._whisper_ready_event.set()
                         logger.info(
                             f"✅ Whisper Ready (CPU fallback): {self._model_name} int8"
                         )
@@ -736,6 +741,7 @@ class AudioCapture(QObject):
             except Exception as e:
                 logger.error(f"Whisper Error: {e}")
                 self._model_loaded = False
+                self._whisper_ready_event.clear()
 
 
     def start(self):
@@ -751,6 +757,7 @@ class AudioCapture(QObject):
             self.last_mode = self.capture_mode
             self._running = True
             self._paused = self._muted
+            self._capture_ready_event.clear()
             # Phase 2: Reset ambient calibration so every new session recalibrates
             self._ambient_calib_remaining = self._ambient_calib_blocks
             self._ambient_rms_samples = []
@@ -786,6 +793,7 @@ class AudioCapture(QObject):
             self._running = False
             self._close_streams()
             self._drain_queue()
+            self._capture_ready_event.clear()
 
         # Shut down thread pools outside the lock to avoid deadlock if pool
         # workers are currently trying to acquire self._lock.
@@ -906,7 +914,7 @@ class AudioCapture(QObject):
             if healthy:
                 self._drain_queue()
                 self._clear_capture_chunk_buffer()
-                self._ensure_whisper_loaded_async()
+                self._ensure_whisper_loaded_async(force=True)
             else:
                 logger.warning(
                     "Audio: Restarting unhealthy pipeline in-place for mode '%s'",
@@ -918,6 +926,29 @@ class AudioCapture(QObject):
         # Not running — start immediately, return without waiting
         self.start()
         return True
+
+    def wait_until_ready(self, timeout_s: float = 10.0) -> bool:
+        """Wait until capture is synchronized and Whisper is ready.
+
+        Returns True only after the live audio pipeline is actually active.
+        """
+        if not self._running:
+            return False
+
+        deadline = time.time() + max(0.0, float(timeout_s or 0.0))
+
+        remaining = max(0.0, deadline - time.time())
+        if not self._capture_ready_event.wait(timeout=remaining):
+            return False
+
+        if self._model_loaded or self._whisper_ready_event.is_set():
+            return True
+
+        self._ensure_whisper_loaded_async(force=True)
+        remaining = max(0.0, deadline - time.time())
+        if remaining <= 0:
+            return bool(self._model_loaded or self._whisper_ready_event.is_set())
+        return bool(self._whisper_ready_event.wait(timeout=remaining) or self._model_loaded)
 
     def _stream_is_ready(self, stream) -> bool:
         if stream is None:
@@ -1513,6 +1544,7 @@ class AudioCapture(QObject):
                                         f"No usable system audio source found: {last_error or self._last_system_audio_error or 'no candidate devices'}"
                                     )
                     logger.info("🎙️ Audio Hardware Successfully Synchronized.")
+                    self._capture_ready_event.set()
                     break
                 except Exception as e:
                     self._close_streams()
@@ -1537,6 +1569,7 @@ class AudioCapture(QObject):
             else:
                 logger.error(f"❌ Final Capture Loop Failure: {e}")
         finally:
+            self._capture_ready_event.clear()
             self._close_streams()
             if self._running:
                 # M15 FIX: Log capture thread death and set a state flag so
