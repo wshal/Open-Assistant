@@ -26,8 +26,12 @@ def _get_user_data_dir() -> Path:
     path constants below.
     """
     if getattr(sys, "frozen", False):          # running as .exe
-        exe_dir = Path(sys.executable).parent  # folder containing the .exe
-        data_dir = exe_dir / "OpenAssist_Data"
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            data_dir = Path(local_appdata) / "OpenAssistAI"
+        else:
+            exe_dir = Path(sys.executable).parent  # fallback if env var missing
+            data_dir = exe_dir / "OpenAssist_Data"
     else:                                       # running from source
         # M40 FIX: Path(".") depends on CWD which varies by launch method.
         # Use the script's own directory as the stable project root.
