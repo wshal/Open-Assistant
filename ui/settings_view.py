@@ -573,6 +573,14 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             self.provider_detail_labels[provider_id].setText(display_msg)
             logger.info("[Q6 Timestamp] %s test result: %s at %s", provider_id, message, ts)
 
+            # Save test health and timestamp to config so it persists across views
+            self.config.set(f"ai.providers.{provider_id}.last_test", {
+                "success": bool(success),
+                "message": str(message),
+                "timestamp": ts
+            })
+            self.config.save()
+
         try:
             ai = getattr(self.app, "ai", None)
             if ai and hasattr(ai, "set_provider_health"):
@@ -731,6 +739,24 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             self.chk_focus_on_show.setChecked(
                 bool(self.config.get("app.focus_on_show", False))
             )
+
+        # Sync provider test health/history from config
+        for pid in self.status_labels.keys():
+            test_data = self.config.get(f"ai.providers.{pid}.last_test", None)
+            if test_data and isinstance(test_data, dict):
+                success = bool(test_data.get("success", False))
+                msg = str(test_data.get("message", ""))
+                ts = str(test_data.get("timestamp", ""))
+                
+                if pid in self.status_labels:
+                    self.status_labels[pid].setText("\u2705" if success else "\u274c")
+                
+                if pid in self.provider_detail_labels:
+                    color = "#4ade80" if success else "#fda4af"
+                    self.provider_detail_labels[pid].setStyleSheet(
+                        f"color: {color}; font-size: 10px; background: transparent;"
+                    )
+                    self.provider_detail_labels[pid].setText(f"{msg}  \u00b7  tested {ts}")
 
         self._sync_stealth_status()
 

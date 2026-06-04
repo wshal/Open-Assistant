@@ -163,7 +163,7 @@ class CaptureTabMixin:
 
         self.chk_auto_mode = PremiumCheckBox("Enable Auto-Answer Mode")
         self.chk_auto_mode.setChecked(
-            bool(self.config.get("ai.auto_mode.enabled", False))
+            bool(self.config.get("ai.auto_mode.enabled", True))
         )
         l.addWidget(self.chk_auto_mode)
         auto_desc = QLabel(

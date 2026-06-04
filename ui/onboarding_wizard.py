@@ -131,7 +131,7 @@ STYLE_INPUT = """
         color: #e2e8f0;
         border: 1px solid rgba(255,255,255,25);
         border-radius: 8px;
-        padding: 12px;
+        padding: 8px 12px;
         font-size: 12px;
     }
     QLineEdit:focus, QComboBox:focus {
@@ -179,6 +179,8 @@ class OnboardingWizard(QWidget):
             "ai_mode": self.config.get("ai.mode", "general"),
             "audio_mode": self.config.get("capture.audio.mode", "system"),
             "gaze_enabled": self.config.get("app.gaze_fade.enabled", False),
+            # Auto mode is ON by default everywhere — user can switch to Standard
+            "auto_mode_enabled": self.config.get("ai.auto_mode.enabled", True),
         }
 
     def reset(self):
@@ -299,10 +301,11 @@ class OnboardingWizard(QWidget):
         clear_layout(self.content_layout)
 
         # Explicitly remove step-specific attributes to avoid accessing deleted wrappers
-        for attr in ["provider_combo", "provider_card", "provider_status_icon", 
-                     "provider_test_btn", "provider_link_btn", "lbl_key", 
-                     "api_key_input", "provider_detail", "input_container", 
-                     "ai_mode", "audio_mode", "chk_gaze"]:
+        for attr in ["provider_combo", "provider_card", "provider_status_icon",
+                     "provider_test_btn", "provider_link_btn", "ollama_model_combo", "ollama_model_container",
+                     "api_key_input", "provider_detail", "input_container",
+                     "ai_mode", "audio_mode", "chk_gaze",
+                     "btn_auto_mode", "btn_standard_mode", "_mode_dropdown_row"]:
             if hasattr(self, attr):
                 try:
                     delattr(self, attr)
@@ -446,9 +449,10 @@ class OnboardingWizard(QWidget):
         self.content_layout.addSpacing(20)
 
         self.provider_card = QFrame()
-        self.provider_card.setFixedWidth(300)
+        self.provider_card.setObjectName("provider_card")
+        self.provider_card.setFixedSize(300, 236)
         self.provider_card.setStyleSheet(
-            "QFrame {"
+            "#provider_card {"
             "background: rgba(255,255,255,5);"
             "border-radius: 12px;"
             "border: 1px solid rgba(255,255,255,10);"
@@ -457,7 +461,7 @@ class OnboardingWizard(QWidget):
         )
         card_layout = QVBoxLayout(self.provider_card)
         card_layout.setContentsMargins(14, 12, 14, 12)
-        card_layout.setSpacing(8)
+        card_layout.setSpacing(6)
 
         card_top = QHBoxLayout()
         card_top.setContentsMargins(0, 0, 0, 0)
@@ -492,9 +496,7 @@ class OnboardingWizard(QWidget):
         self.provider_link_btn.clicked.connect(self._open_provider_link)
         card_layout.addWidget(self.provider_link_btn, 0, Qt.AlignmentFlag.AlignLeft)
 
-        self.lbl_key = QLabel("API Key")
-        self.lbl_key.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 600;")
-        card_layout.addWidget(self.lbl_key)
+
 
         key_row = QHBoxLayout()
         key_row.setContentsMargins(0, 0, 0, 0)
@@ -518,10 +520,37 @@ class OnboardingWizard(QWidget):
         key_row.addWidget(lock_lbl)
         card_layout.addLayout(key_row)
 
+        from PyQt6.QtWidgets import QWidget
+        self.ollama_model_container = QWidget()
+        self.ollama_model_container.setStyleSheet("background: transparent; border: none; padding: 0; margin: 0;")
+        container_layout = QVBoxLayout(self.ollama_model_container)
+        container_layout.setContentsMargins(0, 6, 0, 4)
+        container_layout.setSpacing(0)
+
+        self.ollama_model_combo = QComboBox()
+        self.ollama_model_combo.setStyleSheet(STYLE_INPUT)
+        self.ollama_model_combo.setFixedHeight(38)
+        
+        saved_model = self.config.get("ai.providers.ollama.model", "") or self.wizard_state.get("ollama_model", "")
+        self.ollama_model_combo.addItem(saved_model or "Test Ollama to load local models")
+        self.ollama_model_combo.setEnabled(bool(saved_model))
+        
+        def _on_ollama_model_changed(text):
+            if text and "test ollama" not in text.lower() and "no local models" not in text.lower() and "failed" not in text.lower():
+                self.wizard_state["ollama_model"] = text
+                logger.info("[Onboarding] Selected Ollama model: %s", text)
+        self.ollama_model_combo.currentTextChanged.connect(_on_ollama_model_changed)
+        container_layout.addWidget(self.ollama_model_combo)
+        
+        self.ollama_model_container.setVisible(current_p == "ollama")
+        card_layout.addWidget(self.ollama_model_container)
+
         self.provider_detail = QLabel("Not tested yet")
         self.provider_detail.setWordWrap(True)
         self.provider_detail.setStyleSheet("color: #64748b; font-size: 10px; background: transparent;")
+        # Removed card_layout.addSpacing(6) to prevent double padding with container margins
         card_layout.addWidget(self.provider_detail)
+        card_layout.addStretch()
 
         self.input_container = self.provider_card
         self.content_layout.addWidget(self.input_container, 0, Qt.AlignmentFlag.AlignCenter)
@@ -541,120 +570,197 @@ class OnboardingWizard(QWidget):
         self.content_layout.addStretch(2) # Balanced Spacing
 
     def _step_audio(self):
-        """Audio configuration step."""
-        self.content_layout.addStretch(1) # Top Balance
+        """Audio configuration step — Auto/Standard mode toggle + audio source."""
+        self.content_layout.addStretch(1)
 
-        title = QLabel("Audio Capture Setup")
+        title = QLabel("Audio & Mode Setup")
         title.setStyleSheet(
             "color: #f1f5f9; font-size: 18px; font-weight: 800; background: transparent;"
         )
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.content_layout.addWidget(title)
 
-        desc = QLabel(
-            "Configure how OpenAssist listens to audio."
-        )
-        desc.setStyleSheet("color: #94a3b8; font-size: 11px; text-align: center; line-height: 1.2;")
-        desc.setWordWrap(True)
+        desc = QLabel("Choose how OpenAssist listens and responds.")
+        desc.setStyleSheet("color: #94a3b8; font-size: 11px; background: transparent;")
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        self.content_layout.addSpacing(2) # Group tightly with title
+        self.content_layout.addSpacing(3)
         self.content_layout.addWidget(desc)
-        
-        self.content_layout.addSpacing(30) # Clear gap before inputs
 
+        self.content_layout.addSpacing(22)
+
+        # ── AI Mode: Auto / Standard pill toggle ─────────────────────────────
         lbl_ai_mode = QLabel("AI Mode")
-        lbl_ai_mode.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 600;")
+        lbl_ai_mode.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 600; background: transparent;")
         lbl_ai_mode.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.content_layout.addWidget(lbl_ai_mode)
+        self.content_layout.addSpacing(6)
 
-        self.content_layout.addSpacing(4)
+        PILL_ACTIVE = (
+            "background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #4f46e5,stop:1 #7c3aed); "
+            "color: #ffffff; border: none; border-radius: 10px; "
+            "font-size: 11px; font-weight: 800; padding: 0px;"
+        )
+        PILL_INACTIVE = (
+            "background: rgba(255,255,255,10); color: #64748b; "
+            "border: 1px solid rgba(255,255,255,18); border-radius: 10px; "
+            "font-size: 11px; font-weight: 700; padding: 0px;"
+        )
+
+        auto_enabled = self.wizard_state.get("auto_mode_enabled", True)
+
+        pill_row = QHBoxLayout()
+        pill_row.setSpacing(8)
+        pill_row.addStretch()
+
+        self.btn_auto_mode = QPushButton("⚡ Auto")
+        self.btn_auto_mode.setFixedSize(110, 36)
+        self.btn_auto_mode.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_auto_mode.setToolTip(
+            "Auto Mode: Listens and answers automatically."
+        )
+        self.btn_auto_mode.setStyleSheet(PILL_ACTIVE if auto_enabled else PILL_INACTIVE)
+        pill_row.addWidget(self.btn_auto_mode)
+
+        self.btn_standard_mode = QPushButton("🎯 Standard")
+        self.btn_standard_mode.setFixedSize(110, 36)
+        self.btn_standard_mode.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_standard_mode.setToolTip(
+            "Standard Mode: Select a profile and ask questions manually."
+        )
+        self.btn_standard_mode.setStyleSheet(PILL_INACTIVE if auto_enabled else PILL_ACTIVE)
+        pill_row.addWidget(self.btn_standard_mode)
+
+        pill_row.addStretch()
+        self.content_layout.addLayout(pill_row)
+
+        self.content_layout.addSpacing(8)
+
+        # Fixed height container to prevent layout shifts
+        self.mode_panel = QWidget()
+        self.mode_panel.setFixedHeight(96)
+        self.mode_panel.setStyleSheet("background: transparent;")
+        mode_panel_layout = QVBoxLayout(self.mode_panel)
+        mode_panel_layout.setContentsMargins(0, 0, 0, 0)
+        mode_panel_layout.setSpacing(0)
+        mode_panel_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # 1. Auto mode info widget
+        self.auto_info_widget = QLabel("Listens continuously and answers spoken prompts automatically.")
+        self.auto_info_widget.setWordWrap(True)
+        self.auto_info_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.auto_info_widget.setStyleSheet(
+            "color: #cbd5e1; font-size: 10px; background: rgba(79,70,229,15); "
+            "border: 1px solid rgba(99,102,241,40); border-radius: 10px; padding: 10px 14px;"
+        )
+        self.auto_info_widget.setFixedWidth(280)
+        self.auto_info_widget.setFixedHeight(48)
+        mode_panel_layout.addWidget(self.auto_info_widget, 0, Qt.AlignmentFlag.AlignCenter)
+
+        # 2. Standard mode info widget
+        self.standard_info_widget = QWidget()
+        self.standard_info_widget.setStyleSheet("background: transparent;")
+        std_layout = QVBoxLayout(self.standard_info_widget)
+        std_layout.setContentsMargins(0, 0, 0, 0)
+        std_layout.setSpacing(6)
+        std_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        _lbl_profile = QLabel("Select Mode Profile")
+        _lbl_profile.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 600; background: transparent;")
+        _lbl_profile.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        std_layout.addWidget(_lbl_profile)
 
         self.ai_mode = QComboBox()
-        self.ai_mode.addItems(
-            [
-                "General",
-                "Interview",
-                "Coding",
-                "Meeting",
-                "Exam",
-                "Writing",
-            ]
-        )
+        self.ai_mode.addItems(["General", "Interview", "Coding", "Meeting", "Exam", "Writing"])
         self.ai_mode.setStyleSheet(STYLE_INPUT)
         self.ai_mode.setFixedWidth(280)
+        self.ai_mode.setFixedHeight(38)
         ai_modes = ["general", "interview", "coding", "meeting", "exam", "writing"]
         current_ai_mode = self.wizard_state.get("ai_mode", "general")
         if current_ai_mode in ai_modes:
             self.ai_mode.setCurrentIndex(ai_modes.index(current_ai_mode))
-        self.content_layout.addWidget(self.ai_mode, 0, Qt.AlignmentFlag.AlignCenter)
+        std_layout.addWidget(self.ai_mode, 0, Qt.AlignmentFlag.AlignCenter)
 
-        self.content_layout.addSpacing(20)
+        self.standard_tip = QLabel("Select a profile and ask questions manually.")
+        self.standard_tip.setStyleSheet("color: #64748b; font-size: 9px; background: transparent;")
+        self.standard_tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        std_layout.addWidget(self.standard_tip)
 
-        # Audio source grouping
-        lbl_mode = QLabel("Audio Source")
-        lbl_mode.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 600;")
-        lbl_mode.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.content_layout.addWidget(lbl_mode)
-        
-        self.content_layout.addSpacing(4)
+        mode_panel_layout.addWidget(self.standard_info_widget, 0, Qt.AlignmentFlag.AlignCenter)
+        self.content_layout.addWidget(self.mode_panel)
+
+        self._mode_dropdown_row = self.standard_info_widget
+
+        # Set initial visibility
+        self.auto_info_widget.setVisible(auto_enabled)
+        self.standard_info_widget.setVisible(not auto_enabled)
+
+        # ── Wire pill toggle callbacks ────────────────────────────────────────
+        def _select_auto():
+            self.wizard_state["auto_mode_enabled"] = True
+            self.btn_auto_mode.setStyleSheet(PILL_ACTIVE)
+            self.btn_standard_mode.setStyleSheet(PILL_INACTIVE)
+            self.auto_info_widget.setVisible(True)
+            self.standard_info_widget.setVisible(False)
+
+        def _select_standard():
+            self.wizard_state["auto_mode_enabled"] = False
+            self.btn_standard_mode.setStyleSheet(PILL_ACTIVE)
+            self.btn_auto_mode.setStyleSheet(PILL_INACTIVE)
+            self.auto_info_widget.setVisible(False)
+            self.standard_info_widget.setVisible(True)
+
+        self.btn_auto_mode.clicked.connect(_select_auto)
+        self.btn_standard_mode.clicked.connect(_select_standard)
+
+        self.content_layout.addSpacing(18)
+
+        # ── Audio Source ─────────────────────────────────────────────────────
+        lbl_audio = QLabel("Audio Source")
+        lbl_audio.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 600; background: transparent;")
+        lbl_audio.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.content_layout.addWidget(lbl_audio)
+        self.content_layout.addSpacing(6)
 
         self.audio_mode = QComboBox()
-        self.audio_mode.addItems(
-            [
-                "🖥️ System Audio (Recommended)",
-                "🎙️ Microphone Only",
-                "🌐 Both System & Microphone",
-            ]
-        )
+        self.audio_mode.addItems([
+            "🖥️ System Audio (Recommended)",
+            "🎙️ Microphone Only",
+            "🌐 Both System & Microphone",
+        ])
         self.audio_mode.setStyleSheet(STYLE_INPUT)
         self.audio_mode.setFixedWidth(280)
-        
-        # Restore mode
         modes = ["system", "mic", "both"]
         current_m = self.wizard_state.get("audio_mode", "system")
         if current_m in modes:
             self.audio_mode.setCurrentIndex(modes.index(current_m))
-            
         self.content_layout.addWidget(self.audio_mode, 0, Qt.AlignmentFlag.AlignCenter)
-
-        self.content_layout.addSpacing(12)
-
-        auto_note = QLabel(
-            "Auto Mode uses Whisper transcripts to answer complete spoken prompts automatically."
-        )
-        auto_note.setWordWrap(True)
-        auto_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        auto_note.setToolTip(
-            "Auto Mode keeps the reliable transcript-first pipeline, but answers when it can infer the intended question.\n"
-            "Standard mode waits for a clearer question signal before responding."
-        )
-        auto_note.setStyleSheet(
-            "color: #94a3b8; font-size: 10px; background: rgba(255,255,255,6); "
-            "border: 1px solid rgba(255,255,255,12); border-radius: 10px; padding: 10px 12px;"
-        )
-        self.content_layout.addWidget(auto_note)
-
-        self.content_layout.addSpacing(20)
-
-        # Gaze detection toggle (Custom Painted Widget)
-        self.chk_gaze = PremiumCheckBox("Enable gaze-based window fading")
-        self.chk_gaze.setChecked(self.wizard_state.get("gaze_enabled", False))
-        self.content_layout.addWidget(self.chk_gaze, 0, Qt.AlignmentFlag.AlignCenter)
-
-        self.content_layout.addSpacing(2)
-
-        desc_gaze = QLabel(
-            "Window fades when your mouse is near."
-        )
-        desc_gaze.setStyleSheet("color: #64748b; font-size: 9px; text-align: center;")
-        desc_gaze.setWordWrap(True)
-        desc_gaze.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.content_layout.addWidget(desc_gaze)
 
         self.content_layout.addSpacing(18)
 
-        self.content_layout.addStretch(2) # Balanced Spacing
+        # ── Gaze detection toggle ─────────────────────────────────────────────
+        # Align checkbox and description using a centered left-aligned sub-layout
+        gaze_container = QWidget()
+        gaze_container.setFixedWidth(260)
+        gaze_container.setStyleSheet("background: transparent;")
+        gaze_lay = QVBoxLayout(gaze_container)
+        gaze_lay.setContentsMargins(0, 0, 0, 0)
+        gaze_lay.setSpacing(2)
+
+        self.chk_gaze = PremiumCheckBox("Enable gaze-based window fading")
+        self.chk_gaze.setFixedWidth(260)
+        self.chk_gaze.setFixedHeight(22)
+        self.chk_gaze.setChecked(self.wizard_state.get("gaze_enabled", False))
+        gaze_lay.addWidget(self.chk_gaze)
+
+        desc_gaze = QLabel("Window fades when your mouse is near.")
+        desc_gaze.setStyleSheet("color: #64748b; font-size: 9px; background: transparent; margin-left: 28px;")
+        desc_gaze.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        gaze_lay.addWidget(desc_gaze)
+
+        self.content_layout.addWidget(gaze_container, 0, Qt.AlignmentFlag.AlignCenter)
+
+        self.content_layout.addSpacing(12)
+        self.content_layout.addStretch(2)
 
 
     def _step_complete(self):
@@ -729,11 +835,15 @@ class OnboardingWizard(QWidget):
             for prov, k in self.wizard_state["api_keys"].items():
                 if k:
                     self.config.set_api_key(prov, k)
+            if self.wizard_state.get("ollama_model"):
+                self.config.set("ai.providers.ollama.model", self.wizard_state["ollama_model"])
 
             # 2. Audio & UI
             self.config.set("ai.mode", self.wizard_state["ai_mode"])
             self.config.set("capture.audio.mode", self.wizard_state["audio_mode"])
             self.config.set("app.gaze_fade.enabled", self.wizard_state["gaze_enabled"])
+            # Auto mode: default is True — only override when user explicitly chose Standard
+            self.config.set("ai.auto_mode.enabled", self.wizard_state.get("auto_mode_enabled", True))
 
             # 3. Mark Completed
             self.config.set("onboarding.completed", True)
@@ -751,6 +861,11 @@ class OnboardingWizard(QWidget):
                 self.app.state.audio_source = self.wizard_state["audio_mode"]
                 logger.info("[Onboarding] Applying settings to running app")
                 self.app._apply_settings()
+                # Sync auto_mode state to the running app if it exposes toggle_auto_mode
+                auto_on = self.wizard_state.get("auto_mode_enabled", True)
+                current_auto = bool(self.app.config.get("ai.auto_mode.enabled", False))
+                if auto_on != current_auto and hasattr(self.app, "toggle_auto_mode"):
+                    self.app.toggle_auto_mode()
                 if hasattr(self.app, "overlay") and hasattr(
                     self.app.overlay, "standby_view"
                 ):
@@ -806,19 +921,29 @@ class OnboardingWizard(QWidget):
                 self.wizard_state["provider"] = selected_provider
 
         elif self._current_step == 2:
-            # Audio step
+            # Audio step — auto_mode_enabled is updated live by the pill buttons;
+            # read remaining widgets here.
             if hasattr(self, "ai_mode"):
-                idx = self.ai_mode.currentIndex()
-                ai_modes = ["general", "interview", "coding", "meeting", "exam", "writing"]
-                self.wizard_state["ai_mode"] = ai_modes[idx]
+                try:
+                    idx = self.ai_mode.currentIndex()
+                    ai_modes = ["general", "interview", "coding", "meeting", "exam", "writing"]
+                    self.wizard_state["ai_mode"] = ai_modes[idx]
+                except RuntimeError:
+                    pass
 
             if hasattr(self, "audio_mode"):
-                idx = self.audio_mode.currentIndex()
-                modes = ["system", "mic", "both"]
-                self.wizard_state["audio_mode"] = modes[idx]
+                try:
+                    idx = self.audio_mode.currentIndex()
+                    modes = ["system", "mic", "both"]
+                    self.wizard_state["audio_mode"] = modes[idx]
+                except RuntimeError:
+                    pass
 
             if hasattr(self, "chk_gaze"):
-                self.wizard_state["gaze_enabled"] = self.chk_gaze.isChecked()
+                try:
+                    self.wizard_state["gaze_enabled"] = self.chk_gaze.isChecked()
+                except RuntimeError:
+                    pass
 
         # Update summary UI if we are entering or in the summary step
         self._update_summary()
@@ -851,6 +976,9 @@ class OnboardingWizard(QWidget):
             except RuntimeError:
                 pass
         
+        if hasattr(self, "ollama_model_container"):
+            self.ollama_model_container.setVisible(p == "ollama")
+        
         self._refresh_provider_link(p)
         self._apply_provider_test_state(p)
 
@@ -870,7 +998,6 @@ class OnboardingWizard(QWidget):
         self.provider_card_label.setText(
             "Local engine" if provider_id == "ollama" else "Connection"
         )
-        self.lbl_key.setText("Endpoint" if provider_id == "ollama" else "API Key")
         if hasattr(self, "api_key_input"):
             try:
                 self.api_key_input.setPlaceholderText(
@@ -912,20 +1039,18 @@ class OnboardingWizard(QWidget):
             
             self.summary_provider.setText(f"{prov_names.get(prov_id, prov_id)}: {key_masked}")
 
-            # 2. Audio Mode
+            # 2. Audio Mode + AI Mode
+            auto_on = self.wizard_state.get("auto_mode_enabled", True)
             ai_mode = self.wizard_state["ai_mode"]
             ai_mode_names = {
-                "general": "General",
-                "interview": "Interview",
-                "coding": "Coding",
-                "meeting": "Meeting",
-                "exam": "Exam",
-                "writing": "Writing",
+                "general": "General", "interview": "Interview", "coding": "Coding",
+                "meeting": "Meeting", "exam": "Exam", "writing": "Writing",
             }
             mode = self.wizard_state["audio_mode"]
             mode_names = {"system": "Desktop Speakers", "mic": "Microphone", "both": "Hybrid (System+Mic)"}
+            mode_label = "Auto Mode" if auto_on else ai_mode_names.get(ai_mode, ai_mode)
             self.summary_audio.setText(
-                f"{ai_mode_names.get(ai_mode, ai_mode)} | {mode_names.get(mode, mode)}"
+                f"{mode_label} | {mode_names.get(mode, mode)}"
             )
 
             # 3. Gaze Fade
@@ -1082,11 +1207,43 @@ class OnboardingWizard(QWidget):
                 extra = "" if len(models) <= 2 else f" +{len(models) - 2} more"
                 detail_text = f"{message} | {preview}{extra}"
 
+            if hasattr(self, "ollama_model_combo"):
+                self.ollama_model_combo.blockSignals(True)
+                self.ollama_model_combo.clear()
+                if success and models:
+                    self.ollama_model_combo.addItems(models)
+                    saved_model = self.config.get("ai.providers.ollama.model", "")
+                    target_model = saved_model if saved_model in models else models[0]
+                    for m in models:
+                        m_lower = m.lower()
+                        if "llama" in m_lower or "qwen" in m_lower or "gemma" in m_lower or "mistral" in m_lower or "phi" in m_lower:
+                            if not saved_model:
+                                target_model = m
+                                break
+                    idx = models.index(target_model)
+                    self.ollama_model_combo.setCurrentIndex(idx)
+                    self.ollama_model_combo.setEnabled(True)
+                    self.wizard_state["ollama_model"] = target_model
+                else:
+                    self.ollama_model_combo.addItem("Ollama test failed" if not success else "No local models found")
+                    self.ollama_model_combo.setEnabled(False)
+                self.ollama_model_combo.blockSignals(False)
+
         self.wizard_state.setdefault("provider_test_results", {})[provider_id] = {
             "success": success,
             "message": detail_text,
             "details": details,
         }
+
+        # Save test health and timestamp to config so settings screen reflects it
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime("%H:%M:%S")
+        self.config.set(f"ai.providers.{provider_id}.last_test", {
+            "success": bool(success),
+            "message": str(detail_text),
+            "timestamp": ts
+        })
+        self.config.save()
 
         try:
             ai = getattr(self.app, "ai", None)

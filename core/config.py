@@ -246,7 +246,7 @@ class Config:
         self._data["ai"]["vision"].setdefault("max_bytes", 1_800_000)  # ~1.8MB
         self._data["ai"]["vision"].setdefault("min_downscale_w", 720)
         self._data["ai"].setdefault("auto_mode", {})
-        self._data["ai"]["auto_mode"].setdefault("enabled", False)
+        self._data["ai"]["auto_mode"].setdefault("enabled", True)  # Auto mode ON by default
         self._data["ai"]["auto_mode"].setdefault("speculative_interim", {})
         self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("enabled", True)
         self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("stability_ms", 650)
