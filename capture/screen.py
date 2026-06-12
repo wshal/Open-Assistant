@@ -63,7 +63,7 @@ class ScreenCapture(QObject):
         self._analysis_jpeg_quality = quality_jpeg.get(analysis_quality, self._jpeg_quality)
 
         self._smart_crop_enabled = config.get("capture.screen.smart_crop", True)
-        self._enabled = config.get("capture.screen.enabled", True)
+        self._enabled = config.get("capture.screen.enabled", False)
 
         # P1.1: Cache OCR/hash per active window (title-based by default).
         self._window_states: dict[str, _WindowState] = {}

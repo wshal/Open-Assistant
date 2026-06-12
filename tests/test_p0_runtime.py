@@ -25,7 +25,7 @@ from ai.providers.ollama_provider import OllamaProvider
 from ai.prompts import PromptBuilder
 from stealth.anti_detect import StealthManager
 from ui.settings_view import ProviderTestWorker, SettingsView
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QWidget
 
 
 class ConfigStub:
@@ -2735,6 +2735,10 @@ class ProcessUtilsTests(unittest.TestCase):
 
 
 class StealthManagerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.qt_app = QApplication.instance() or QApplication([])
+
     def test_windows_prefers_exclude_from_capture(self):
         class FakeWindow:
             def winId(self):
@@ -2827,6 +2831,185 @@ class StealthManagerTests(unittest.TestCase):
         self.assertEqual(manager.get_status()["state"], "limited")
         self.assertEqual(manager.get_status()["platform"], "limited")
 
+    def test_activate_ghost_cursor_respects_ghost_cursor_config(self):
+        config = ConfigStub({"stealth.enabled": True, "stealth.ghost_cursor": False})
+        manager = StealthManager(config)
+        
+        # If disabled in config, activate_ghost_cursor should return early without setting active state
+        manager.activate_ghost_cursor(Mock())
+        self.assertFalse(manager._ghost_cursor_active)
+
+    def test_app_toggles_ghost_cursor(self):
+        from core.app import OpenAssistApp
+        
+        class FakeApp:
+            def __init__(self):
+                self.config = ConfigStub({"stealth.ghost_cursor": True})
+                self.stealth = Mock()
+                self.overlay = Mock()
+                self._active_view = Mock(return_value=None)
+                
+            def toggle_ghost_cursor(self):
+                OpenAssistApp.toggle_ghost_cursor(self)
+
+        app = FakeApp()
+        app.toggle_ghost_cursor()
+        
+        # Value in config should be negated (True -> False) and saved
+        self.assertFalse(app.config.get("stealth.ghost_cursor", True))
+        app.stealth.deactivate_ghost_cursor.assert_called_once()
+
+    def test_app_toggles_vision(self):
+        from core.app import OpenAssistApp
+        
+        class FakeApp:
+            def __init__(self):
+                self.config = ConfigStub({"capture.screen.enabled": True})
+                self.screen = Mock()
+                self.overlay = Mock()
+                
+            def toggle_vision(self):
+                OpenAssistApp.toggle_vision(self)
+
+        app = FakeApp()
+        app.toggle_vision()
+        
+        # Value in config should be negated (True -> False) and saved
+        self.assertFalse(app.config.get("capture.screen.enabled", True))
+        app.screen.set_enabled.assert_called_once_with(False)
+
+    def test_ghost_cursor_lifecycle(self):
+        config = ConfigStub({"stealth.enabled": True, "stealth.ghost_cursor": True})
+        manager = StealthManager(config)
+        
+        # Real QWidget as fake window
+        window = QWidget()
+
+        # Activate ghost cursor
+        manager.activate_ghost_cursor(window)
+        self.assertTrue(manager._ghost_cursor_active)
+        self.assertIn(id(window), manager._ghost_cursors)
+        self.assertTrue(manager._ghost_cursors[id(window)].is_active)
+        
+        # Deactivate ghost cursor
+        manager.deactivate_ghost_cursor()
+        self.assertFalse(manager._ghost_cursor_active)
+        self.assertFalse(manager._ghost_cursors[id(window)].is_active)
+
+    def test_stealth_tooltip_filter(self):
+        from stealth.ghost_cursor import GlobalStealthToolTipFilter, StealthToolTip
+        from PyQt6.QtWidgets import QPushButton
+        from PyQt6.QtCore import QEvent
+        
+        class OverlayWindow(QWidget):
+            pass
+
+        overlay = OverlayWindow()
+        overlay.show()
+        button = QPushButton(overlay)
+        button.setToolTip("Test Tooltip Info")
+        
+        filter_obj = GlobalStealthToolTipFilter(self.qt_app)
+        
+        # Test tooltip event on our fake overlay button
+        event = QEvent(QEvent.Type.ToolTip)
+        res = filter_obj.eventFilter(button, event)
+        
+        # Filter should intercept (return True) and create a StealthToolTip child widget
+        self.assertTrue(res)
+        
+        wid = id(overlay)
+        self.assertIn(wid, filter_obj.tooltips)
+        tooltip_widget = filter_obj.tooltips[wid]
+        self.assertIsInstance(tooltip_widget, StealthToolTip)
+        self.assertTrue(tooltip_widget.isVisible())
+        self.assertEqual(tooltip_widget.label.text(), "Test Tooltip Info")
+        
+        # Test leave event hides tooltip
+        leave_event = QEvent(QEvent.Type.Leave)
+        filter_obj.eventFilter(button, leave_event)
+        self.assertFalse(tooltip_widget.isVisible())
+        
+        # Test non-overlay widget passes through
+        normal_win = QWidget()
+        normal_btn = QPushButton(normal_win)
+        normal_btn.setToolTip("Normal Tooltip")
+        res_normal = filter_obj.eventFilter(normal_btn, event)
+        self.assertFalse(res_normal)  # Should not be intercepted
+
+    def test_overlay_ghost_cursor_events(self):
+        from ui.overlay import OverlayWindow
+        from PyQt6.QtGui import QEnterEvent, QHideEvent
+        from PyQt6.QtCore import QPointF, QEvent
+
+        config = ConfigStub()
+        mock_app = Mock()
+        mock_app.state = Mock()
+        mock_app.state.muted_changed = Mock()
+        mock_app.state.hud_mode_changed = Mock()
+        mock_app.state.capturing_changed = Mock()
+        mock_app.state.mode_changed = Mock()
+        mock_app.state.is_mini = False
+        mock_app.state.session_context = ""
+        mock_app.stealth = Mock()
+        mock_app.stealth.enabled = True
+
+        overlay = OverlayWindow(config, mock_app)
+        
+        # Test enterEvent
+        enter_ev = QEnterEvent(QPointF(0,0), QPointF(0,0), QPointF(0,0))
+        overlay.enterEvent(enter_ev)
+        mock_app.stealth.activate_ghost_cursor.assert_called_with(overlay)
+
+        # Test leaveEvent
+        leave_ev = QEvent(QEvent.Type.Leave)
+        overlay.leaveEvent(leave_ev)
+        mock_app.stealth.deactivate_ghost_cursor.assert_called()
+
+        mock_app.stealth.reset_mock()
+
+        # Test hideEvent
+        hide_ev = QHideEvent()
+        overlay.hideEvent(hide_ev)
+        mock_app.stealth.deactivate_ghost_cursor.assert_called()
+
+    def test_mini_overlay_ghost_cursor_events(self):
+        from ui.mini_overlay import MiniOverlay
+        from PyQt6.QtGui import QEnterEvent, QHideEvent
+        from PyQt6.QtCore import QPointF, QEvent
+
+        config = ConfigStub()
+        mock_app = Mock()
+        mock_app.state = Mock()
+        mock_app.state.muted_changed = Mock()
+        mock_app.state.hud_mode_changed = Mock()
+        mock_app.state.capturing_changed = Mock()
+        mock_app.state.mode_changed = Mock()
+        mock_app.state.is_mini = False
+        mock_app.state.session_context = ""
+        mock_app.stealth = Mock()
+        mock_app.stealth.enabled = True
+
+        mini = MiniOverlay(config, mock_app)
+        
+        # Test enterEvent
+        enter_ev = QEnterEvent(QPointF(0,0), QPointF(0,0), QPointF(0,0))
+        mini.enterEvent(enter_ev)
+        mock_app.stealth.activate_ghost_cursor.assert_called_with(mini)
+
+        # Test leaveEvent
+        leave_ev = QEvent(QEvent.Type.Leave)
+        mini.leaveEvent(leave_ev)
+        mock_app.stealth.deactivate_ghost_cursor.assert_called()
+
+        mock_app.stealth.reset_mock()
+
+        # Test hideEvent
+        hide_ev = QHideEvent()
+        mini.hideEvent(hide_ev)
+        mock_app.stealth.deactivate_ghost_cursor.assert_called()
+
 
 if __name__ == "__main__":
     unittest.main()
+

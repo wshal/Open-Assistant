@@ -5,6 +5,7 @@ from ctypes import c_void_p
 import sys
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QCursor
 
 from utils.logger import setup_logger
 
@@ -23,6 +24,10 @@ class StealthManager:
         self.config = config
         self.enabled = config.get("stealth.enabled", True)
         self._last_affinity_state = {}
+        self._ghost_cursors = {}       # window → GhostCursorWidget child
+        self._ghost_cursor_active = False
+        self._blank_cursor_applied = False
+        self._static_cursor = None     # StaticCursorOverlay top-level window
         self._status = {
             "state": "limited",
             "platform": self.protection_level(),
@@ -54,6 +59,112 @@ class StealthManager:
     def should_hide_for_screen_share(self) -> bool:
         """Hide the HUD only when the platform lacks strong anti-capture support."""
         return self.protection_level() != "strong"
+
+    # ── Ghost Cursor ─────────────────────────────────────────────────────
+
+    def _get_ghost_cursor(self, window):
+        """Get or create a GhostCursorWidget for *window*.
+
+        The widget is a child of *window*, so it shares the same HWND and
+        has no DWM compositor surface (no transparent box).
+        """
+        wid = id(window)
+        cursor = self._ghost_cursors.get(wid)
+        if cursor is not None:
+            return cursor
+        try:
+            from stealth.ghost_cursor import GhostCursorWidget
+            cursor = GhostCursorWidget(window)
+            self._ghost_cursors[wid] = cursor
+            # Clean up when window is destroyed — restore real cursor if active
+            window.destroyed.connect(
+                lambda _=None, w=wid: self._on_ghost_window_destroyed(w)
+            )
+            logger.debug("Ghost cursor child widget created for %s", type(window).__name__)
+            return cursor
+        except Exception as e:
+            logger.warning("Failed to create ghost cursor: %s", e)
+            return None
+
+    def _on_ghost_window_destroyed(self, wid):
+        """Called when a window with a ghost cursor child is destroyed.
+
+        Removes the stale dict entry AND restores the real cursor if
+        the ghost cursor was active — prevents the cursor from being
+        stuck blank forever.
+        """
+        self._ghost_cursors.pop(wid, None)
+        if self._ghost_cursor_active:
+            self.deactivate_ghost_cursor()
+
+    def activate_ghost_cursor(self, window):
+        """Hide the real cursor and show the ghost cursor inside *window*.
+
+        Called when the mouse enters an overlay window while stealth is active.
+        """
+        if not self.enabled:
+            return
+        if not self.config.get("stealth.ghost_cursor", True):
+            return
+        if self._ghost_cursor_active:
+            return
+
+        cursor = self._get_ghost_cursor(window)
+        if cursor is None:
+            return
+
+        self._ghost_cursor_active = True
+
+        # Show static cursor overlay at the entry point so viewers see it parked
+        try:
+            entry_pos = QCursor.pos()
+            if self._static_cursor is None:
+                from stealth.ghost_cursor import StaticCursorOverlay
+                self._static_cursor = StaticCursorOverlay()
+            # Update cursor image and DPI-specific hotspot
+            self._static_cursor.update_cursor()
+            hspot = self._static_cursor.hotspot()
+            # Position overlay so cursor hotspot is exactly at entry point
+            self._static_cursor.move(entry_pos - hspot)
+            self._static_cursor.show()
+            self._static_cursor.raise_()
+        except Exception as e:
+            logger.warning("Failed to show static cursor overlay: %s", e)
+
+        # Hide the real cursor application-wide while over the protected window
+        from PyQt6.QtWidgets import QApplication
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.BlankCursor))
+        self._blank_cursor_applied = True
+        cursor.activate()
+
+    def deactivate_ghost_cursor(self):
+        """Restore the real cursor and hide all ghost cursors.
+
+        Called when the mouse leaves an overlay window or the window hides.
+        """
+        if not self._ghost_cursor_active:
+            return
+        self._ghost_cursor_active = False
+
+        # Hide the static cursor overlay
+        if self._static_cursor is not None:
+            try:
+                self._static_cursor.hide()
+            except Exception as e:
+                logger.debug("Failed to hide static cursor overlay: %s", e)
+
+        # Iterate a snapshot — destroyed signal could mutate the dict
+        for cursor in list(self._ghost_cursors.values()):
+            try:
+                if cursor.is_active:
+                    cursor.deactivate()
+            except RuntimeError:
+                # C++ object already deleted (window destroyed concurrently)
+                pass
+        if self._blank_cursor_applied:
+            from PyQt6.QtWidgets import QApplication
+            QApplication.restoreOverrideCursor()
+            self._blank_cursor_applied = False
 
     def get_status(self) -> dict:
         """Return the latest stealth protection status for diagnostics/UI."""

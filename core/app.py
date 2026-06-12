@@ -68,6 +68,15 @@ class OpenAssistApp(QObject):
         self.is_running = True
         self.qt_app = QApplication.instance() or QApplication(sys.argv)
 
+        # Install global stealth tooltip filter to prevent OS tooltips from leaking under screen capture
+        try:
+            from stealth.ghost_cursor import GlobalStealthToolTipFilter
+            self._tooltip_filter = GlobalStealthToolTipFilter(self)
+            self.qt_app.installEventFilter(self._tooltip_filter)
+            logger.info("Global stealth tooltip filter installed successfully")
+        except Exception as e:
+            logger.warning("Failed to install global stealth tooltip filter: %s", e)
+
         # Components
         self.history = ResponseHistory()
         self.rag = RAGEngine(config)
@@ -300,7 +309,7 @@ class OpenAssistApp(QObject):
 
         capture_active = bool(getattr(self.state, "is_capturing", False))
         audio_enabled = bool(self.config.get("capture.audio.enabled", True))
-        screen_enabled = bool(self.config.get("capture.screen.enabled", True))
+        screen_enabled = bool(self.config.get("capture.screen.enabled", False))
 
         self.overlay.update_status(
             provider=provider,
@@ -541,7 +550,7 @@ class OpenAssistApp(QObject):
         self.state.audio_source = self.config.get("capture.audio.mode", "system")
         self.state.is_muted = bool(self.config.get("capture.audio.muted", False))
         self.state.is_stealth = self.config.get("stealth.enabled", True)
-        screen_enabled = bool(self.config.get("capture.screen.enabled", True))
+        screen_enabled = bool(self.config.get("capture.screen.enabled", False))
         if hasattr(self, "screen") and self.screen and hasattr(self.screen, "set_enabled"):
             self.screen.set_enabled(screen_enabled)
         if hasattr(self, "overlay") and self.overlay and hasattr(self.overlay, "update_vision_state"):
@@ -1622,6 +1631,86 @@ class OpenAssistApp(QObject):
             except Exception as e:
                 logger.debug(f"Audio mute config save skipped: {e}")
 
+    def toggle_ghost_cursor(self):
+        """Toggle the ghost cursor configuration dynamically and handle active cursor states."""
+        new_val = not self.config.get("stealth.ghost_cursor", True)
+        self.config.set("stealth.ghost_cursor", new_val)
+        try:
+            self.config.save()
+        except Exception as e:
+            logger.debug(f"Ghost cursor config save skipped: {e}")
+        logger.info("Ghost cursor dynamically toggled to %s", new_val)
+
+        # Dynamically deactivate if it is now disabled
+        if not new_val:
+            self.stealth.deactivate_ghost_cursor()
+        else:
+            # If it's now enabled, and mouse is currently over our active view, activate it.
+            from PyQt6.QtGui import QCursor
+            view = self._active_view()
+            if view and view.isVisible():
+                cursor_pos = QCursor.pos()
+                local_pos = view.mapFromGlobal(cursor_pos)
+                if view.rect().contains(local_pos):
+                    self.stealth.activate_ghost_cursor(view)
+
+        # If the settings view is open, update its checkbox state
+        settings = getattr(self.overlay, "settings_view", None)
+        if settings and hasattr(settings, "chk_ghost_cursor") and settings.isVisible():
+            settings.chk_ghost_cursor.blockSignals(True)
+            settings.chk_ghost_cursor.setChecked(new_val)
+            settings.chk_ghost_cursor.blockSignals(False)
+
+        # Show a subtle visual cue / status message to the user in the transcript overlay
+        if hasattr(self.overlay, "update_transcript"):
+            self.overlay.update_transcript(
+                "Ghost cursor enabled (hidden on share)."
+                if new_val
+                else "Ghost cursor disabled (system cursor shown)."
+            )
+
+    def toggle_vision(self):
+        """Toggle vision screen capture dynamically (on/off)."""
+        current_enabled = self.config.get("capture.screen.enabled", False)
+        new_enabled = not current_enabled
+        self.config.set("capture.screen.enabled", new_enabled)
+        if hasattr(self, "screen") and self.screen:
+            self.screen.set_enabled(new_enabled)
+        try:
+            self.config.save()
+        except Exception as e:
+            logger.debug(f"Vision capture config save skipped: {e}")
+        logger.info("Vision capture toggled to: %s", new_enabled)
+
+        # Trigger immediate capture when turning vision back ON so the user gets instant feedback
+        if new_enabled and getattr(self, "session_active", False):
+            _loop = getattr(self, "loop", None)
+            if _loop and _loop.is_running() and hasattr(self, "screen") and self.screen:
+                import asyncio
+                asyncio.run_coroutine_threadsafe(
+                    self.screen.capture_now(emit_signal=True),
+                    _loop
+                )
+
+        # Notify the UI settings checkbox if the Settings view is currently visible
+        settings = getattr(self.overlay, "settings_view", None)
+        if settings and hasattr(settings, "chk_vision_enabled") and settings.isVisible():
+            settings.chk_vision_enabled.blockSignals(True)
+            settings.chk_vision_enabled.setChecked(new_enabled)
+            settings.chk_vision_enabled.blockSignals(False)
+
+        # Sync the eye/monkey icon on the overlay
+        if hasattr(self.overlay, "update_vision_state"):
+            self.overlay.update_vision_state(reset_to_master=False)
+
+        # Show a subtle visual cue / status message in the transcript overlay
+        if hasattr(self.overlay, "update_transcript"):
+            self.overlay.update_transcript(
+                "Vision capture enabled."
+                if new_enabled
+                else "Vision capture paused."
+            )
+
     def scroll_up(self):
         if (
             hasattr(self.overlay, "stack")
@@ -2383,7 +2472,7 @@ class OpenAssistApp(QObject):
 
         def _warm_vision():
             try:
-                if not bool(self.config.get("capture.screen.enabled", True)):
+                if not bool(self.config.get("capture.screen.enabled", False)):
                     logger.info("Vision warmup skipped: capture.screen.enabled=false")
                     return
                 self.screen.initialize()

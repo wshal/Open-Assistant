@@ -76,6 +76,26 @@ class UiTabMixin:
         )
         l.addWidget(desc_hud_opacity)
 
+        lbl_ghost_cursor = QLabel("STEALTH CURSOR")
+        lbl_ghost_cursor.setStyleSheet(
+            f"{TEXT_PRIMARY} font-size: 11px; font-weight: 800; background: transparent;"
+        )
+        l.addWidget(lbl_ghost_cursor)
+
+        self.chk_ghost_cursor = PremiumCheckBox("Enable ghost cursor during capture protection")
+        self.chk_ghost_cursor.setChecked(self.config.get("stealth.ghost_cursor", True))
+        l.addWidget(self.chk_ghost_cursor)
+
+        desc_ghost_cursor = QLabel(
+            "Draws a local ghost cursor on the overlay while hiding your real cursor from stream viewers. "
+            "Disable to keep the normal system cursor visible (which may show up in screen shares)."
+        )
+        desc_ghost_cursor.setWordWrap(True)
+        desc_ghost_cursor.setStyleSheet(
+            f"{TEXT_MUTED} font-size: 10px; background: transparent;"
+        )
+        l.addWidget(desc_ghost_cursor)
+
         lbl_normal_opacity = QLabel("NORMAL HUD VISIBILITY")
         lbl_normal_opacity.setStyleSheet(
             f"{TEXT_PRIMARY} font-size: 11px; font-weight: 800; background: transparent;"

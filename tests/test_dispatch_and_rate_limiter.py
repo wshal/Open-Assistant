@@ -56,6 +56,8 @@ def test_hotkey_dispatch_uses_signal_bridge_instead_of_thread_local_timer():
         move_up=lambda: None,
         move_down=lambda: None,
         toggle_audio=lambda: None,
+        toggle_ghost_cursor=lambda: None,
+        toggle_vision=lambda: None,
         emergency_erase=lambda: None,
         toggle_mini_mode=lambda: None,
         switch_mode=lambda: None,

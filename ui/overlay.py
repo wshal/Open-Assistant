@@ -1041,7 +1041,7 @@ class OverlayWindow(QMainWindow):
         to the live module (called at session start to snap back to the saved setting).
         """
         if reset_to_master:
-            master_enabled = self.config.get("capture.screen.enabled", True)
+            master_enabled = self.config.get("capture.screen.enabled", False)
             if hasattr(self.app, "screen") and self.app.screen:
                 self.app.screen.set_enabled(master_enabled)
 
@@ -1345,6 +1345,18 @@ class OverlayWindow(QMainWindow):
         else:
             self._drag = False
 
+    def enterEvent(self, event):
+        """Activate the ghost cursor when the mouse enters the overlay."""
+        super().enterEvent(event)
+        if hasattr(self.app, "stealth") and self.app.stealth.enabled:
+            self.app.stealth.activate_ghost_cursor(self)
+
+    def leaveEvent(self, event):
+        """Deactivate the ghost cursor when the mouse leaves the overlay."""
+        super().leaveEvent(event)
+        if hasattr(self.app, "stealth"):
+            self.app.stealth.deactivate_ghost_cursor()
+
     def showEvent(self, e):
         super().showEvent(e)
         if hasattr(self.app, "_apply_window_effects"):
@@ -1355,6 +1367,9 @@ class OverlayWindow(QMainWindow):
             self._gaze_timer.start(100)
 
     def hideEvent(self, e):
+        # Ensure ghost cursor is cleaned up if window hides while mouse is over it
+        if hasattr(self.app, "stealth"):
+            self.app.stealth.deactivate_ghost_cursor()
         if hasattr(self, "_gaze_timer") and self._gaze_timer.isActive():
             self._gaze_timer.stop()
         # M23 FIX: Stop the periodic markdown render timer on hide.

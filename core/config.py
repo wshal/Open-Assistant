@@ -379,6 +379,7 @@ class Config:
         self._data["app"]["gaze_fade"].setdefault("target_opacity", 0.10)
         self._data.setdefault("stealth", {})
         self._data["stealth"].setdefault("enabled", True)
+        self._data["stealth"].setdefault("ghost_cursor", True)
         self._data["stealth"].setdefault("auto_hide_on_share", True)
         self._data["stealth"].setdefault("low_opacity", 0.75)
         self._data.setdefault("hotkeys", {})
@@ -397,6 +398,8 @@ class Config:
         hotkeys.setdefault("history_prev", "ctrl+[")
         hotkeys.setdefault("history_next", "ctrl+]")
         hotkeys.setdefault("toggle_audio", "ctrl+shift+a")
+        hotkeys.setdefault("toggle_ghost_cursor", "ctrl+alt+g")
+        hotkeys.setdefault("toggle_vision", "ctrl+alt+v")
         hotkeys.setdefault("mini_mode", "ctrl+alt+n")
         hotkeys.setdefault("emergency_erase", "ctrl+shift+e")
         # Hotkeys exposed in the SHORTCUTS settings tab but previously missing

@@ -174,6 +174,8 @@ class HotkeyManager:
             "move_up": self.app.move_up,
             "move_down": self.app.move_down,
             "toggle_audio": self.app.toggle_audio,
+            "toggle_ghost_cursor": getattr(self.app, "toggle_ghost_cursor", lambda: None),
+            "toggle_vision": getattr(self.app, "toggle_vision", lambda: None),
             "emergency_erase": self.app.emergency_erase,
             "mini_mode": self.app.toggle_mini_mode,
             "switch_mode": self.app.switch_mode,

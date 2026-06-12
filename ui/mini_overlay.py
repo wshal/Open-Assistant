@@ -658,6 +658,9 @@ class MiniOverlay(QMainWindow):
         self._gaze_timer.start(100)
 
     def hideEvent(self, e):
+        # Ensure ghost cursor is cleaned up if window hides while mouse is over it
+        if hasattr(self.app, "stealth"):
+            self.app.stealth.deactivate_ghost_cursor()
         # P1.6: Pause gaze polling while hidden — avoids 100ms busy-loop when invisible
         self._gaze_timer.stop()
         super().hideEvent(e)
@@ -741,6 +744,18 @@ class MiniOverlay(QMainWindow):
 
     def mouseReleaseEvent(self, e):
         self._drag = False
+
+    def enterEvent(self, event):
+        """Activate the ghost cursor when the mouse enters the mini overlay."""
+        super().enterEvent(event)
+        if hasattr(self.app, "stealth") and self.app.stealth.enabled:
+            self.app.stealth.activate_ghost_cursor(self)
+
+    def leaveEvent(self, event):
+        """Deactivate the ghost cursor when the mouse leaves the mini overlay."""
+        super().leaveEvent(event)
+        if hasattr(self.app, "stealth"):
+            self.app.stealth.deactivate_ghost_cursor()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:

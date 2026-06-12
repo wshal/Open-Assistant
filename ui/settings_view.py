@@ -723,6 +723,16 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
                 bool(self.config.get("app.gaze_fade.enabled", False))
             )
 
+        if hasattr(self, "chk_ghost_cursor"):
+            self.chk_ghost_cursor.setChecked(
+                bool(self.config.get("stealth.ghost_cursor", True))
+            )
+
+        if hasattr(self, "chk_vision_enabled"):
+            self.chk_vision_enabled.setChecked(
+                bool(self.config.get("capture.screen.enabled", False))
+            )
+
         if hasattr(self, "margin_slider"):
             current_margin = self.config.get("app.gaze_fade.margin", 60)
             margin_map = {20: 0, 30: 1, 40: 2, 50: 3, 60: 4, 80: 5}
@@ -1019,6 +1029,24 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
                     "app.gaze_fade.target_opacity",
                     opacity_values[self.opacity_slider.currentIndex()],
                 )
+
+            if hasattr(self, "chk_ghost_cursor"):
+                was_enabled = self.config.get("stealth.ghost_cursor", True)
+                is_enabled = self.chk_ghost_cursor.isChecked()
+                self.config.set("stealth.ghost_cursor", is_enabled)
+                if was_enabled and not is_enabled:
+                    if self.app and hasattr(self.app, "stealth"):
+                        self.app.stealth.deactivate_ghost_cursor()
+                elif (not was_enabled) and is_enabled:
+                    if self.app and hasattr(self.app, "stealth"):
+                        active_view = getattr(self.app, "_active_view", lambda: None)()
+                        if active_view and active_view.isVisible():
+                            from PyQt6.QtGui import QCursor
+
+                            cursor_pos = QCursor.pos()
+                            local_pos = active_view.mapFromGlobal(cursor_pos)
+                            if active_view.rect().contains(local_pos):
+                                self.app.stealth.activate_ghost_cursor(active_view)
 
             self.config.save()
             logger.info("[Settings] Config save completed")

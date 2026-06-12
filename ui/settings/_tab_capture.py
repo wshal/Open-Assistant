@@ -289,7 +289,7 @@ class CaptureTabMixin:
         l.addWidget(lbl2)
 
         self.chk_vision_enabled = PremiumCheckBox("Enable Vision (Screen Capture + OCR)")
-        self.chk_vision_enabled.setChecked(self.config.get("capture.screen.enabled", True))
+        self.chk_vision_enabled.setChecked(self.config.get("capture.screen.enabled", False))
         l.addWidget(self.chk_vision_enabled)
         vision_desc = QLabel(
             "Master switch for screen analysis. When disabled, the AI runs in audio-only mode for minimal latency."
