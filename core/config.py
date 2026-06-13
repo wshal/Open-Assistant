@@ -357,6 +357,7 @@ class Config:
         # Previously missing — slider values were silently ignored on fresh installs.
         self._data["capture"]["audio"]["vad"].setdefault("inter_turn_start_silence_ms", 400)
         self._data["capture"]["audio"]["vad"].setdefault("stop_silence_ms", 700)
+        self._data["capture"]["audio"]["vad"].setdefault("adaptive_enabled", True)
 
         # Final speech transcript gating: ignore tiny non-question scraps like
         # "API." so they do not pollute session context or auto-trigger answers.

@@ -925,6 +925,7 @@ class TestP2ASRVADCustomization(unittest.TestCase):
         cfg = Config()
         cfg.set("capture.audio.vad.inter_turn_start_silence_ms", 400)
         cfg.set("capture.audio.vad.stop_silence_ms", 700)
+        cfg.set("capture.audio.vad.adaptive_enabled", False)
 
         app_mock = MagicMock()
         app_mock.state.session_context = ""

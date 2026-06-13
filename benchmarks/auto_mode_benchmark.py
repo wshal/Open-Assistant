@@ -844,6 +844,8 @@ class AutoModeTester:
         if self.current_fixture_idx >= len(self.fixtures):
             self.finish_suite()
             return
+        if not getattr(self.app, "session_active", False):
+            self.app.start_new_session()
         if not self._fixture_runtime_ready():
             if self._runtime_wait_started_at <= 0.0:
                 self._runtime_wait_started_at = time.time()
@@ -862,8 +864,6 @@ class AutoModeTester:
                 safe_print("Waiting for standard AI providers before starting fixture...")
                 QTimer.singleShot(1000, self.next_fixture)
                 return
-        if not getattr(self.app, "session_active", False):
-            self.app.start_new_session()
         try:
             self.app.reset_benchmark_fixture_runtime()
         except Exception as e:

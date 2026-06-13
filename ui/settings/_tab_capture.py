@@ -1,6 +1,6 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QSlider,
-    QScrollArea, QFrame, QMessageBox
+    QScrollArea, QFrame, QMessageBox, QSpinBox
 )
 from PyQt6.QtCore import Qt, QMetaObject, Q_ARG
 from ui.custom_widgets import PremiumCheckBox
@@ -178,6 +178,22 @@ class CaptureTabMixin:
         sep3.setStyleSheet("background: rgba(255,255,255,12);")
         l.addWidget(sep3)
 
+        # Adaptive VAD Checkbox
+        self.chk_adaptive_vad = PremiumCheckBox("Enable Adaptive VAD (Dynamic Start & Stop)")
+        self.chk_adaptive_vad.setChecked(bool(self.config.get("capture.audio.vad.adaptive_enabled", True)))
+        l.addWidget(self.chk_adaptive_vad)
+        adaptive_desc = QLabel(
+            "Automatically scales the start quiet gap based on ambient noise and the end silence threshold based on speaker speed (WPM)."
+        )
+        adaptive_desc.setWordWrap(True)
+        adaptive_desc.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
+        l.addWidget(adaptive_desc)
+
+        sep_adaptive = QFrame()
+        sep_adaptive.setFixedHeight(1)
+        sep_adaptive.setStyleSheet("background: rgba(255,255,255,12);")
+        l.addWidget(sep_adaptive)
+
         # VAD sliders
         lbl_vad_start = self._make_section_label("VAD START SILENCE THRESHOLD")
         l.addWidget(lbl_vad_start)
@@ -209,15 +225,36 @@ class CaptureTabMixin:
             }
             """
         )
-        self.vad_start_value = QLabel(f"{self.vad_start_slider.value()}ms")
-        self.vad_start_value.setStyleSheet(
-            f"{TEXT_MUTED} font-size: 10px; font-weight: 700; background: transparent;"
+        self.vad_start_spin = QSpinBox()
+        self.vad_start_spin.setRange(100, 2000)
+        self.vad_start_spin.setSingleStep(50)
+        self.vad_start_spin.setSuffix("ms")
+        self.vad_start_spin.setValue(self.vad_start_slider.value())
+        self.vad_start_spin.setStyleSheet(
+            """
+            QSpinBox {
+                background: rgba(20,20,40,220);
+                color: #e0e0f5;
+                border: 1px solid rgba(80,85,255,20);
+                border-radius: 6px;
+                padding: 4px 6px;
+                font-size: 11px;
+                font-weight: bold;
+                min-width: 60px;
+                max-width: 60px;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background: rgba(255,255,255,10);
+                border-radius: 2px;
+                width: 14px;
+            }
+            """
         )
-        self.vad_start_slider.valueChanged.connect(
-            lambda val: self.vad_start_value.setText(f"{val}ms")
-        )
+        self.vad_start_slider.valueChanged.connect(self.vad_start_spin.setValue)
+        self.vad_start_spin.valueChanged.connect(self.vad_start_slider.setValue)
+
         vad_start_row.addWidget(self.vad_start_slider, 1)
-        vad_start_row.addWidget(self.vad_start_value)
+        vad_start_row.addWidget(self.vad_start_spin)
         l.addLayout(vad_start_row)
 
         desc_vad_start = QLabel(
@@ -262,15 +299,36 @@ class CaptureTabMixin:
             }
             """
         )
-        self.vad_stop_value = QLabel(f"{self.vad_stop_slider.value()}ms")
-        self.vad_stop_value.setStyleSheet(
-            f"{TEXT_MUTED} font-size: 10px; font-weight: 700; background: transparent;"
+        self.vad_stop_spin = QSpinBox()
+        self.vad_stop_spin.setRange(200, 3000)
+        self.vad_stop_spin.setSingleStep(100)
+        self.vad_stop_spin.setSuffix("ms")
+        self.vad_stop_spin.setValue(self.vad_stop_slider.value())
+        self.vad_stop_spin.setStyleSheet(
+            """
+            QSpinBox {
+                background: rgba(20,20,40,220);
+                color: #e0e0f5;
+                border: 1px solid rgba(80,85,255,20);
+                border-radius: 6px;
+                padding: 4px 6px;
+                font-size: 11px;
+                font-weight: bold;
+                min-width: 60px;
+                max-width: 60px;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background: rgba(255,255,255,10);
+                border-radius: 2px;
+                width: 14px;
+            }
+            """
         )
-        self.vad_stop_slider.valueChanged.connect(
-            lambda val: self.vad_stop_value.setText(f"{val}ms")
-        )
+        self.vad_stop_slider.valueChanged.connect(self.vad_stop_spin.setValue)
+        self.vad_stop_spin.valueChanged.connect(self.vad_stop_slider.setValue)
+
         vad_stop_row.addWidget(self.vad_stop_slider, 1)
-        vad_stop_row.addWidget(self.vad_stop_value)
+        vad_stop_row.addWidget(self.vad_stop_spin)
         l.addLayout(vad_stop_row)
 
         desc_vad_stop = QLabel(
@@ -279,6 +337,15 @@ class CaptureTabMixin:
         desc_vad_stop.setWordWrap(True)
         desc_vad_stop.setStyleSheet(f"{TEXT_MUTED} font-size: 10px; background: transparent;")
         l.addWidget(desc_vad_stop)
+
+        def toggle_sliders(adaptive_active):
+            self.vad_start_slider.setEnabled(not adaptive_active)
+            self.vad_stop_slider.setEnabled(not adaptive_active)
+            self.vad_start_spin.setEnabled(not adaptive_active)
+            self.vad_stop_spin.setEnabled(not adaptive_active)
+
+        self.chk_adaptive_vad.toggled.connect(toggle_sliders)
+        toggle_sliders(self.chk_adaptive_vad.isChecked())
 
         sep_vad2 = QFrame()
         sep_vad2.setFixedHeight(1)

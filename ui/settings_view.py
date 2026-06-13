@@ -988,15 +988,20 @@ class SettingsView(QWidget, ApiTabMixin, CaptureTabMixin, ContextTabMixin, Hotke
             if hasattr(self, "vad_start_slider") and hasattr(self, "vad_stop_slider"):
                 start_val = self.vad_start_slider.value()
                 stop_val = self.vad_stop_slider.value()
+                adaptive_val = self.chk_adaptive_vad.isChecked() if hasattr(self, "chk_adaptive_vad") else True
+
                 self.config.set("capture.audio.vad.inter_turn_start_silence_ms", start_val)
                 self.config.set("capture.audio.vad.stop_silence_ms", stop_val)
+                self.config.set("capture.audio.vad.adaptive_enabled", adaptive_val)
 
                 audio = getattr(self.app, "audio", None)
                 if audio:
-                    audio._inter_turn_start_silence_ms = start_val
-                    audio._inter_turn_start_silence_blocks = max(1, int(start_val / audio.block_ms))
-                    if hasattr(audio, "set_vad_silence_ms"):
-                        audio.set_vad_silence_ms(stop_val)
+                    audio._adaptive_enabled = adaptive_val
+                    if not adaptive_val:
+                        audio._inter_turn_start_silence_ms = start_val
+                        audio._inter_turn_start_silence_blocks = max(1, int(start_val / audio.block_ms))
+                        if hasattr(audio, "set_vad_silence_ms"):
+                            audio.set_vad_silence_ms(stop_val)
 
             if hasattr(self, "hud_opacity_slider"):
                 self.config.set(

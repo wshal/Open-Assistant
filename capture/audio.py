@@ -372,6 +372,10 @@ class AudioCapture(QObject):
         self._inter_turn_start_silence_blocks = max(
             1, int(self._inter_turn_start_silence_ms / self.block_ms)
         )
+        self._wpm_history = []
+        self._adaptive_enabled = bool(config.get("capture.audio.vad.adaptive_enabled", True))
+        self._original_stop_silence_ms = int(config.get("capture.audio.vad.stop_silence_ms", 700) or 700)
+        self._original_start_silence_ms = self._inter_turn_start_silence_ms
         # Warn when configured ms values floor to a different effective duration.
         # This prevents silent config/behaviour discrepancies during EOS tuning.
         for _cfg_key, _cfg_ms, _blocks in [
@@ -1454,6 +1458,11 @@ class AudioCapture(QObject):
                             logger.info(
                                 "Audio hardware capture suspended; using injected audio frames."
                             )
+                        # Signal readiness immediately so wait_until_ready()
+                        # does not block for 10 s and abort the session.
+                        # In suspended mode the benchmark injects audio frames
+                        # directly into the processing queue.
+                        self._capture_ready_event.set()
                         while self._running and self._hardware_capture_suspended:
                             time.sleep(0.1)
                         if not self._running:
@@ -1725,6 +1734,12 @@ class AudioCapture(QObject):
 
     def set_hardware_capture_suspended(self, enabled: bool, reason: str = "") -> None:
         self._hardware_capture_suspended = bool(enabled)
+        # When hardware capture is suspended (benchmark / injection mode),
+        # the capture thread never opens real streams and therefore never
+        # signals _capture_ready_event.  Set the event here so that
+        # wait_until_ready() does not block for 10 s and abort the session.
+        if enabled and hasattr(self, "_capture_ready_event"):
+            self._capture_ready_event.set()
         logger.debug(
             "Audio: hardware capture %s%s",
             "suspended" if enabled else "resumed",
@@ -1986,6 +2001,7 @@ class AudioCapture(QObject):
         utterance_id = ""
         had_mid_utterance_slice = False
         utterance_vad_backend = self._vad_backend_name
+        silence_since_last_turn = 0
         # M14 FIX: Track peak RMS during the current utterance so it
         # can be passed to _passes_speech_rms_gate for accurate gating.
         current_peak_rms = 0.0
@@ -2075,6 +2091,26 @@ class AudioCapture(QObject):
             except TypeError:
                 floor_ok = self._passes_speech_rms_gate(rms, is_speaking=is_speaking)
             has_speech = raw_has_speech and floor_ok
+
+            # Scale start silence dynamically if adaptive is enabled
+            if getattr(self, "_adaptive_enabled", True):
+                floor = getattr(self, "_dynamic_rms_floor", 0.0) or 0.0
+                if floor <= 0.001:
+                    dynamic_start_ms = 200
+                elif floor >= 0.006:
+                    dynamic_start_ms = 600
+                else:
+                    pct = (floor - 0.001) / 0.005
+                    dynamic_start_ms = int(200 + pct * 400)
+                self._inter_turn_start_silence_ms = dynamic_start_ms
+                self._inter_turn_start_silence_blocks = max(1, int(dynamic_start_ms / self.block_ms))
+
+            # Enforce inter-turn start silence quiet gap
+            if not is_speaking:
+                if self._last_final_submit_at > 0.0:
+                    elapsed = time.time() - self._last_final_submit_at
+                    if elapsed < (self._inter_turn_start_silence_ms / 1000.0):
+                        has_speech = False
 
             # Online adaptation of the noise floor when not speaking and VAD is silent.
             # Only update if the calibration phase has finished.
@@ -2586,6 +2622,30 @@ class AudioCapture(QObject):
         }
         self.transcripts.append(cleaned)
         self.transcription_ready.emit(cleaned)
+
+        # Calculate WPM for adaptive VAD stop silence threshold
+        if cleaned and audio_duration_ms > 0:
+            words = len(cleaned.split())
+            duration_s = audio_duration_ms / 1000.0
+            wpm = (words / duration_s) * 60.0
+            if not hasattr(self, "_wpm_history"):
+                self._wpm_history = []
+            self._wpm_history.append(wpm)
+            if len(self._wpm_history) > 5:
+                self._wpm_history.pop(0)
+            avg_wpm = sum(self._wpm_history) / len(self._wpm_history)
+            
+            if getattr(self, "_adaptive_enabled", True):
+                if avg_wpm >= 130.0:
+                    target_stop_ms = 500
+                elif avg_wpm <= 100.0:
+                    target_stop_ms = 1100
+                else:
+                    pct = (avg_wpm - 100.0) / 30.0
+                    target_stop_ms = int(1100 - pct * 600)
+                
+                target_stop_ms = max(400, min(1500, target_stop_ms))
+                self.set_vad_silence_ms(target_stop_ms)
         logger.debug(
             f"[Transcription] Emitted {len(parts)} chunk(s) as one query: \"{cleaned[:80]}...\""
             if len(cleaned) > 80 else
