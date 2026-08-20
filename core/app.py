@@ -115,8 +115,15 @@ class OpenAssistApp(QObject):
         import itertools
         self._generation_epoch_counter = itertools.count(1)
         self._generation_epoch = 0
+        self._active_process_future = None
+        self._active_ui_turn_id = ""
+        self._ui_response_generation = 0
         self._screen_analysis_pending = False
         self._pending_request_metadata = None
+        # Foreground ownership prevents screen OCR auto-answer from cancelling
+        # an in-flight user audio turn through AIEngine's shared token.
+        self._foreground_origin = ""
+        self._last_screen_auto_at = 0.0
         self._screen_share_active = False
         self._screen_share_hidden_window = None
         self._pending_incomplete_audio_query = ""
@@ -187,8 +194,13 @@ class OpenAssistApp(QObject):
     def _wire_signals(self):
         self.overlay.user_query.connect(self.generate_response)
         self.mini_overlay.user_query.connect(self.generate_response)
-        self.ai.response_chunk.connect(self.overlay.append_response)
-        self.ai.response_chunk.connect(self.mini_overlay.append_response)
+        # UI delivery is turn-tagged. Qt queues signals crossing the asyncio
+        # worker/UI boundary, so an old audio chunk may arrive after a newer
+        # manual request unless we verify ownership at delivery time.
+        if hasattr(self.ai, "response_chunk_tagged"):
+            self.ai.response_chunk_tagged.connect(self._on_response_chunk)
+        else:
+            self.ai.response_chunk.connect(self._on_response_chunk_legacy)
         if hasattr(self.ai, "background_complete"):
             self.ai.background_complete.connect(self.overlay._on_bg_complete)
             self.ai.background_complete.connect(self.mini_overlay._on_bg_complete)
@@ -205,7 +217,10 @@ class OpenAssistApp(QObject):
         self.overlay.standby_view.audio_source_changed.connect(
             self._on_audio_source_ui_change
         )
-        self.ai.response_complete.connect(self._on_response_complete)
+        if hasattr(self.ai, "response_complete_tagged"):
+            self.ai.response_complete_tagged.connect(self._on_response_complete)
+        else:
+            self.ai.response_complete.connect(self._on_response_complete)
         self.ai.error_occurred.connect(self._on_ai_error)
         self.state.stealth_changed.connect(lambda _: self._apply_ui_only())
         self.run_on_ui_thread.connect(lambda callback: callback())
@@ -217,8 +232,24 @@ class OpenAssistApp(QObject):
         except Exception:
             logger.debug("Failed to schedule UI-thread callback", exc_info=True)
 
-    def _on_response_complete(self, full_text: str):
+    def _on_response_chunk_legacy(self, text: str):
+        """Compatibility path for engines without turn-tagged UI signals."""
+        self.overlay.append_response(text)
+        self.mini_overlay.append_response(text)
+
+    def _on_response_chunk(self, text: str, turn_id: str):
+        """Deliver a stream chunk only when it belongs to the visible turn."""
+        if turn_id != getattr(self, "_active_ui_turn_id", ""):
+            logger.info("AI: Dropping queued stale UI chunk for turn=%s", turn_id)
+            return
+        self.overlay.append_response(text)
+        self.mini_overlay.append_response(text)
+
+    def _on_response_complete(self, full_text: str, turn_id: str = ""):
         """Mark when response generation completes and is ready to display."""
+        if turn_id and turn_id != getattr(self, "_active_ui_turn_id", ""):
+            logger.info("AI: Dropping queued stale UI completion for turn=%s", turn_id)
+            return
         session_id = getattr(self, "_current_session_id", "unknown_session")
         elapsed_ms = (time.time() - getattr(self, "_session_start_time", time.time())) * 1000
         response_duration = (time.time() - (getattr(self, "_current_response_start_time", None) or time.time())) * 1000
@@ -250,6 +281,12 @@ class OpenAssistApp(QObject):
         cache_tier = 0  # Q14: which cache tier served this response (0=miss/LLM)
         if entries:
             entry = entries[-1]
+            # The signal carries response text only. Use the committed entry's
+            # query because _last_query may already belong to the next turn.
+            if isinstance(entry, dict):
+                completed_query = str(entry.get("query", "") or "")
+            else:
+                completed_query = str(getattr(entry, "query", "") or "")
             latency_ms = getattr(entry, "latency", 0)
             provider = getattr(entry, "provider", None)
             metadata = getattr(entry, "metadata", {}) or {}
@@ -359,16 +396,18 @@ class OpenAssistApp(QObject):
 
         self.overlay.on_complete(
             rendered_text,
-            query=self._last_query,
+            query=completed_query if entries else self._last_query,
             cache_tier=cache_tier,
             provider=provider or "",
         )
         self.mini_overlay.on_complete(
             rendered_text,
-            query=self._last_query,
+            query=completed_query if entries else self._last_query,
             cache_tier=cache_tier,
             provider=provider or "",
         )
+        if turn_id:
+            self._active_ui_turn_id = ""
 
         # ── Reset transcript label to Listening/Ready ─────────────────────────────
         # Clear the "⏳ Processing..." label that was set when query was submitted.
@@ -428,6 +467,7 @@ class OpenAssistApp(QObject):
         self._last_query = ""
         self._last_query_time = 0.0
         self._pending_request_metadata = None
+        self._foreground_origin = ""
         detector = getattr(getattr(self, "ai", None), "detector", None)
         if detector and hasattr(detector, "reset_turn_state"):
             detector.reset_turn_state(reason or "turn-reset")
@@ -911,6 +951,16 @@ class OpenAssistApp(QObject):
         if s in {"speech", "auto"} and not self.session_active:
             return
 
+        # Screen auto-answer is opportunistic. It must not supersede a spoken
+        # or explicitly submitted foreground turn, because AIEngine uses one
+        # shared cancellation token for foreground generations.
+        if s == "auto" and self._foreground_origin in {"speech", "manual", "quick"}:
+            logger.debug(
+                "AI: Skipping screen auto-answer while %s turn is active",
+                self._foreground_origin,
+            )
+            return
+
         # OMEGA DEBOUNCE: Prevent double-triggers (Audio + OCR) for the same query
         now = time.time()
         if (
@@ -923,10 +973,26 @@ class OpenAssistApp(QObject):
 
         self._last_query = q
         self._last_query_time = now
+        self._foreground_origin = str(s or "")
 
-        # P1.4: New query should gracefully demote any in-flight generation to background.
+        # A typed question is an explicit foreground override. Do not retain a
+        # prior audio turn in background because its eventual answer could be
+        # written into history and become context for this manual request.
         if s in {"manual", "speech", "quick"}:
-            if bool(self.config.get("ai.background_generation.enabled", True)) and hasattr(self.ai, "demote_to_background"):
+            if s == "manual":
+                try:
+                    # Cancel the queued/running coroutine itself so a typed
+                    # query never waits behind an audio turn holding _ai_lock.
+                    active_future = getattr(self, "_active_process_future", None)
+                    if active_future is not None and not active_future.done():
+                        active_future.cancel()
+                    cancel_bg = getattr(self.ai, "cancel_background_generation", None)
+                    if callable(cancel_bg):
+                        cancel_bg()
+                    self.ai.cancel()
+                except Exception:
+                    pass
+            elif bool(self.config.get("ai.background_generation.enabled", True)) and hasattr(self.ai, "demote_to_background"):
                 try:
                     self.ai.demote_to_background()
                 except Exception:
@@ -956,6 +1022,9 @@ class OpenAssistApp(QObject):
         #      in the full response area so the user always sees what was captured,
         #      even while refinement is running in the background.
         if s in {"manual", "speech", "quick"}:
+            # Each request owns its deferred UI work. A prior request's timer
+            # must not write a Thinking marker into a newer response.
+            pending_ui_generation = getattr(self, "_ui_response_generation", 0) + 1
             label = f"⏳ Processing: {q[:55]}..." if len(q) > 55 else "⏳ Processing..."
             self.overlay.update_transcript(label, state="processing")
 
@@ -966,7 +1035,16 @@ class OpenAssistApp(QObject):
             # fall back to showing "Thinking..." via a deferred QTimer so the user
             # never sees a blank screen on slow providers.
             self.overlay.show_chat_view()
-            self.overlay._current_query = q
+            begin_overlay = getattr(self.overlay, "begin_active_response", None)
+            if callable(begin_overlay):
+                begin_overlay(q)
+            else:
+                self.overlay._current_query = q
+            begin_mini = getattr(self.mini_overlay, "begin_active_response", None)
+            if callable(begin_mini):
+                begin_mini(q)
+            else:
+                self.mini_overlay._active_response_query = q
             self.overlay._pending_thinking = True   # signal: waiting for first chunk
 
             race_hint = ""
@@ -983,7 +1061,10 @@ class OpenAssistApp(QObject):
             # (cache hits return in <20ms so they'll have replaced this already)
             from PyQt6.QtCore import QTimer as _QTimer
             def _show_thinking():
-                if getattr(self.overlay, "_pending_thinking", False):
+                if (
+                    getattr(self, "_ui_response_generation", 0) == pending_ui_generation
+                    and getattr(self.overlay, "_pending_thinking", False)
+                ):
                     from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor
                     cursor = self.overlay.response_area.textCursor()
                     cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -1010,6 +1091,8 @@ class OpenAssistApp(QObject):
         else:
             turn_id = request_metadata.get("turn_id") or f"{s}:{request_epoch}:{uuid.uuid4().hex}"
         request_metadata["turn_id"] = turn_id
+        self._active_ui_turn_id = turn_id
+        self._ui_response_generation = getattr(self, "_ui_response_generation", 0) + 1
         if isinstance(c, dict) and c.get("auto_answer"):
             request_metadata["auto_mode"] = True
             request_metadata["auto_answer"] = True
@@ -1031,9 +1114,18 @@ class OpenAssistApp(QObject):
             except Exception:
                 pass
 
-        asyncio.run_coroutine_threadsafe(
+        process_future = asyncio.run_coroutine_threadsafe(
             self._process_ai(q, s, c, request_epoch, request_metadata), self.loop
         )
+        self._active_process_future = process_future
+
+        # Do not retain a completed future or let an old completion clear the
+        # newer manual request's ownership record.
+        if hasattr(process_future, "add_done_callback"):
+            def _clear_completed_process(done_future):
+                if getattr(self, "_active_process_future", None) is done_future:
+                    self._active_process_future = None
+            process_future.add_done_callback(_clear_completed_process)
 
     async def _process_ai(self, q, s, c, request_epoch, request_metadata):
         if request_epoch != self._generation_epoch:
@@ -1088,6 +1180,16 @@ class OpenAssistApp(QObject):
                         (__import__("time").time() - _t0_parallel) * 1000,
                     )
 
+            # An explicit typed question is authoritative. Do not feed the
+            # previous live-audio transcript or prior conversation back into
+            # the provider, otherwise the model can answer the audio question
+            # while history correctly records the new typed question.
+            if s == "manual" and not isolate_context:
+                au = ""
+                request_metadata.setdefault("suppress_audio_context", True)
+                request_metadata.setdefault("suppress_history_context", True)
+                logger.debug("[Manual Query] Audio and prior-turn context suppressed")
+
             if isolate_context:
                 sc = ""
                 sc_hash = ""
@@ -1139,7 +1241,7 @@ class OpenAssistApp(QObject):
             # au is already set above (Q10 parallel block or c.get("audio"))
 
             # P3.3: Actionable Queries — detect and execute before hitting the AI
-            if hasattr(self, "actions"):
+            if s != "manual" and hasattr(self, "actions"):
                 action_output = await self.actions.detect_and_run(q)
                 if action_output:
                     logger.info(
@@ -1148,6 +1250,10 @@ class OpenAssistApp(QObject):
                     )
                     request_metadata = dict(request_metadata or {})
                     request_metadata["action_output"] = action_output
+            elif s == "manual":
+                # Manual prompts are informational only; never execute a local
+                # command based on text supplied by the user.
+                request_metadata.setdefault("actions_disabled", True)
 
             # P3.4: Context Pruning — drop irrelevant screen blocks before the prompt
             if sc and q and hasattr(self, "context_pruner"):
@@ -2430,6 +2536,15 @@ class OpenAssistApp(QObject):
         if not self.session_active:
             return
 
+        # OCR is background context. Do not let it interrupt a live audio or
+        # explicit user request through the shared foreground cancellation path.
+        if self._foreground_origin in {"speech", "manual", "quick"}:
+            logger.debug(
+                "Vision: ignoring screen auto-dispatch during %s turn",
+                self._foreground_origin,
+            )
+            return
+
         # ── Background RAG Prefetch ───────────────────────────────────────────
         # Pre-warm the RAG cache with what's visible on screen so when the user
         # asks a question the RAG result is already ready.
@@ -2453,6 +2568,14 @@ class OpenAssistApp(QObject):
         q = self.ai.detector.detect_with_confidence(t, source="screen")
         if q.triggered:
             if q.should_auto_respond():
+                now = time.time()
+                cooldown_s = float(
+                    self.config.get("ai.auto_mode.screen_auto_cooldown_s", 5.0) or 5.0
+                )
+                if cooldown_s > 0 and now - self._last_screen_auto_at < cooldown_s:
+                    logger.debug("Vision: screen auto-answer suppressed by cooldown")
+                    return
+                self._last_screen_auto_at = now
                 self.generate_response(q.detected_text, "auto", {"screen": t})
             else:
                 # P2.1: Low-confidence screen detection — show hint, do not auto-answer
@@ -2493,10 +2616,11 @@ class OpenAssistApp(QObject):
                     logger.debug("Intent classifier warmup skipped: %s", e)
                 self.ai.ensure_health_monitor(self.loop)
                 # Opportunistically pre-warm Groq's TCP/TLS connection so the
-                # first real user prompt may hit an already-open socket. READY
-                # does not wait for this. Periodic keepalive is config-gated
-                # because each ping is still a Groq API request.
-                if hasattr(self.ai, "warm_groq_connection"):
+                # first real user prompt may hit an already-open socket. This
+                # uses no-inference HTTP warmup and does not delay READY.
+                if hasattr(self.ai, "warm_provider_connections"):
+                    self.ai.warm_provider_connections(self.loop)
+                elif hasattr(self.ai, "warm_groq_connection"):
                     self.ai.warm_groq_connection(self.loop)
                 if hasattr(self.ai, "start_groq_keepalive"):
                     self.ai.start_groq_keepalive(self.loop)

@@ -104,6 +104,14 @@ class BaseProvider(ABC):
     def supports_health_check(self) -> bool:
         return type(self).health_check is not BaseProvider.health_check
 
+    def supports_non_billing_health_check(self) -> bool:
+        """Whether startup health checks avoid inference/token usage."""
+        return False
+
+    async def warm_connection_async(self) -> None:
+        """Best-effort transport warmup hook for provider implementations."""
+        return None
+
     def is_disabled(self) -> bool:
         return time.time() < self._disabled_until
 

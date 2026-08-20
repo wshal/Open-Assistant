@@ -5,6 +5,7 @@ import time
 from typing import AsyncGenerator
 
 from ai.providers.base import BaseProvider
+from core.constants import GROQ_DEFAULT_TEXT_MODEL, GROQ_DEPRECATED_TEXT_MODELS
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -17,8 +18,16 @@ class GroqProvider(BaseProvider):
         if not key:
             self.enabled = False
             return
+        configured_model = str(self.pcfg.get("model", "") or "").strip()
+        if configured_model in GROQ_DEPRECATED_TEXT_MODELS:
+            self.pcfg["model"] = GROQ_DEFAULT_TEXT_MODEL
+        configured_models = self.pcfg.get("models")
+        if isinstance(configured_models, dict):
+            for tier, model in list(configured_models.items()):
+                if str(model or "").strip() in GROQ_DEPRECATED_TEXT_MODELS:
+                    configured_models[tier] = GROQ_DEFAULT_TEXT_MODEL
         if not self.pcfg.get("model") and not self.pcfg.get("models"):
-            self.pcfg["model"] = "llama-3.1-8b-instant"
+            self.pcfg["model"] = GROQ_DEFAULT_TEXT_MODEL
         try:
             from groq import AsyncGroq
 
@@ -32,31 +41,33 @@ class GroqProvider(BaseProvider):
             self.enabled = False
 
     async def warm_connection_async(self) -> None:
-        """Pre-open the Groq TCP/TLS connection with a minimal request.
+        """Pre-open the shared Groq TCP/TLS connection without inference.
 
         Called opportunistically during standby warmup so the first real user
         prompt may hit an already-established socket rather than paying the
         full TCP + TLS handshake cost on the live path.
 
         Design rules:
-          - Uses max_tokens=1 to keep the request tiny.
-          - Does not call _pre_request(), so it does not advance local
-            rate-limit timestamps. It is still a Groq API request and may count
-            against server-side quota.
+          - Uses the SDK's underlying HTTP client against the API root rather
+            than sending a chat completion. This establishes DNS/TCP/TLS and
+            keeps the first real request fast without consuming model tokens.
           - Silent: any failure is swallowed because a warm failure is harmless.
           - Never called from the hot path.
         """
         if not self.enabled:
             return
         try:
-            model = self.pcfg.get("model") or "llama-3.1-8b-instant"
-            await self.client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": "hi"}],
-                max_tokens=1,
-                temperature=0.0,
+            http_client = getattr(self.client, "_client", None)
+            if http_client is None:
+                return
+            response = await http_client.get(
+                "https://api.groq.com/",
+                timeout=5.0,
             )
-            logger.debug("[Groq] Connection pre-warmed")
+            logger.debug(
+                "[Groq] HTTP connection pre-warmed (status=%s)",
+                getattr(response, "status_code", "unknown"),
+            )
         except Exception:
             # Failure is acceptable; warmup is best-effort.
             pass
@@ -90,15 +101,17 @@ class GroqProvider(BaseProvider):
         model = self.get_model(tier)
         t0 = time.time()
         try:
-            r = await self.client.chat.completions.create(
-                model=model,
-                messages=[
+            kwargs = {
+                "model": model,
+                "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                max_tokens=self.max_tokens,
-                temperature=0.7,
-            )
+                "max_completion_tokens": self.max_tokens,
+                "temperature": 0.7,
+            }
+            self._add_reasoning_effort(kwargs, model)
+            r = await self.client.chat.completions.create(**kwargs)
             if not r.choices:
                 raise Exception(f"Groq returned empty choices list (model={model})")
             choice = r.choices[0]
@@ -118,16 +131,18 @@ class GroqProvider(BaseProvider):
         t0 = time.time()
         tok = 0
         try:
-            stream = await self.client.chat.completions.create(
-                model=model,
-                messages=[
+            kwargs = {
+                "model": model,
+                "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                max_tokens=self.max_tokens,
-                temperature=0.7,
-                stream=True,
-            )
+                "max_completion_tokens": self.max_tokens,
+                "temperature": 0.7,
+                "stream": True,
+            }
+            self._add_reasoning_effort(kwargs, model)
+            stream = await self.client.chat.completions.create(**kwargs)
             async for chunk in stream:
                 if not chunk.choices:
                     continue
@@ -142,18 +157,26 @@ class GroqProvider(BaseProvider):
             raise
 
     async def health_check(self) -> bool:
-        """Verify the key can complete a tiny chat request."""
+        """Verify API access without spending chat completion quota."""
         try:
-            model = self.get_model("fast")
-            if not model:
-                return False
-            r = await self.client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": "Hi"}],
-                max_tokens=1,
-                temperature=0.0,
-            )
-            return bool(getattr(r, "choices", None))
+            response = await self.client.models.list()
+            configured = self.get_model("fast") or GROQ_DEFAULT_TEXT_MODEL
+            model_ids = {
+                str(getattr(model, "id", "") or "")
+                for model in (getattr(response, "data", None) or [])
+            }
+            return not model_ids or configured in model_ids
         except Exception as e:
             logger.debug("Groq health check failed: %s", e)
             return False
+
+    def supports_non_billing_health_check(self) -> bool:
+        """Allow startup validation without issuing an inference request."""
+        return True
+
+    def _add_reasoning_effort(self, kwargs: dict, model: str) -> None:
+        """Apply GPT-OSS reasoning control without affecting other Groq models."""
+        if str(model).startswith("openai/gpt-oss-"):
+            effort = str(self.pcfg.get("reasoning_effort", "low") or "low").lower()
+            if effort in {"low", "medium", "high"}:
+                kwargs["reasoning_effort"] = effort

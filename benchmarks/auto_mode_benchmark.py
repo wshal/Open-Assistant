@@ -1214,6 +1214,12 @@ def main():
     parser.add_argument("--files", nargs="*", default=None, help="Optional explicit wav filenames to run")
     parser.add_argument("--standard-only", action="store_true", help="Run fixtures through standard direct-dispatch mode instead of Auto Mode")
     parser.add_argument(
+        "--groq-reasoning-effort",
+        choices=["low", "medium", "high"],
+        default="medium",
+        help="GPT-OSS reasoning effort for Groq response benchmarking (default: medium)",
+    )
+    parser.add_argument(
         "--headless-ui",
         action="store_true",
         help="Suppress QTextEdit rendering while still recording UI completion callbacks",
@@ -1225,6 +1231,8 @@ def main():
     config.set("capture.audio.mode", "system")
     config.set("capture.screen.enabled", False)
     config.set("ai.auto_mode.enabled", not args.standard_only)
+    config.set("ai.fixed_provider", "groq")
+    config.set("ai.providers.groq.reasoning_effort", args.groq_reasoning_effort)
     
     # Init OpenAssist
     app = OpenAssistApp(config)

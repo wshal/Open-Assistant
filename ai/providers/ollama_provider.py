@@ -517,6 +517,19 @@ class OllamaProvider(BaseProvider):
         """Quick health check."""
         return await self.check_availability()
 
+    def supports_non_billing_health_check(self) -> bool:
+        return True
+
+    async def warm_connection_async(self) -> None:
+        try:
+            session = await self._get_session()
+            async with session.get(
+                f"{self.endpoint}/api/tags", timeout=self._connect_timeout
+            ) as response:
+                await response.read()
+        except Exception:
+            pass
+
     def supports_vision(self) -> bool:
         # Allow a dedicated vision model without forcing the default text model
         # to be multimodal (e.g., keep a coder model for chat, use a VL model for screenshots).

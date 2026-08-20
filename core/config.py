@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from utils.crypto import SecureStorage
 from utils.logger import setup_logger
-from core.constants import CONFIG_FILE
+from core.constants import (
+    CEREBRAS_DEFAULT_TEXT_MODEL,
+    CEREBRAS_DEPRECATED_TEXT_MODELS,
+    CONFIG_FILE,
+    GROQ_DEFAULT_TEXT_MODEL,
+    GROQ_DEPRECATED_TEXT_MODELS,
+)
 
 logger = setup_logger(__name__)
 
@@ -137,6 +143,8 @@ class Config:
                 self._data = {}
 
         migrated = self._migrate_plaintext_keys_from_yaml()
+        model_migrated = self._migrate_deprecated_models()
+        reasoning_migrated = self._migrate_reasoning_effort_default()
         self._apply_defaults()
         # Issue #3: Do NOT force stealth.enabled=True here — _apply_defaults
         # already supplies the default on first run, and forcing it every load
@@ -144,7 +152,7 @@ class Config:
         self._resolve_env(self._data)
         self._inject_secrets()
         self._disable_providers_without_keys()
-        if migrated:
+        if migrated or model_migrated or reasoning_migrated:
             # Persist immediately to scrub any plaintext keys from disk.
             try:
                 self.save()
@@ -161,6 +169,60 @@ class Config:
             logger.info(f"Config loaded ({len(validation['valid'])} valid keys)")
         else:
             logger.info("Config loaded (no API keys configured)")
+
+    def _migrate_deprecated_models(self) -> bool:
+        """Replace retired cloud chat model IDs in persisted configuration.
+
+        User-selected models from other providers are left untouched. The
+        migration is intentionally exact so unrelated model names containing
+        similar text are not rewritten.
+        """
+        try:
+            providers = self._data.get("ai", {}).get("providers", {})
+            if not isinstance(providers, dict):
+                return False
+            changed = False
+            migrations = {
+                "groq": (GROQ_DEPRECATED_TEXT_MODELS, GROQ_DEFAULT_TEXT_MODEL),
+                "cerebras": (CEREBRAS_DEPRECATED_TEXT_MODELS, CEREBRAS_DEFAULT_TEXT_MODEL),
+            }
+            for provider_name, (deprecated_models, replacement) in migrations.items():
+                provider = providers.get(provider_name, {})
+                if not isinstance(provider, dict):
+                    continue
+                model = str(provider.get("model", "") or "").strip()
+                if model in deprecated_models:
+                    provider["model"] = replacement
+                    changed = True
+
+                models = provider.get("models")
+                if isinstance(models, dict):
+                    for tier, configured_model in list(models.items()):
+                        if str(configured_model or "").strip() in deprecated_models:
+                            models[tier] = replacement
+                            changed = True
+
+            if changed:
+                logger.warning(
+                    "Config: migrated retired cloud model(s) to current replacements",
+                )
+            return changed
+        except Exception as exc:
+            logger.warning("Config: could not migrate deprecated models: %s", exc)
+            return False
+
+    def _migrate_reasoning_effort_default(self) -> bool:
+        """Move the temporary GPT-OSS default from medium to low once."""
+        try:
+            groq = self._data.get("ai", {}).get("providers", {}).get("groq", {})
+            if not isinstance(groq, dict) or groq.get("reasoning_effort") != "medium":
+                return False
+            groq["reasoning_effort"] = "low"
+            logger.info("Config: switched GPT-OSS reasoning effort to low for latency")
+            return True
+        except Exception as exc:
+            logger.warning("Config: could not migrate reasoning effort: %s", exc)
+            return False
 
     def _migrate_plaintext_keys_from_yaml(self) -> bool:
         """
@@ -218,6 +280,11 @@ class Config:
         # Keep the global default conservative enough to avoid false failovers,
         # and allow slower providers like Ollama to override it explicitly.
         self._data["ai"]["text"].setdefault("first_token_timeout_ms", 2000)
+        self._data["ai"]["text"].setdefault("response_timeout_s", 45)
+        self._data["ai"]["text"].setdefault(
+            "response_timeout_s_by_provider",
+            {"groq": 30, "gemini": 45, "cerebras": 30, "together": 30, "ollama": 90},
+        )
         self._data["ai"]["text"].setdefault(
             "first_token_timeout_ms_by_provider",
             {
@@ -251,18 +318,30 @@ class Config:
         self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("enabled", True)
         self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("stability_ms", 650)
         self._data["ai"]["auto_mode"]["speculative_interim"].setdefault("delay_ms", 250)
+        # Prevent rapidly changing OCR from flooding foreground requests.
+        self._data["ai"]["auto_mode"].setdefault("screen_auto_cooldown_s", 5.0)
         self._data["ai"].setdefault("providers", {})
         # Keep boot light: provider availability is shown from configuration,
         # and live health checks are only run on explicit test or background
         # request failure. This avoids quota churn from probing every provider
         # at startup.
         self._data["ai"]["providers"].setdefault("validate_on_init", False)
+        # Standby should verify configured providers automatically. Providers
+        # without a non-billing probe remain visibly configured instead of
+        # silently spending inference quota during startup.
+        self._data["ai"]["providers"].setdefault("standby_auto_probe", True)
+        self._data["ai"]["providers"].setdefault("startup_probe_non_billing_only", True)
         self._data["ai"]["providers"].setdefault("health_check_timeout", 4)
         # Keep provider probing to a single low-cost attempt by default.
         # Retries are useful for flaky networks, but they also amplify quota
         # churn when a provider is already exhausted.
         self._data["ai"]["providers"].setdefault("health_check_attempts", 1)
         self._data["ai"]["providers"].setdefault("groq", {})
+        self._data["ai"]["providers"]["groq"].setdefault("reasoning_effort", "low")
+        # Retained for compatibility with older settings files. Connection
+        # pre-warming now uses a non-inference HTTP request and does not spend
+        # completion tokens.
+        self._data["ai"]["providers"]["groq"].setdefault("warmup_enabled", False)
         # Periodic pings can reduce first-token latency after idle gaps, but
         # each ping is still a Groq API request and can consume free-tier RPM.
         self._data["ai"]["providers"]["groq"].setdefault("keepalive_enabled", False)

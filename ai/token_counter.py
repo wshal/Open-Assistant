@@ -9,6 +9,7 @@ Accurate counting prevents:
 import re
 from typing import Optional, Dict, Tuple
 from utils.logger import setup_logger
+from core.constants import CEREBRAS_DEFAULT_TEXT_MODEL, GROQ_DEFAULT_TEXT_MODEL
 
 logger = setup_logger(__name__)
 
@@ -16,12 +17,12 @@ logger = setup_logger(__name__)
 # Approximate context window sizes per model family
 MODEL_CONTEXT_WINDOWS: Dict[str, int] = {
     # Groq
-    "llama-3.1-8b-instant": 131072,
+    GROQ_DEFAULT_TEXT_MODEL: 131072,
     "llama-3.3-70b-versatile": 131072,
     "deepseek-r1-distill-llama-70b": 131072,
 
     # Cerebras
-    "llama3.1-8b": 8192,
+    CEREBRAS_DEFAULT_TEXT_MODEL: 131072,
     "llama-3.3-70b": 8192,
 
     # SambaNova

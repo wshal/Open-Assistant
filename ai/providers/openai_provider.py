@@ -254,17 +254,24 @@ class OpenAIProvider(BaseProvider):
             raise self._handle_error(e)
 
     async def health_check(self) -> bool:
-        """Verify the API key by completing a minimal chat request."""
+        """Verify API access through the model catalogue."""
         try:
-            model = self.get_model("fast")
-            if not model:
-                return False
-            messages = self._build_messages("Health check.", "Hi", model)
-            kwargs = {"model": model, "messages": messages, "max_tokens": 1}
-            if not model.startswith("o"):
-                kwargs["temperature"] = 0.0
-            response = await self.client.chat.completions.create(**kwargs)
-            return bool(getattr(response, "choices", None))
+            response = await self.client.models.list()
+            configured = self.get_model("fast")
+            model_ids = {
+                str(getattr(model, "id", "") or "")
+                for model in (getattr(response, "data", None) or [])
+            }
+            return not model_ids or not configured or configured in model_ids
         except Exception as e:
             logger.debug("OpenAI health check failed: %s", e)
             return False
+
+    def supports_non_billing_health_check(self) -> bool:
+        return True
+
+    async def warm_connection_async(self) -> None:
+        try:
+            await self.client.models.list()
+        except Exception:
+            pass

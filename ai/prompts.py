@@ -256,6 +256,46 @@ For MCQ: state correct answer first.""",
         return len(q.split()) <= 10 and any(marker in q for marker in generic_markers)
 
     @staticmethod
+    def _is_bare_manual_topic(query: str) -> bool:
+        """Return whether a short typed phrase is best read as a topic lookup."""
+        text = str(query or "").strip()
+        if not text or text.endswith(("?", "!", ".", ":", ";")):
+            return False
+        words = text.split()
+        if not 1 <= len(words) <= 6:
+            return False
+        lowered = text.lower()
+        non_topics = (
+            "what ", "who ", "where ", "when ", "why ", "how ", "which ",
+            "is ", "are ", "do ", "does ", "did ", "can ", "could ",
+            "would ", "should ", "explain ", "define ", "describe ", "compare ",
+            "show ", "give ", "list ", "write ", "create ", "build ", "fix ",
+            "install ", "run ", "help ", "please ", "this ", "that ", "my ",
+            "test ", "sample ", "example ", "hello", "hi", "hey", "thanks", "thank you",
+        )
+        return not lowered.startswith(non_topics)
+
+    @classmethod
+    def _complete_manual_question(cls, query: str) -> str:
+        """Make short typed questions and topics unambiguous to providers.
+
+        This only changes the provider-facing prompt. The original text remains
+        the query displayed in the UI and recorded in history.
+        """
+        text = str(query or "").strip()
+        if not text or text.endswith(("?", "!", ".", ":", ";")):
+            return text
+        if re.match(
+            r"^(?:what|who|where|when|why|how|which|whose|is|are|do|does|did|can|could|would|should)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return f"{text}?"
+        if cls._is_bare_manual_topic(text):
+            return f"What is {text}?"
+        return text
+
+    @staticmethod
     def _sanitize_session_context(ctx: str) -> str:
         """Sanitize user-supplied session context before injecting into system prompt.
 
@@ -316,7 +356,10 @@ For MCQ: state correct answer first.""",
         parts = []
         suppress_session_context = (
             origin in {"manual", "speech"}
-            and self._is_general_knowledge_query(query)
+            and (
+                self._is_general_knowledge_query(query)
+                or (origin == "manual" and self._is_bare_manual_topic(query))
+            )
         )
 
         # Conversation history — injected first so the model anchors on prior context
@@ -377,17 +420,23 @@ For MCQ: state correct answer first.""",
                 "FORMAT:\n- Task (one line)\n- Solution (concise)\n- Code (fenced, if applicable)\n- Notes (optional)"
             )
         elif origin == "manual":
+            manual_query = self._complete_manual_question(query)
             if suppress_session_context:
                 parts.append(
                     "[TASK]\nAnswer the user's question directly from general knowledge. "
-                    "Do not mention the current screen, codebase, active window, or session context unless the question clearly asks about them."
+                    "Do not mention the current screen, codebase, active window, or session context unless the question clearly asks about them. "
+                    "The manual query below is complete even if the user omitted terminal punctuation. "
+                    "Treat a short topic phrase as a request for a concise definition or explanation; answer directly and never ask them to finish the question."
                 )
             else:
                 parts.append(
                     "[TASK]\nAnswer the user's question using the current session context. "
                     "Prefer the most recent on-screen evidence when relevant. "
-                    "If the question is generic and the session context is unrelated, answer directly without talking about the unrelated context."
+                    "If the question is generic and the session context is unrelated, answer directly without talking about the unrelated context. "
+                    "The manual query below is complete even if the user omitted terminal punctuation. "
+                    "Treat a short topic phrase as a request for a concise definition or explanation; answer directly and never ask them to finish the question."
                 )
+            parts.append(f"[USER QUESTION]\n{manual_query}")
         elif origin == "quick":
             # Mode-specific quick-answer format injected here
             fmt = ""
@@ -414,7 +463,8 @@ For MCQ: state correct answer first.""",
                 f"[LONG-TERM MEMORY — relevant past sessions]\n{long_term_memory[:2000]}"
             )
 
-        parts.append(f"Q: {query}")
+        if origin != "manual":
+            parts.append(f"Q: {query}")
         return "\n---\n".join(parts)
 
     @staticmethod

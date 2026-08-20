@@ -65,26 +65,19 @@ class CohereProvider(BaseProvider):
             raise
 
     async def health_check(self) -> bool:
-        """Verify the key can complete a tiny chat request."""
+        """Verify API access through the model catalogue, not inference."""
         try:
-            model = self.get_model("fast")
-            if not model:
-                return False
-            r = await self.client.chat(
-                model=model,
-                messages=[{"role": "user", "content": "Hi"}],
-                max_tokens=1,
-                temperature=0.0,
-            )
-            content = getattr(getattr(r, "message", None), "content", None)
-            if isinstance(content, list):
-                for item in content:
-                    if getattr(item, "text", ""):
-                        return True
-                return False
-            if hasattr(content, "text"):
-                return bool(getattr(content, "text", "").strip())
-            return bool(str(content or "").strip())
+            response = await self.client.models.list()
+            return bool(getattr(response, "models", None) or getattr(response, "data", None))
         except Exception as e:
             logger.debug("Cohere health check failed: %s", e)
             return False
+
+    def supports_non_billing_health_check(self) -> bool:
+        return True
+
+    async def warm_connection_async(self) -> None:
+        try:
+            await self.client.models.list()
+        except Exception:
+            pass

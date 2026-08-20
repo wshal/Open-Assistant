@@ -284,6 +284,7 @@ class EmbeddingTier:
         query: str,
         mode: str,
         context_fp: str,
+        history_fp: Optional[str] = None,
     ) -> Optional[_EmbedRecord]:
         """Return the best matching record above threshold, or None."""
         if not self._vectors:
@@ -303,11 +304,14 @@ class EmbeddingTier:
         # Cosine similarity = dot product (since both sides are normalized)
         scores = matrix @ vec  # (N,)
 
-        # Filter by mode + context scope and TTL
+        # Filter by mode, visual context, conversational history, and TTL.
+        # History scope prevents a new turn from reusing the prior answer.
         best_score = self.threshold - 1e-9  # below threshold
         best_idx = -1
         for i, (rec, ts) in enumerate(zip(records, timestamps)):
             if rec.mode != mode or rec.context_fp != context_fp:
+                continue
+            if history_fp is not None and rec.history_fp != history_fp:
                 continue
             if (now - ts) > self.ttl_s:
                 continue
@@ -479,8 +483,8 @@ class ShortQueryCache:
         # called re-entrantly from get_with_tier() and set().
         self._cache_lock = threading.RLock()
         self._items: dict[CacheKey, CacheEntry] = {}
-        # Composite key: (signature, mode, context_fp) → CacheKey
-        self._semantic_items: dict[Tuple[str, str, str], CacheKey] = {}
+        # Composite key: (signature, mode, context_fp, history_fp) -> CacheKey
+        self._semantic_items: dict[Tuple[str, str, str, str], CacheKey] = {}
         self._lru = collections.deque()
         # Q17: LRU list for semantic_items (prevents unbounded growth)
         self._semantic_lru = collections.deque()
@@ -638,7 +642,7 @@ class ShortQueryCache:
             # ── Tier 2: Semantic Signature ────────────────────────────────────────
             if self.enable_semantic:
                 signature = self._get_semantic_signature(query)
-                sem_lookup_key = (signature, key.mode, key.context_fp)
+                sem_lookup_key = (signature, key.mode, key.context_fp, key.history_fp)
                 semantic_key = self._semantic_items.get(sem_lookup_key)
                 if semantic_key:
                     entry = self._items.get(semantic_key)
@@ -652,7 +656,12 @@ class ShortQueryCache:
         # Run outside the lock — embedding search is CPU-heavy (~15ms) and
         # the EmbeddingTier has its own internal _data_lock.
         if self._embed:
-            rec = self._embed.find(query, mode=key.mode, context_fp=key.context_fp)
+            rec = self._embed.find(
+                query,
+                mode=key.mode,
+                context_fp=key.context_fp,
+                history_fp=key.history_fp,
+            )
             if rec:
                 embed_key = CacheKey(rec.mode, rec.cache_query, rec.context_fp, rec.history_fp)
                 with self._cache_lock:
@@ -767,7 +776,7 @@ class ShortQueryCache:
             if self.enable_semantic:
                 try:
                     signature = self._get_semantic_signature(query)
-                    sem_key = (signature, key.mode, key.context_fp)
+                    sem_key = (signature, key.mode, key.context_fp, key.history_fp)
                     if sem_key not in self._semantic_items:
                         # New entry — check cap
                         while len(self._semantic_items) >= self._max_semantic_items and self._semantic_lru:

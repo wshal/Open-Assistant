@@ -2415,6 +2415,61 @@ class OllamaProviderTests(unittest.TestCase):
 
 
 class PromptBuilderTests(unittest.TestCase):
+    def test_manual_unpunctuated_question_is_explicit_and_complete(self):
+        prompt = PromptBuilder().user(
+            query="what is custom hook",
+            origin="manual",
+            mode="general",
+        )
+
+        self.assertIn("[USER QUESTION]", prompt)
+        self.assertIn("what is custom hook?", prompt)
+        self.assertIn("never ask them to finish the question", prompt)
+
+    def test_manual_declarative_request_is_not_repunctuated(self):
+        prompt = PromptBuilder().user(
+            query="explain custom hooks",
+            origin="manual",
+            mode="general",
+        )
+
+        self.assertIn("explain custom hooks", prompt)
+        self.assertNotIn("explain custom hooks?", prompt)
+
+    def test_manual_short_topic_is_treated_as_complete_request(self):
+        prompt = PromptBuilder().user(
+            query="custom hook",
+            origin="manual",
+            mode="general",
+        )
+
+        self.assertIn("[USER QUESTION]\nWhat is custom hook?", prompt)
+        self.assertIn("short topic phrase", prompt)
+        self.assertIn("concise definition or explanation", prompt)
+
+    def test_manual_bare_topic_expands_to_a_direct_question(self):
+        prompt = PromptBuilder().user(
+            query="virtual dom",
+            origin="manual",
+            mode="general",
+            screen="unrelated editor content",
+            nexus={"active_window": "VS Code", "history_depth_secs": 60},
+        )
+
+        self.assertIn("[USER QUESTION]\nWhat is virtual dom?", prompt)
+        self.assertNotIn("[SCREEN]", prompt)
+        self.assertNotIn("[ENVIRONMENT]", prompt)
+
+    def test_manual_action_is_not_misread_as_a_topic(self):
+        prompt = PromptBuilder().user(
+            query="install node",
+            origin="manual",
+            mode="general",
+        )
+
+        self.assertIn("[USER QUESTION]\ninstall node", prompt)
+        self.assertNotIn("What is install node?", prompt)
+
     def test_manual_general_knowledge_query_suppresses_unrelated_session_context(self):
         builder = PromptBuilder()
 

@@ -146,15 +146,19 @@ class AnthropicProvider(BaseProvider):
         return Exception(f"Anthropic: {error}")
 
     async def health_check(self) -> bool:
-        """Verify API key and model access."""
+        """Verify API access through the model catalogue, not inference."""
         try:
-            message = await self.client.messages.create(
-                model=self.get_model("fast"),
-                max_tokens=1,
-                messages=[{"role": "user", "content": "Say 'ok'"}],
-                temperature=0.0,
-            )
-            return bool(self._extract_text(message.content))
+            response = await self.client.models.list(limit=1)
+            return bool(getattr(response, "data", None))
         except Exception as e:
             logger.debug(f"Anthropic health check failed: {e}")
             return False
+
+    def supports_non_billing_health_check(self) -> bool:
+        return True
+
+    async def warm_connection_async(self) -> None:
+        try:
+            await self.client.models.list(limit=1)
+        except Exception:
+            pass

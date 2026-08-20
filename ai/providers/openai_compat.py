@@ -75,18 +75,24 @@ class OpenAICompatProvider(BaseProvider):
             raise
 
     async def health_check(self) -> bool:
-        """Verify the API key by completing a tiny chat request."""
+        """Verify API access through the provider's model catalogue."""
         try:
-            model = self.get_model("fast")
-            if not model:
-                return False
-            r = await self.client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": "Hi"}],
-                max_tokens=1,
-                temperature=0.0,
-            )
-            return bool(getattr(r, "choices", None))
+            response = await self.client.models.list()
+            configured = self.get_model("fast")
+            model_ids = {
+                str(getattr(model, "id", "") or "")
+                for model in (getattr(response, "data", None) or [])
+            }
+            return not model_ids or not configured or configured in model_ids
         except Exception as e:
             logger.debug("%s health check failed: %s", self.name, e)
             return False
+
+    def supports_non_billing_health_check(self) -> bool:
+        return True
+
+    async def warm_connection_async(self) -> None:
+        try:
+            await self.client.models.list()
+        except Exception:
+            pass

@@ -49,6 +49,7 @@ class OverlayWindow(QMainWindow):
         self._active_response_query = ""
         self._active_response_text = ""
         self._active_response_streaming = False
+        self._response_body_block_ready = False
         self._user_is_scrolling = False
         self._prev_stack_index = 0
         self._prev_stack_widget = None
@@ -60,9 +61,8 @@ class OverlayWindow(QMainWindow):
 
         # ── Streaming render strategy ──────────────────────────────────────
         # During streaming we append raw text directly to QTextEdit for
-        # zero-latency display. A periodic 300ms timer re-renders the
-        # accumulated buffer as Markdown without blocking chunk display.
-        # On completion we do a final full markdown render.
+        # zero-latency display. Markdown is rendered once on completion so
+        # replacing the document cannot split token chunks into new lines.
         self._render_timer = QTimer(self)
         self._render_timer.setInterval(300)          # periodic during stream
         self._render_timer.timeout.connect(self._render_markdown_now)
@@ -476,7 +476,9 @@ class OverlayWindow(QMainWindow):
         if was_scrolling:
             sb.setValue(min(previous_value, sb.maximum()))
         else:
-            self.response_area.moveCursor(QTextCursor.MoveOperation.End)
+            # New responses are presented from their beginning. Do not jump
+            # to the last line while the answer is streaming or re-rendering.
+            sb.setValue(0)
 
     def _render_markdown_now(self):
         """Full markdown re-render of the accumulated buffer."""
@@ -514,9 +516,17 @@ class OverlayWindow(QMainWindow):
         self._restore_scroll_after_update(previous_value, was_scrolling)
 
     def begin_active_response(self, query: str) -> None:
+        self._render_timer.stop()
+        self._current_query = query or ""
         self._active_response_query = query or ""
         self._active_response_text = ""
         self._active_response_streaming = False
+        # A canceled prior stream may never emit on_complete. Clear its
+        # rendering state before accepting chunks for this new turn.
+        self._raw_buffer = ""
+        self._is_streaming = False
+        self._response_body_block_ready = False
+        self._user_is_scrolling = False
         self._history_navigation_header = ""
 
     def capture_active_response_chunk(self, text: str) -> None:
@@ -529,14 +539,26 @@ class OverlayWindow(QMainWindow):
         """Position response text on its own block after the query header."""
         cursor = self.response_area.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        if (
-            self.response_area.document().blockCount() <= 1
-            and self.response_area.toPlainText().strip()
-        ):
+        if not self._response_body_block_ready:
             block_fmt = QTextBlockFormat()
             block_fmt.setTopMargin(8)
-            cursor.insertBlock(block_fmt)
+            if hasattr(cursor, "insertBlock"):
+                cursor.insertBlock(block_fmt)
+            self._response_body_block_ready = True
         return cursor
+
+    def _render_streaming_text(self) -> None:
+        """Render streaming text as one escaped block without markdown parsing."""
+        query_html = (
+            f"<div style='color:#64748b;font-size:10px;margin-bottom:5px;'>"
+            f"<b>QUERY:</b> {escape(self._current_query)}</div>"
+            if self._current_query else ""
+        )
+        body_html = escape(self._raw_buffer).replace("\n", "<br>")
+        self.response_area.setHtml(
+            f"{query_html}<div style='color:#d0d0e8;font-size:13px;"
+            f"white-space:pre-wrap;word-break:normal;'>{body_html}</div>"
+        )
 
     def restore_active_response_view(self) -> bool:
         query = (self._active_response_query or "").strip()
@@ -554,20 +576,14 @@ class OverlayWindow(QMainWindow):
         if streaming:
             self._is_streaming = True
             self.response_area.clear()
+            self._response_body_block_ready = False
             if self._current_query:
                 self.response_area.setHtml(
                     f"<div style='color: #64748b; font-size: 10px; margin-bottom: 5px;'>"
                     f"<b>QUERY:</b> {escape(self._current_query)}</div>"
                 )
             if text:
-                cursor = self._response_text_cursor()
-                fmt = QTextCharFormat()
-                fmt.setForeground(QColor("#d0d0e8"))
-                cursor.setCharFormat(fmt)
-                cursor.insertText(text)
-                self.response_area.setTextCursor(cursor)
-            if "```" not in text:
-                self._render_timer.start()
+                self._render_streaming_text()
         elif not text:
             self._is_streaming = False
             self.response_area.setHtml(
@@ -600,21 +616,15 @@ class OverlayWindow(QMainWindow):
             # singleShot won't overwrite our content with "Thinking...".
             self._pending_thinking = False
             self.response_area.clear()
+            self._response_body_block_ready = False
             # Show query header immediately so user sees their question reflected
             if self._current_query:
                 self.response_area.setHtml(
                     f"<div style='color: #64748b; font-size: 10px; margin-bottom: 5px;'>"
                     f"<b>QUERY:</b> {escape(self._current_query)}</div>"
                 )
-            # Start periodic markdown re-render every 300ms
-            self._render_timer.start()
 
         self._raw_buffer += text
-
-        # Stop periodic markdown re-renders once a code fence appears to prevent
-        # layout wobble while code blocks stream in.
-        if self._render_timer.isActive() and "```" in self._raw_buffer:
-            self._render_timer.stop()
 
         # Immediate plaintext append — character-level, zero lag.
         # Use QTextCharFormat to keep text in the correct colour (#d0d0e8)
@@ -622,12 +632,9 @@ class OverlayWindow(QMainWindow):
         sb = self.response_area.verticalScrollBar()
         previous_value = sb.value()
         was_scrolling = bool(self._user_is_scrolling)
-        cursor = self._response_text_cursor()
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor("#d0d0e8"))
-        cursor.setCharFormat(fmt)
-        cursor.insertText(text)
-        self.response_area.setTextCursor(cursor)
+        # Replacing one escaped block avoids QTextCursor paragraph state
+        # splitting token-sized chunks into one-character vertical lines.
+        self._render_streaming_text()
         self._restore_scroll_after_update(previous_value, was_scrolling)
 
     def on_complete(self, full_text: str, query: str = None, cache_tier: int = 0, provider: str = ""):

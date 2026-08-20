@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QTimer
 from PyQt6.QtGui import QTextCursor, QTextCharFormat, QTextBlockFormat, QColor
+from html import escape
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -59,6 +60,7 @@ class MiniOverlay(QMainWindow):
         self._active_response_query = ""
         self._active_response_text = ""
         self._active_response_streaming = False
+        self._response_body_block_ready = False
         self._drag = False
         self._expanded = False
         self._user_is_scrolling = False
@@ -75,7 +77,7 @@ class MiniOverlay(QMainWindow):
         self._gaze_timer.start(100)
 
         self._render_timer = QTimer(self)
-        self._render_timer.setInterval(300)  # periodic markdown re-render during streaming
+        self._render_timer.setInterval(300)  # retained for safe shutdown compatibility
         self._render_timer.timeout.connect(self._render_markdown_now)
 
         self._build()
@@ -220,7 +222,8 @@ class MiniOverlay(QMainWindow):
         if was_scrolling:
             sb.setValue(min(previous_value, sb.maximum()))
         else:
-            sb.setValue(sb.maximum())
+            # New responses are presented from their beginning, not the tail.
+            sb.setValue(0)
 
     def _sync_existing_response(self):
         """Sync the current history entry into the Mini-HUD.
@@ -309,9 +312,15 @@ class MiniOverlay(QMainWindow):
         self._adjust_height()
 
     def begin_active_response(self, query: str) -> None:
+        self._render_timer.stop()
         self._active_response_query = query or ""
         self._active_response_text = ""
         self._active_response_streaming = False
+        # A canceled prior stream may never emit on_complete. Clear its
+        # rendering state before accepting chunks for this new turn.
+        self._raw_buffer = ""
+        self._last_rendered = ""
+        self._user_is_scrolling = False
 
     def capture_active_response_chunk(self, text: str) -> None:
         if not text:
@@ -323,14 +332,26 @@ class MiniOverlay(QMainWindow):
         """Position response text on its own block after the query header."""
         cursor = self.response_area.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        if (
-            self.response_area.document().blockCount() <= 1
-            and self.response_area.toPlainText().strip()
-        ):
+        if not self._response_body_block_ready:
             block_fmt = QTextBlockFormat()
             block_fmt.setTopMargin(8)
-            cursor.insertBlock(block_fmt)
+            if hasattr(cursor, "insertBlock"):
+                cursor.insertBlock(block_fmt)
+            self._response_body_block_ready = True
         return cursor
+
+    def _render_streaming_text(self) -> None:
+        """Render streaming text as one escaped block without markdown parsing."""
+        query_html = (
+            f"<div style='color:#64748b;font-size:9px;margin-bottom:8px;'>"
+            f"<b>Q:</b> {escape(self._active_response_query)}</div>"
+            if self._active_response_query else ""
+        )
+        body_html = escape(self._raw_buffer).replace("\n", "<br>")
+        self.response_area.setHtml(
+            f"{query_html}<div style='color:#d0d0e8;font-size:11px;"
+            f"white-space:pre-wrap;word-break:normal;'>{body_html}</div>"
+        )
 
     def restore_active_response_view(self) -> bool:
         query = (self._active_response_query or "").strip()
@@ -343,19 +364,13 @@ class MiniOverlay(QMainWindow):
             self._toggle_expand(True)
         if self._active_response_streaming:
             self.response_area.clear()
+            self._response_body_block_ready = False
             self.response_area.setHtml(
                 f"<div style='color:#64748b;font-size:9px;margin-bottom:8px;'>"
                 f"<b>Q:</b> {query}</div>"
             )
             if text:
-                cursor = self._response_text_cursor()
-                fmt = QTextCharFormat()
-                fmt.setForeground(QColor("#d0d0e8"))
-                cursor.setCharFormat(fmt)
-                cursor.insertText(text)
-                self.response_area.setTextCursor(cursor)
-            if "```" not in text:
-                self._render_timer.start()
+                self._render_streaming_text()
         elif not text:
             self.response_area.setHtml(
                 f"<div style='color:#64748b;font-size:9px;margin-bottom:8px;'>"
@@ -367,7 +382,7 @@ class MiniOverlay(QMainWindow):
         return True
 
     def append_response(self, text: str):
-        """Called on every streaming chunk — immediate display + periodic markdown re-render."""
+        """Called on every streaming chunk for immediate plain-text display."""
         self.capture_active_response_chunk(text)
         if bool(getattr(self.app, "_history_navigation_active", False)):
             return
@@ -375,29 +390,21 @@ class MiniOverlay(QMainWindow):
         if is_first:
             # First chunk: clear area, start periodic timer
             self.response_area.clear()
+            self._response_body_block_ready = False
             self.set_thinking()
-            self._render_timer.start()
 
         self._raw_buffer += text
 
         if is_first:
             self._toggle_expand(True)
 
-        # Stop periodic markdown re-renders once a code fence appears to prevent
-        # layout wobble while code blocks stream in.
-        if self._render_timer.isActive() and "```" in self._raw_buffer:
-            self._render_timer.stop()
-
         # Immediate colour-correct text append
         sb = self.response_area.verticalScrollBar()
         previous_value = sb.value()
         was_scrolling = bool(self._user_is_scrolling)
-        cursor = self._response_text_cursor()
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor("#d0d0e8"))
-        cursor.setCharFormat(fmt)
-        cursor.insertText(text)
-        self.response_area.setTextCursor(cursor)
+        # Replacing one escaped block avoids QTextCursor paragraph state
+        # splitting token-sized chunks into one-character vertical lines.
+        self._render_streaming_text()
         self._restore_scroll_after_update(previous_value, was_scrolling)
 
     def on_complete(
@@ -536,9 +543,7 @@ class MiniOverlay(QMainWindow):
         self.response_area.setMinimumHeight(min_response_height)
         self.response_area.setMaximumHeight(max_response_height)
         if not self._user_is_scrolling:
-            self.response_area.verticalScrollBar().setValue(
-                self.response_area.verticalScrollBar().maximum()
-            )
+            self.response_area.verticalScrollBar().setValue(0)
 
     def _toggle_expand(self, force=None):
         self._expanded = force if force is not None else not self._expanded

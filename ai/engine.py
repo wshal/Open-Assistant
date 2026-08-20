@@ -38,6 +38,11 @@ class AIEngine(QObject):
 
     response_chunk = pyqtSignal(str)
     response_complete = pyqtSignal(str)
+    # The plain signals are retained for compatibility with non-UI listeners.
+    # The application UI consumes the tagged variants so queued cross-thread
+    # events from a superseded turn can be rejected deterministically.
+    response_chunk_tagged = pyqtSignal(str, str)  # (text, turn_id)
+    response_complete_tagged = pyqtSignal(str, str)  # (text, turn_id)
     background_complete = pyqtSignal(str, str)  # (query, response)
     error_occurred = pyqtSignal(str)
     turn_complete = pyqtSignal()  # Emitted when a generation turn finishes (success or error)
@@ -169,6 +174,7 @@ class AIEngine(QObject):
                 self._foreground_turn_id or "",
             )
             return False
+        self.response_chunk_tagged.emit(chunk, turn_id)
         self.response_chunk.emit(chunk)
         return True
 
@@ -182,6 +188,7 @@ class AIEngine(QObject):
                 self._foreground_turn_id or "",
             )
             return False
+        self.response_complete_tagged.emit(full_text, turn_id)
         self.response_complete.emit(full_text)
         return True
 
@@ -469,6 +476,19 @@ class AIEngine(QObject):
             if name in seen or prov is None or not getattr(prov, "enabled", False):
                 return
             seen.add(name)
+            standby_only_probe = bool(
+                self.config.get("ai.providers.standby_auto_probe", True)
+            ) and not bool(self.config.get("ai.providers.validate_on_init", False))
+            if standby_only_probe and bool(
+                self.config.get("ai.providers.startup_probe_non_billing_only", True)
+            ) and not getattr(
+                prov, "supports_non_billing_health_check", lambda: False
+            )():
+                logger.debug(
+                    "Skipping startup probe for %s; no non-billing health check is available",
+                    name,
+                )
+                return
             if not getattr(prov, "supports_health_check", lambda: False)():
                 self.set_provider_health(name, True, source="startup_skip")
                 return
@@ -516,7 +536,10 @@ class AIEngine(QObject):
 
     def ensure_provider_validation(self, loop: asyncio.AbstractEventLoop):
         """Start a non-blocking background probe pass for loaded providers."""
-        if not bool(self.config.get("ai.providers.validate_on_init", False)):
+        if not bool(
+            self.config.get("ai.providers.validate_on_init", False)
+            or self.config.get("ai.providers.standby_auto_probe", True)
+        ):
             return None
         if not loop or not loop.is_running():
             return None
@@ -610,11 +633,10 @@ class AIEngine(QObject):
         waiting for the result — READY is never delayed.
 
         Design intent:
-          - Standby warmup opportunistically opens Groq's TCP connection.
+          - Standby warmup opportunistically opens Groq's TCP/TLS connection.
           - READY does not wait for it.
-          - The first real user prompt does not get a synthetic request in
-            front of it. The warm request is still a Groq API call, so it stays
-            one-shot and best-effort.
+          - The warm request does not invoke inference, so it does not spend
+            completion tokens or add a synthetic prompt before the user turn.
         """
         if not loop or not loop.is_running():
             return
@@ -629,6 +651,22 @@ class AIEngine(QObject):
             logger.debug("[Engine] Groq connection warm scheduled (opportunistic)")
         except Exception as exc:
             logger.debug("[Engine] Groq warm schedule failed (non-fatal): %s", exc)
+
+    def warm_provider_connections(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Warm every loaded provider using its non-inference transport hook."""
+        if not loop or not loop.is_running():
+            return
+        for name, provider in list((self._providers or {}).items()):
+            if not getattr(provider, "enabled", False):
+                continue
+            warm_fn = getattr(provider, "warm_connection_async", None)
+            if not callable(warm_fn):
+                continue
+            try:
+                asyncio.run_coroutine_threadsafe(warm_fn(), loop)
+                logger.debug("[Engine] %s connection warm scheduled", name)
+            except Exception as exc:
+                logger.debug("[Engine] %s warm schedule failed: %s", name, exc)
 
     def start_groq_keepalive(self, loop: asyncio.AbstractEventLoop, idle_threshold_s: float = 25.0) -> None:
         """Start the Groq background keepalive task on the async loop.
@@ -735,6 +773,10 @@ class AIEngine(QObject):
         self.cancel()
         self._current_gen_kwargs = None
 
+    def cancel_background_generation(self) -> None:
+        """Discard deferred work that must not affect a newer foreground turn."""
+        self._bg_slot.cancel()
+
     async def generate_response(
         self,
         query: str,
@@ -814,7 +856,10 @@ class AIEngine(QObject):
         allow_cache = (
             cache_enabled
             and not bool(request_metadata.get("suppress_response_cache"))
-            and origin in {"manual", "speech", "auto"}
+            # Typed turns must always reach the provider. A manual question
+            # often follows an audio question with unchanged visual context;
+            # reusing the audio answer is incorrect.
+            and origin in {"speech", "auto"}
             and isinstance(query, str)
             and len(query.strip()) > 0
             and len(query.strip()) <= max_q_chars
@@ -955,7 +1000,11 @@ class AIEngine(QObject):
             user_msg = self.prompts.user(
                 query=query,
                 screen=screen_context or "",
-                audio=audio_context or ("" if isolate_context else nexus_snapshot.get("recent_audio", "")),
+                audio=(
+                    ""
+                    if isolate_context or request_metadata.get("suppress_audio_context")
+                    else audio_context or nexus_snapshot.get("recent_audio", "")
+                ),
                 rag="",
                 mode=_mode_arg,
                 origin=origin,
@@ -1208,7 +1257,11 @@ class AIEngine(QObject):
             user_msg = self.prompts.user(
                 query=resolved_query,
                 screen=screen_context or ("" if request_metadata.get("suppress_screen_context") else nexus_snapshot.get("latest_ocr", "")),
-                audio=refined_audio or ("" if isolate_context else nexus_snapshot.get("full_audio_history", "")),
+                audio=(
+                    ""
+                    if isolate_context or request_metadata.get("suppress_audio_context")
+                    else refined_audio or nexus_snapshot.get("full_audio_history", "")
+                ),
                 rag="" if request_metadata.get("suppress_rag_context") else rag_context,
                 mode=_mode_arg,
                 origin=origin,
@@ -1440,12 +1493,16 @@ class AIEngine(QObject):
                         self._first_token_timeout_ms_for_provider(current_provider.name),
                     )
                     ft_timeout_s = max(ft_ms / 1000.0, 0.0) if ft_ms > 0 else 0.0
+                    response_timeout_s = self._response_timeout_s_for_provider(
+                        current_provider.name
+                    )
 
                     async for chunk in self._stream_with_first_token_timeout(
                         current_provider,
                         sys_prompt,
                         user_msg,
                         first_token_timeout_s=ft_timeout_s,
+                        total_timeout_s=response_timeout_s,
                     ):
                         if _cancelled():
                             logger.warning("AI: Stream cancelled before chunk emit")
@@ -1536,25 +1593,83 @@ class AIEngine(QObject):
         user_msg: str,
         *,
         first_token_timeout_s: float = 0.0,
+        total_timeout_s: float = 0.0,
     ) -> AsyncGenerator[str, None]:
         stream = provider.generate_stream(sys_prompt, user_msg)
+        deadline = (
+            time.monotonic() + float(total_timeout_s)
+            if total_timeout_s and total_timeout_s > 0
+            else None
+        )
+
+        def _remaining() -> float | None:
+            if deadline is None:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Response timeout ({float(total_timeout_s):.1f}s) from "
+                    f"{getattr(provider, 'name', 'provider')}"
+                )
+            return remaining
+
         if not first_token_timeout_s or first_token_timeout_s <= 0:
-            async for chunk in stream:
+            while True:
+                try:
+                    remaining = _remaining()
+                    next_chunk = stream.__anext__()
+                    chunk = (
+                        await asyncio.wait_for(next_chunk, timeout=remaining)
+                        if remaining is not None
+                        else await next_chunk
+                    )
+                except StopAsyncIteration:
+                    break
                 yield chunk
             return
 
         try:
-            first = await asyncio.wait_for(stream.__anext__(), timeout=first_token_timeout_s)
+            remaining = _remaining()
+            first_timeout = first_token_timeout_s
+            if remaining is not None:
+                first_timeout = min(first_timeout, remaining)
+            first = await asyncio.wait_for(stream.__anext__(), timeout=first_timeout)
         except StopAsyncIteration:
             return
         except asyncio.TimeoutError as exc:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Response timeout ({float(total_timeout_s):.1f}s) from "
+                    f"{getattr(provider, 'name', 'provider')}"
+                ) from exc
             raise TimeoutError(
                 f"First token timeout ({first_token_timeout_s:.2f}s) from {getattr(provider, 'name', 'provider')}"
             ) from exc
 
         yield first
-        async for chunk in stream:
+        while True:
+            try:
+                remaining = _remaining()
+                next_chunk = stream.__anext__()
+                chunk = (
+                    await asyncio.wait_for(next_chunk, timeout=remaining)
+                    if remaining is not None
+                    else await next_chunk
+                )
+            except StopAsyncIteration:
+                break
             yield chunk
+
+    def _response_timeout_s_for_provider(self, provider_name: str) -> float:
+        """Return the maximum wall-clock budget for one streamed response."""
+        overrides = self.config.get("ai.text.response_timeout_s_by_provider", {})
+        raw = overrides.get(provider_name) if isinstance(overrides, dict) else None
+        if raw is None:
+            raw = self.config.get("ai.text.response_timeout_s", 0)
+        try:
+            return max(0.0, float(raw or 0))
+        except (TypeError, ValueError):
+            return 0.0
 
     # ── Conversation memory helpers ─────────────────────────────────────────────
 

@@ -147,6 +147,27 @@ class TestShortQueryCacheSemantic(unittest.TestCase):
         self.assertIsNone(entry)
         self.assertEqual(tier, 0)
 
+    def test_semantic_cache_does_not_cross_conversational_turns(self):
+        """Same intent/topic still needs the same history scope."""
+        self.cache.set(
+            mode="general",
+            query="What is React?",
+            context_fp=self.ctx,
+            history_fp="before",
+            response="React is a UI library.",
+            provider="test",
+        )
+
+        entry, tier = self.cache.get_with_tier(
+            mode="general",
+            query="Can you explain the React library?",
+            context_fp=self.ctx,
+            history_fp="after",
+        )
+
+        self.assertIsNone(entry)
+        self.assertEqual(tier, 0)
+
     def test_intent_word_boundary_no_false_positive(self):
         """'fixed' should NOT match the TROUBLESHOOT 'fix' intent pattern."""
         sig = self.cache._get_semantic_signature("I already fixed this")
@@ -222,7 +243,7 @@ class TestEmbeddingTier(unittest.TestCase):
         rec = _EmbedRecord(mode="general", context_fp="ctx1", cache_query="stored", history_fp="h1")
         tier.add("stored", rec)
 
-        result = tier.find("query", mode="general", context_fp="ctx1")
+        result = tier.find("query", mode="general", context_fp="ctx1", history_fp="h1")
         self.assertIsNotNone(result)
         self.assertEqual(result.cache_query, "stored")
 
@@ -239,7 +260,7 @@ class TestEmbeddingTier(unittest.TestCase):
 
         rec = _EmbedRecord(mode="general", context_fp="ctx1", cache_query="stored", history_fp="h1")
         tier.add("stored", rec)
-        result = tier.find("query", mode="general", context_fp="ctx1")
+        result = tier.find("query", mode="general", context_fp="ctx1", history_fp="h1")
         self.assertIsNone(result)
 
     def test_mode_isolation(self):
@@ -255,7 +276,23 @@ class TestEmbeddingTier(unittest.TestCase):
         tier.add("stored", rec)
 
         # Same vector but looking up with mode="general" — must NOT return
-        result = tier.find("query", mode="general", context_fp="ctx1")
+        result = tier.find("query", mode="general", context_fp="ctx1", history_fp="h1")
+        self.assertIsNone(result)
+
+    def test_history_isolation(self):
+        """A matching query/context must not cross conversational turns."""
+        tier = self._make_tier(threshold=0.85)
+        v = np.random.rand(384).astype(np.float32)
+
+        def fake_embed(text):
+            norm = np.linalg.norm(v)
+            return v / norm
+        tier._embed = fake_embed
+
+        rec = _EmbedRecord(mode="general", context_fp="ctx1", cache_query="stored", history_fp="h1")
+        tier.add("stored", rec)
+
+        result = tier.find("query", mode="general", context_fp="ctx1", history_fp="h2")
         self.assertIsNone(result)
 
     def test_embedding_tier_disabled_by_default_in_base_tests(self):

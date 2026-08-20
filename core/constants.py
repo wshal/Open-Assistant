@@ -8,6 +8,13 @@ APP_NAME = "OpenAssist AI"
 APP_VERSION = "1.0.0"
 APP_ID = "com.openassist.ai"
 
+# Provider model lifecycle constants. Keep replacements and retired IDs in one
+# place so defaults, migrations, health checks, and the settings UI agree.
+GROQ_DEFAULT_TEXT_MODEL = "openai/gpt-oss-20b"
+GROQ_DEPRECATED_TEXT_MODELS = frozenset({"llama-3.1-8b-instant"})
+CEREBRAS_DEFAULT_TEXT_MODEL = "gpt-oss-120b"
+CEREBRAS_DEPRECATED_TEXT_MODELS = frozenset({"llama3.1-8b"})
+
 
 def _get_user_data_dir() -> Path:
     """Return the directory where ALL mutable user data lives.

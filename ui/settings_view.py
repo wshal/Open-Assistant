@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QInputDialog,
 )
 from PyQt6.QtGui import QDesktopServices
-from core.constants import PROVIDERS
+from core.constants import CEREBRAS_DEFAULT_TEXT_MODEL, GROQ_DEFAULT_TEXT_MODEL, PROVIDERS
 from ui.custom_widgets import PremiumCheckBox
 from utils.logger import setup_logger
 from ui.settings._tab_api import ApiTabMixin
@@ -186,9 +186,9 @@ class ProviderTestWorker(QThread):
             "groq": (
                 "https://api.groq.com/openai/v1/chat/completions",
                 {
-                    "model": "llama-3.1-8b-instant",
+                    "model": GROQ_DEFAULT_TEXT_MODEL,
                     "messages": [{"role": "user", "content": "Hi"}],
-                    "max_tokens": 5,
+                    "max_completion_tokens": 5,
                 },
             ),
             "gemini": (
@@ -202,7 +202,7 @@ class ProviderTestWorker(QThread):
             "cerebras": (
                 "https://api.cerebras.ai/v1/chat/completions",
                 {
-                    "model": "llama-3.1-8b-instant",
+                    "model": CEREBRAS_DEFAULT_TEXT_MODEL,
                     "messages": [{"role": "user", "content": "Hi"}],
                     "max_tokens": 5,
                 },

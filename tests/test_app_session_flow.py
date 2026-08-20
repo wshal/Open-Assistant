@@ -177,6 +177,8 @@ class OverlayStub:
         self._active_response_query = query
         self._active_response_text = ""
         self._active_response_streaming = False
+        self._raw_buffer = ""
+        self._is_streaming = False
 
     def capture_active_response_chunk(self, text):
         self._active_response_text += text
@@ -306,6 +308,8 @@ class MiniOverlayStub:
         self._active_response_query = query
         self._active_response_text = ""
         self._active_response_streaming = False
+        self._raw_buffer = ""
+        self._last_rendered = ""
 
     def capture_active_response_chunk(self, text):
         self._active_response_text += text
@@ -1860,6 +1864,116 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
 
         self.assertIsNotNone(app._current_response_start_time)
 
+    def test_manual_query_cancels_prior_work_instead_of_demoting_it(self):
+        app = self._build_app()
+        app.session_active = True
+        app._ai_lock_ready = SimpleNamespace(wait=lambda timeout=2: True)
+        calls = []
+        app.ai = SimpleNamespace(
+            detector=SimpleNamespace(learn_from_query=lambda q: None),
+            cancel=lambda: calls.append("cancel"),
+            cancel_background_generation=lambda: calls.append("cancel_background"),
+            demote_to_background=lambda: calls.append("demote"),
+        )
+        app.simulator = SimpleNamespace(get_foreground_window=lambda: None)
+        app.overlay.response_area.setHtml = lambda html: None
+        app._pending_request_metadata = None
+
+        async def _fake_process_ai(*args, **kwargs):
+            return None
+        app._process_ai = _fake_process_ai
+        app.loop = object()
+
+        with patch("core.app.asyncio.run_coroutine_threadsafe", side_effect=lambda coro, loop: coro.close()):
+            OpenAssistApp.generate_response(app, "what are hooks?", "manual", {"audio": ""})
+
+        self.assertEqual(calls, ["cancel_background", "cancel"])
+
+    def test_manual_query_cancels_active_audio_process_before_scheduling(self):
+        app = self._build_app()
+        app.session_active = True
+        app._ai_lock_ready = SimpleNamespace(wait=lambda timeout=2: True)
+        calls = []
+        active_audio = SimpleNamespace(done=lambda: False, cancel=lambda: calls.append("cancel_process"))
+        app._active_process_future = active_audio
+        app.ai = SimpleNamespace(
+            detector=SimpleNamespace(learn_from_query=lambda q: None),
+            cancel=lambda: calls.append("cancel_engine"),
+            cancel_background_generation=lambda: calls.append("cancel_background"),
+        )
+        app.simulator = SimpleNamespace(get_foreground_window=lambda: None)
+        app.overlay.response_area.setHtml = lambda html: None
+        app._pending_request_metadata = None
+
+        async def _fake_process_ai(*args, **kwargs):
+            return None
+        app._process_ai = _fake_process_ai
+        app.loop = object()
+
+        with patch("core.app.asyncio.run_coroutine_threadsafe", side_effect=lambda coro, loop: coro.close()):
+            OpenAssistApp.generate_response(app, "what are hooks?", "manual", {"audio": ""})
+
+        self.assertEqual(calls, ["cancel_process", "cancel_background", "cancel_engine"])
+
+    def test_tagged_ui_delivery_drops_queued_audio_from_superseded_turn(self):
+        app = self._build_app()
+        app._active_ui_turn_id = "manual:new-turn"
+
+        # Simulate Qt delivering chunks queued by the old audio stream after
+        # the manual response view has become active.
+        OpenAssistApp._on_response_chunk(app, "old audio answer", "speech:old-turn")
+
+        self.assertEqual(app.overlay.appended, [])
+        self.assertEqual(app.mini_overlay.appended, [])
+
+        OpenAssistApp._on_response_chunk(app, "correct manual answer", "manual:new-turn")
+
+        self.assertEqual(app.overlay.appended, ["correct manual answer"])
+        self.assertEqual(app.mini_overlay.appended, ["correct manual answer"])
+
+    def test_tagged_stale_completion_does_not_replace_manual_response(self):
+        app = self._build_app()
+        app._active_ui_turn_id = "manual:new-turn"
+
+        OpenAssistApp._on_response_complete(
+            app,
+            "old audio answer",
+            "speech:old-turn",
+        )
+
+        self.assertEqual(app.overlay.completed, [])
+        self.assertEqual(app.mini_overlay.completed, [])
+
+    def test_new_manual_turn_clears_stale_overlay_stream_state(self):
+        app = self._build_app()
+        app.session_active = True
+        app._ai_lock_ready = SimpleNamespace(wait=lambda timeout=2: True)
+        app.overlay._raw_buffer = "stale audio answer"
+        app.overlay._is_streaming = True
+        app.mini_overlay._raw_buffer = "stale audio answer"
+        app.mini_overlay._last_rendered = "stale audio answer"
+        app.ai = SimpleNamespace(
+            detector=SimpleNamespace(learn_from_query=lambda q: None),
+            cancel=lambda: None,
+            cancel_background_generation=lambda: None,
+        )
+        app.simulator = SimpleNamespace(get_foreground_window=lambda: None)
+        app.overlay.response_area.setHtml = lambda html: None
+        app._pending_request_metadata = None
+
+        async def _fake_process_ai(*args, **kwargs):
+            return None
+        app._process_ai = _fake_process_ai
+        app.loop = object()
+
+        with patch("core.app.asyncio.run_coroutine_threadsafe", side_effect=lambda coro, loop: coro.close()):
+            OpenAssistApp.generate_response(app, "what are hooks?", "manual", {"audio": ""})
+
+        self.assertEqual(app.overlay._raw_buffer, "")
+        self.assertFalse(app.overlay._is_streaming)
+        self.assertEqual(app.mini_overlay._raw_buffer, "")
+        self.assertEqual(app.mini_overlay._last_rendered, "")
+
     def test_manual_screen_prompt_routes_to_one_shot_vision_analysis(self):
         app = self._build_app()
         app.session_active = True
@@ -2041,6 +2155,78 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertEqual(captured["kwargs"]["screen_hash"], "")
         self.assertEqual(captured["args"][1]["latest_ocr"], "")
         self.assertTrue(captured["kwargs"]["request_metadata"]["suppress_screen_context"])
+
+    def test_manual_query_suppresses_stale_audio_and_history_context(self):
+        app = self._build_app()
+        app._ai_lock = asyncio.Lock()
+        app._generation_epoch = 10
+        app.screen = SimpleNamespace(
+            _enabled=False,
+            last_img_hash="",
+            capture_context=Mock(side_effect=AssertionError("vision disabled must not capture")),
+        )
+        app.audio = SimpleNamespace(get_transcript=lambda: "previous audio question")
+        app.memory = SimpleNamespace(is_ready=lambda: False)
+        app.nexus = SimpleNamespace(get_snapshot=lambda: {"full_audio_history": "previous audio question"})
+        captured = {}
+
+        async def _capture_generate_response(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        app.ai = SimpleNamespace(generate_response=_capture_generate_response)
+
+        asyncio.run(
+            OpenAssistApp._process_ai(
+                app,
+                "what are hooks?",
+                "manual",
+                None,
+                10,
+                {},
+            )
+        )
+
+        self.assertEqual(captured["kwargs"]["audio_context"], "")
+        self.assertTrue(captured["kwargs"]["request_metadata"]["suppress_audio_context"])
+        self.assertTrue(captured["kwargs"]["request_metadata"]["suppress_history_context"])
+
+    def test_manual_query_never_executes_actionable_commands(self):
+        app = self._build_app()
+        app._ai_lock = asyncio.Lock()
+        app._generation_epoch = 10
+        app.screen = SimpleNamespace(_enabled=False, last_img_hash="")
+        app.audio = SimpleNamespace(get_transcript=lambda: "")
+        app.memory = SimpleNamespace(is_ready=lambda: False)
+        app.nexus = SimpleNamespace(get_snapshot=lambda: {})
+        action_calls = []
+
+        async def _should_not_run(query):
+            action_calls.append(query)
+            return "$ npm install node"
+
+        captured = {}
+
+        async def _capture_generate_response(*args, **kwargs):
+            captured["kwargs"] = kwargs
+
+        app.actions = SimpleNamespace(detect_and_run=_should_not_run)
+        app.ai = SimpleNamespace(generate_response=_capture_generate_response)
+
+        asyncio.run(
+            OpenAssistApp._process_ai(
+                app,
+                "install node",
+                "manual",
+                None,
+                10,
+                {},
+            )
+        )
+
+        self.assertEqual(action_calls, [])
+        self.assertTrue(captured["kwargs"]["request_metadata"]["actions_disabled"])
+        self.assertNotIn("action_output", captured["kwargs"]["request_metadata"])
 
     def test_screen_analysis_badge_updates_during_flow(self):
         app = self._build_app()

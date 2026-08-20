@@ -29,6 +29,7 @@ logs/
 # 📊  Benchmark Output  (large JSON reports, regenerated on demand)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Keep benchmark SCRIPTS but not the generated JSON sweep results.
+benchmarks/*.json
 benchmarks/audio_asr_matrix_sweep.json
 benchmarks/audio_asr_model_sweep.json
 benchmarks/audio_asr_decoder_sweep.json

@@ -134,7 +134,8 @@ class MarkdownRenderer:
 
         return f"""
         <div style="font-family: {self.font_family}, sans-serif;
-                    font-size: 13px; line-height: 1.6; color: #d0d0e8;">
+                    font-size: 13px; line-height: 1.6; color: #d0d0e8;
+                    word-break: normal; overflow-wrap: normal; white-space: normal;">
             {body}
         </div>
         """
