@@ -1,8 +1,9 @@
-"""Gemini provider — gemini-2.5-flash default, tiered model support, thinking budget."""
+"""Gemini provider — Gemini 3.5 Flash default with a fast Lite tier."""
 
 import time
 from typing import AsyncGenerator
 from ai.providers.base import BaseProvider
+from core.constants import GEMINI_DEFAULT_TEXT_MODEL, GEMINI_DEPRECATED_TEXT_MODELS
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -10,6 +11,7 @@ logger = setup_logger(__name__)
 # ── Deprecated / broken models ────────────────────────────────────────────────
 # These are silently replaced at startup so config.yaml drift can't break users.
 _DEPRECATED_MODELS: set[str] = {
+    *GEMINI_DEPRECATED_TEXT_MODELS,
     # 2.0 family — permanently shut down June 1, 2026
     "gemini-2.0-flash",
     "gemini-2.0-flash-001",
@@ -31,12 +33,12 @@ _DEPRECATED_MODELS: set[str] = {
 # These tiers keep the default on a stable low-latency model while allowing
 # quality/premium opt-ins from config.yaml.
 _DEFAULT_MODELS = {
-    "fast":     "gemini-2.5-flash-lite",   # quick/interim queries
-    "balanced": "gemini-2.5-flash",        # primary workhorse
-    "quality":  "gemini-2.5-pro",          # vision / complex tasks
-    "premium":  "gemini-3-flash-preview",  # current-generation preview opt-in
+    "fast":     "gemini-3.1-flash-lite",   # lowest latency / high-volume work
+    "balanced": "gemini-3.5-flash",        # primary workhorse
+    "quality":  "gemini-3.5-flash",        # vision / accurate tasks
+    "premium":  "gemini-3.5-flash",        # stable production model
 }
-_RECOMMENDED_MODEL = "gemini-2.5-flash"
+_RECOMMENDED_MODEL = GEMINI_DEFAULT_TEXT_MODEL
 
 
 class GeminiProvider(BaseProvider):
@@ -99,13 +101,11 @@ class GeminiProvider(BaseProvider):
 
     @staticmethod
     def _supports_thinking(model: str) -> bool:
-        """Return True for models that support the thinking_budget parameter."""
-        # Only 2.5+ models support thinking; older and lite variants do not.
+        """Return True for Gemini 3 models that support thinking levels."""
+        # Gemini 3 models support thinking, including Flash-Lite.
         return bool(model) and (
-            "gemini-2.5-flash" in model or
-            "gemini-2.5-pro" in model or
             "gemini-3" in model
-        ) and "lite" not in model
+        )
 
     def _build_contents(self, model: str, system: str, user: str):
         """
@@ -124,16 +124,45 @@ class GeminiProvider(BaseProvider):
         return user, (system or None)
 
     def _build_config_kwargs(self, model: str, temperature: float = 0.7, types_module=None) -> dict:
-        """Build GenerateContentConfig kwargs, including thinking budget where supported."""
-        kwargs = dict(max_output_tokens=self.max_tokens, temperature=temperature)
-        if self._thinking_budget != 0 and self._supports_thinking(model):
-            # thinking_budget=-1 → dynamic (model decides); >0 → fixed token cap
+        """Build GenerateContentConfig kwargs compatible with the model generation."""
+        # Gemini 3 recommends thinking levels over legacy sampling controls;
+        # omitting temperature also avoids INVALID_ARGUMENT on stricter API
+        # versions. Gemini 2.x/custom models retain the old behavior.
+        kwargs = dict(max_output_tokens=self.max_tokens)
+        # This provider does not pass tools/function declarations. Explicitly
+        # disable automatic function calling to keep direct GenerateContent
+        # requests deterministic and quiet under google-genai 2.x.
+        if types_module is not None and hasattr(types_module, "AutomaticFunctionCallingConfig"):
+            kwargs["automatic_function_calling"] = types_module.AutomaticFunctionCallingConfig(
+                disable=True
+            )
+        else:
+            kwargs["automatic_function_calling"] = {"disable": True}
+        if not self._supports_thinking(model):
+            kwargs["temperature"] = temperature
+        if self._supports_thinking(model) and self._thinking_budget == 0:
+            # Preserve the provider's historical "thinking disabled" default
+            # while using Gemini 3's supported control surface.
             if types_module is not None and hasattr(types_module, "ThinkingConfig"):
-                kwargs["thinking_config"] = types_module.ThinkingConfig(
-                    thinking_budget=self._thinking_budget
-                )
+                kwargs["thinking_config"] = types_module.ThinkingConfig(thinking_level="minimal")
             else:
-                kwargs["thinking_config"] = {"thinking_budget": self._thinking_budget}
+                kwargs["thinking_config"] = {"thinking_level": "minimal"}
+        elif self._thinking_budget != 0 and self._supports_thinking(model):
+            # Gemini 3 uses thinking levels. Preserve the old setting as a
+            # useful compatibility knob: -1 means medium, while explicit
+            # budgets map to progressively stronger levels.
+            if types_module is not None and hasattr(types_module, "ThinkingConfig"):
+                if self._thinking_budget < 0:
+                    level = "medium"
+                elif self._thinking_budget <= 2048:
+                    level = "low"
+                elif self._thinking_budget <= 8192:
+                    level = "medium"
+                else:
+                    level = "high"
+                kwargs["thinking_config"] = types_module.ThinkingConfig(thinking_level=level)
+            else:
+                kwargs["thinking_config"] = {"thinking_level": "medium"}
         return kwargs
 
     @staticmethod

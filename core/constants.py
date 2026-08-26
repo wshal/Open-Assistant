@@ -15,6 +15,18 @@ GROQ_DEPRECATED_TEXT_MODELS = frozenset({"llama-3.1-8b-instant"})
 CEREBRAS_DEFAULT_TEXT_MODEL = "gpt-oss-120b"
 CEREBRAS_DEPRECATED_TEXT_MODELS = frozenset({"llama3.1-8b"})
 
+# Gemini model lifecycle. Keep this shared by persisted-config migration and
+# the provider's runtime safety net so old installs converge on the same IDs.
+GEMINI_DEFAULT_TEXT_MODEL = "gemini-3.5-flash"
+GEMINI_FAST_TEXT_MODEL = "gemini-3.1-flash-lite"
+GEMINI_DEPRECATED_TEXT_MODELS = frozenset({
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-2.5-pro-preview-06-05",
+    "gemini-2.5-flash-preview-04-17",
+})
+
 
 def _get_user_data_dir() -> Path:
     """Return the directory where ALL mutable user data lives.

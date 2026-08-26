@@ -36,6 +36,8 @@ MODEL_CONTEXT_WINDOWS: Dict[str, int] = {
     "gemini-2.0-flash": 1048576,
     "gemini-2.5-pro-preview-06-05": 1048576,
     "gemini-2.5-flash-preview-04-17": 1048576,
+    "gemini-3.1-flash-lite": 1048576,
+    "gemini-3.5-flash": 1048576,
 
     # Together
     "meta-llama/Llama-3.2-3B-Instruct-Turbo": 131072,

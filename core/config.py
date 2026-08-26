@@ -15,6 +15,9 @@ from core.constants import (
     CONFIG_FILE,
     GROQ_DEFAULT_TEXT_MODEL,
     GROQ_DEPRECATED_TEXT_MODELS,
+    GEMINI_DEFAULT_TEXT_MODEL,
+    GEMINI_FAST_TEXT_MODEL,
+    GEMINI_DEPRECATED_TEXT_MODELS,
 )
 
 logger = setup_logger(__name__)
@@ -185,6 +188,7 @@ class Config:
             migrations = {
                 "groq": (GROQ_DEPRECATED_TEXT_MODELS, GROQ_DEFAULT_TEXT_MODEL),
                 "cerebras": (CEREBRAS_DEPRECATED_TEXT_MODELS, CEREBRAS_DEFAULT_TEXT_MODEL),
+                "gemini": (GEMINI_DEPRECATED_TEXT_MODELS, GEMINI_DEFAULT_TEXT_MODEL),
             }
             for provider_name, (deprecated_models, replacement) in migrations.items():
                 provider = providers.get(provider_name, {})
@@ -199,7 +203,11 @@ class Config:
                 if isinstance(models, dict):
                     for tier, configured_model in list(models.items()):
                         if str(configured_model or "").strip() in deprecated_models:
-                            models[tier] = replacement
+                            models[tier] = (
+                                GEMINI_FAST_TEXT_MODEL
+                                if provider_name == "gemini" and tier == "fast"
+                                else replacement
+                            )
                             changed = True
 
             if changed:

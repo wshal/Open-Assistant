@@ -27,7 +27,12 @@ from PyQt6.QtWidgets import (
     QInputDialog,
 )
 from PyQt6.QtGui import QDesktopServices
-from core.constants import CEREBRAS_DEFAULT_TEXT_MODEL, GROQ_DEFAULT_TEXT_MODEL, PROVIDERS
+from core.constants import (
+    CEREBRAS_DEFAULT_TEXT_MODEL,
+    GEMINI_DEFAULT_TEXT_MODEL,
+    GROQ_DEFAULT_TEXT_MODEL,
+    PROVIDERS,
+)
 from ui.custom_widgets import PremiumCheckBox
 from utils.logger import setup_logger
 from ui.settings._tab_api import ApiTabMixin
@@ -196,7 +201,7 @@ class ProviderTestWorker(QThread):
                 # Using Flash keeps TEST fast and typically within free-tier limits.
                 # Issue #7: API key passed via x-goog-api-key header (set below),
                 # NOT the URL query string, to keep it out of proxy/server logs.
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_DEFAULT_TEXT_MODEL}:generateContent",
                 {"contents": [{"parts": [{"text": "Hi"}]}]},
             ),
             "cerebras": (
