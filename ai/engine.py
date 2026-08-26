@@ -2154,6 +2154,10 @@ class AIEngine(QObject):
     ) -> str:
         """Run screenshot analysis through the best available vision-capable provider."""
         cancel_token = self._begin_foreground_generation()
+        # Manual screen analysis is a foreground turn too. The app UI consumes
+        # tagged signals, so use the turn currently assigned by App instead of
+        # emitting legacy untagged signals that can disappear from the UI.
+        current_turn_id = str(self._foreground_turn_id or "").strip()
         start_time = time.time()
         self._last_request_at = start_time
         budget_s = float(self.config.get("ai.vision.budget_s", 10) or 10)
@@ -2440,8 +2444,12 @@ class AIEngine(QObject):
                         )
                         # Emit a single chunk so the UI doesn't look blank.
                         if response:
-                            self.response_chunk.emit(response)
-                        self.response_complete.emit(response)
+                            self._emit_response_chunk_for_turn(
+                                response, turn_id=current_turn_id
+                            )
+                        self._emit_response_complete_for_turn(
+                            response, turn_id=current_turn_id
+                        )
                         logger.info(
                             f"Vision race complete via {p.name if p else 'vision'} ({latency_ms:.0f}ms)"
                         )
@@ -2492,7 +2500,9 @@ class AIEngine(QObject):
                             raise Exception("Vision analysis timed out (budget exceeded)")
                         response += chunk
                         emitted_partial = True
-                        self.response_chunk.emit(chunk)
+                        self._emit_response_chunk_for_turn(
+                            chunk, turn_id=current_turn_id
+                        )
                 else:
                     remaining = max(0.05, deadline - time.time())
                     response = await asyncio.wait_for(_analyze_one(provider), timeout=remaining)
@@ -2527,12 +2537,16 @@ class AIEngine(QObject):
                         "had_rag": False,
                     },
                 )
-                self.response_complete.emit(response)
+                self._emit_response_complete_for_turn(
+                    response, turn_id=current_turn_id
+                )
                 self._mark_provider_success(provider.name)
                 return response
             except Exception as exc:
                 if emitted_partial:
-                    self.response_complete.emit("")
+                    self._emit_response_complete_for_turn(
+                        "", turn_id=current_turn_id
+                    )
                 last_error = exc
                 self._maybe_cooldown_provider(provider, exc)
                 logger.warning(f"Vision analysis failed on {provider.name}: {exc}")

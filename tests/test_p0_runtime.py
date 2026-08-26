@@ -1839,8 +1839,13 @@ class PromptBuilderSpeechTests(unittest.TestCase):
 
         chunks = []
         completed = []
+        tagged_completed = []
         engine.response_chunk.connect(chunks.append)
         engine.response_complete.connect(completed.append)
+        engine.response_complete_tagged.connect(
+            lambda text, turn_id: tagged_completed.append((text, turn_id))
+        )
+        engine.set_foreground_turn_id("screen-analysis-test")
 
         asyncio.run(
             engine.analyze_image_response(
@@ -1852,6 +1857,10 @@ class PromptBuilderSpeechTests(unittest.TestCase):
 
         self.assertEqual(chunks, ["partial"])
         self.assertEqual(completed, ["", "final answer"])
+        self.assertEqual(
+            tagged_completed,
+            [("", "screen-analysis-test"), ("final answer", "screen-analysis-test")],
+        )
         self.assertEqual(history.entries[-1]["provider"], "openai")
 
 

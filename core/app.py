@@ -1453,13 +1453,53 @@ class OpenAssistApp(QObject):
             self.overlay.set_analysis_provider_badge(pending=True)
         self._screen_analysis_pending = True
         request_epoch = self._generation_epoch
+        # Own this as a normal foreground UI turn so tagged vision signals are
+        # delivered to the response panel just like text/speech requests.
+        turn_id_factory = getattr(self, "_make_turn_id", None)
+        if callable(turn_id_factory):
+            turn_id = turn_id_factory("screen_analysis", request_epoch)
+        else:
+            turn_id = f"screen_analysis:{request_epoch}:{uuid.uuid4().hex}"
+        self._active_ui_turn_id = turn_id
+        self._ui_response_generation = getattr(self, "_ui_response_generation", 0) + 1
+        for view in (self.overlay, self.mini_overlay):
+            begin_response = getattr(view, "begin_active_response", None)
+            if callable(begin_response):
+                begin_response("Analyze current screen")
+        self.overlay.show_chat_view()
+        self.overlay._pending_thinking = True
+        if hasattr(self.ai, "set_foreground_turn_id"):
+            self.ai.set_foreground_turn_id(turn_id)
         query_override_text = " ".join((query_override or "").split()).strip()
         logger.info("[AnalyzeScreen] Manual screen analysis requested")
 
         async def _capture_and_analyze():
             if request_epoch != self._generation_epoch:
                 return
-            image_bytes = await self.screen.capture_image_bytes(for_analysis=True)
+            try:
+                # OS-level capture should be quick; never leave the button in
+                # its animated state if a display/driver call stalls.
+                image_bytes = await asyncio.wait_for(
+                    self.screen.capture_image_bytes(for_analysis=True), timeout=8.0
+                )
+            except Exception as exc:
+                logger.warning("[AnalyzeScreen] Screenshot capture failed: %s", exc)
+                self._screen_analysis_pending = False
+                OpenAssistApp._call_on_ui_thread(
+                    self,
+                    lambda: (
+                        self.overlay.update_transcript(
+                            "Screen capture failed. Please try again.", state="error"
+                        ),
+                        self.overlay.set_analysis_provider_badge()
+                        if hasattr(self.overlay, "set_analysis_provider_badge")
+                        else None,
+                        self.overlay.show_error_toast("Screenshot capture failed")
+                        if hasattr(self.overlay, "show_error_toast")
+                        else None,
+                    ),
+                )
+                return
             if request_epoch != self._generation_epoch:
                 return
             if not image_bytes:
