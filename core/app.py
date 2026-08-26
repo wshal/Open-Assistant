@@ -2649,7 +2649,10 @@ class OpenAssistApp(QObject):
                     provider = self.audio._effective_transcription_provider(is_final=True)
                 if provider == "groq":
                     if hasattr(self.audio, "_ensure_whisper_loaded_async"):
-                        self.audio._ensure_whisper_loaded_async(force=False)
+                        # Keep local Whisper warm as a fallback, but do not make
+                        # cloud-STT readiness wait for its model load.
+                        self.audio._ensure_whisper_loaded_async(force=True)
+                    logger.info("Audio warmup: cloud STT selected; local Whisper fallback preload scheduled")
                     self.warmup_status_update.emit("Cloud STT Ready", 90, False)
                     return
                 if hasattr(self.audio, "_ensure_whisper_loaded_async"):

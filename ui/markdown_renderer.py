@@ -93,6 +93,13 @@ class MarkdownRenderer:
         while i < len(lines):
             line = lines[i]
 
+            # Bare table rows are not laid out as a table by Qt. Group a
+            # complete Markdown table into a real HTML table first.
+            if self._is_table_start(lines, i):
+                table_html, i = self._render_table(lines, i)
+                html_parts.append(table_html)
+                continue
+
             # Code blocks (```)
             if line.strip().startswith("```"):
                 if self._in_code_block:
@@ -139,6 +146,82 @@ class MarkdownRenderer:
             {body}
         </div>
         """
+
+    @staticmethod
+    def _table_cells(line: str):
+        """Return cells for a pipe-delimited Markdown row, or None."""
+        stripped = (line or "").strip()
+        if "|" not in stripped:
+            return None
+        if stripped.startswith("|"):
+            stripped = stripped[1:]
+        if stripped.endswith("|"):
+            stripped = stripped[:-1]
+        cells = [cell.strip() for cell in stripped.split("|")]
+        return cells if len(cells) >= 2 else None
+
+    @classmethod
+    def _is_table_delimiter(cls, line: str) -> bool:
+        cells = cls._table_cells(line)
+        return bool(cells) and all(
+            re.match(r"^:?-{1,}:?$", cell.replace(" ", ""))
+            for cell in cells
+        )
+
+    @classmethod
+    def _is_table_start(cls, lines, index: int) -> bool:
+        return (
+            index + 1 < len(lines)
+            and cls._table_cells(lines[index]) is not None
+            and cls._is_table_delimiter(lines[index + 1])
+        )
+
+    def _render_table(self, lines, start: int):
+        header = self._table_cells(lines[start]) or []
+        separators = self._table_cells(lines[start + 1]) or []
+        rows = []
+        i = start + 2
+        while i < len(lines):
+            cells = self._table_cells(lines[i])
+            if cells is None:
+                break
+            if len(cells) < len(header):
+                cells += [""] * (len(header) - len(cells))
+            elif len(cells) > len(header):
+                cells = cells[: len(header) - 1] + [" | ".join(cells[len(header) - 1 :])]
+            rows.append(cells)
+            i += 1
+
+        def render_cell(tag, value, column):
+            marker = separators[column] if column < len(separators) else ""
+            align = "center" if marker.startswith(":") and marker.endswith(":") else (
+                "right" if marker.endswith(":") else "left"
+            )
+            return (
+                f'<{tag} style="padding: 5px 10px; border: 1px solid '
+                f'rgba(60,60,100,80); vertical-align: top; white-space: normal; '
+                f'word-wrap: normal; text-align: {align};">'
+                f"{self._render_inline(value)}</{tag}>"
+            )
+
+        header_html = "".join(
+            render_cell("th", value, column)
+            for column, value in enumerate(header)
+        )
+        body_html = "".join(
+            '<tr style="background: rgba(30,30,50,80);">'
+            + "".join(render_cell("td", value, column) for column, value in enumerate(row))
+            + "</tr>"
+            for row in rows
+        )
+        return (
+            '<table width="100%" cellspacing="0" cellpadding="0" '
+            'style="width: 100%; border-collapse: collapse; table-layout: auto; '
+            'margin: 8px 0;">'
+            '<tr style="background: rgba(50,50,85,140);">'
+            f"{header_html}</tr>{body_html}</table>",
+            i,
+        )
 
     def _render_line(self, line: str) -> str:
         """Render a single markdown line to HTML."""
@@ -232,8 +315,9 @@ class MarkdownRenderer:
         if not text:
             return ""
 
-        # Escape HTML first
-        text = html.escape(text)
+        # Providers occasionally emit entities such as ``m&#x20;``. Decode
+        # them before escaping so the intended space is displayed safely.
+        text = html.escape(html.unescape(text))
 
         # Bold + Italic
         text = re.sub(

@@ -651,7 +651,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
         self.assertLess(order.index("whisper"), order.index("ready"))
         self.assertEqual(app.audio.start_calls, 0)
 
-    def test_background_warmup_skips_whisper_preloading_when_using_groq(self):
+    def test_background_warmup_preloads_whisper_fallback_when_using_groq(self):
         app = self._build_app()
         updates = []
         order = []
@@ -691,7 +691,7 @@ class OpenAssistAppSessionFlowTests(unittest.TestCase):
             OpenAssistApp._background_warmup(app)
 
         self.assertIn("intent", order)
-        self.assertNotIn("whisper", order)
+        self.assertIn("whisper", order)
         self.assertIn(("Cloud STT Ready", 90, False), updates)
         self.assertEqual(updates[-1], ("✅ READY", 100, True))
 

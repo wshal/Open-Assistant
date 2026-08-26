@@ -12,7 +12,9 @@ class SmartRouter:
         self.config = config
         self.providers = providers
         self.strategy = config.get("ai.strategy", "smart")
-        self.offline_first = config.get("ai.offline_first", True)  # P2: Prefer local
+        # Local Ollama is a reliability fallback, not the default latency
+        # choice.  Opt into offline-first explicitly for privacy/offline use.
+        self.offline_first = config.get("ai.offline_first", False)
         self.task_map = config.get("ai.router.task_routing", {})
         self.fallback = config.get("ai.router.fallback_order", [])
         self._rr = 0

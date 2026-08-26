@@ -265,6 +265,10 @@ class Config:
 
     def _apply_defaults(self):
         self._data.setdefault("ai", {})
+        # Empty means automatic speed/health-aware routing.  Ollama remains a
+        # fallback unless the user explicitly selects fixed/offline mode.
+        self._data["ai"].setdefault("fixed_provider", "")
+        self._data["ai"].setdefault("offline_first", False)
         self._data["ai"].setdefault("text", {})
         # Text routing: provider priority + optional "race" for lowest latency.
         self._data["ai"]["text"].setdefault(
@@ -336,6 +340,9 @@ class Config:
         # Retries are useful for flaky networks, but they also amplify quota
         # churn when a provider is already exhausted.
         self._data["ai"]["providers"].setdefault("health_check_attempts", 1)
+        # Re-admit providers after transient request failures without requiring
+        # the user to open Settings and press Test.
+        self._data["ai"]["providers"].setdefault("recovery_probe_interval_s", 30)
         self._data["ai"]["providers"].setdefault("groq", {})
         self._data["ai"]["providers"]["groq"].setdefault("reasoning_effort", "low")
         # Retained for compatibility with older settings files. Connection

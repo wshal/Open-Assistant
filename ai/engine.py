@@ -139,6 +139,10 @@ class AIEngine(QObject):
         # M5 FIX: Protect _session_failed_providers with a lock.
         self._session_failed_lock = threading.Lock()
         self._session_failed_providers: set[str] = set()
+        # Recovery probes are deliberately throttled.  A failed request should
+        # not permanently remove a provider, but probing on every request can
+        # amplify an outage (and can consume provider quota).
+        self._recovery_probe_at: Dict[str, float] = {}
 
     @property
     def providers(self):
@@ -212,7 +216,12 @@ class AIEngine(QObject):
             # Skip providers that are in a temporary cooldown window.
             # Previously only provider.enabled (static flag) was checked here;
             # is_disabled() reflects the dynamic cooldown set by _maybe_cooldown_provider.
-            if hasattr(provider, "is_disabled") and provider.is_disabled():
+            # Treat only an explicit boolean True as disabled.  This keeps
+            # lightweight/custom provider adapters (and test doubles) that
+            # expose a truthy placeholder method from being misclassified as
+            # permanently unavailable.
+            is_disabled_fn = getattr(provider, "is_disabled", None)
+            if callable(is_disabled_fn) and is_disabled_fn() is True:
                 remaining = getattr(provider, "cooldown_remaining_s", lambda: 0)()
                 logger.debug(
                     "Skipping %s in provider selection — cooldown active (%ds remaining)",
@@ -373,6 +382,20 @@ class AIEngine(QObject):
             # Cooldown is best-effort; never fail the request flow due to it.
             pass
 
+    def _mark_provider_success(self, provider_id: str) -> None:
+        """Close the circuit after a real data-plane request succeeds."""
+        pid = str(provider_id or "").strip()
+        if not pid:
+            return
+        with self._session_failed_lock:
+            self._session_failed_providers.discard(pid)
+        self._recovery_probe_at.pop(pid, None)
+        provider = (self._providers or {}).get(pid)
+        if provider is not None and hasattr(provider, "set_health_state"):
+            provider.set_health_state("active", "request succeeded")
+        cache = self._provider_health_cache.setdefault(pid, {})
+        cache.update({"state": "active", "reason": "", "source": "request_success", "updated_at": time.time()})
+
     def set_session_context(self, text: str):
         """Update the active session context injected into all system prompts."""
         self._session_context = (text or "").strip()
@@ -511,11 +534,17 @@ class AIEngine(QObject):
                     if not ok and attempt < attempts:
                         await asyncio.sleep(min(0.5 * attempt, 0.75))
 
+                prior_source = str(self._provider_health_cache.get(name, {}).get("source", "") or "")
+                recovery_source = prior_source in {
+                    "request_failure", "startup_probe", "settings_test",
+                    "onboarding_test", "recovery_probe",
+                }
                 self.set_provider_health(
                     name,
                     ok,
                     reason=last_error,
-                    source="startup_probe",
+                    source=("recovery_probe" if recovery_source and ok else
+                            prior_source if recovery_source else "startup_probe"),
                 )
                 if not ok:
                     logger.warning("x %s failed background health probe", name)
@@ -573,8 +602,14 @@ class AIEngine(QObject):
         pid = str(provider_id or "").strip()
         if not pid:
             return
-        state = "active" if healthy else "down"
+        # Request failures already have a bounded circuit-breaker cooldown.
+        # Represent those as cooldown, not permanent `down`; `down` is reserved
+        # for an explicit/configuration/auth failure or a failed active probe.
+        prov = (self._providers or {}).get(pid)
+        in_cooldown = bool(prov is not None and getattr(prov, "is_disabled", lambda: False)())
+        state = "active" if healthy else ("cooldown" if in_cooldown or source == "request_failure" else "down")
         cache = self._provider_health_cache.setdefault(pid, {})
+        previous_state = str(cache.get("state", "configured") or "configured")
         cache.update(
             {
                 "state": state,
@@ -583,9 +618,17 @@ class AIEngine(QObject):
                 "updated_at": time.time(),
             }
         )
-        prov = (self._providers or {}).get(pid)
         if prov is not None and hasattr(prov, "set_health_state"):
             prov.set_health_state(state, reason)
+        if previous_state != state or source in {"request_failure", "recovery_probe"}:
+            logger.info(
+                "Provider health transition: %s %s -> %s (source=%s%s)",
+                pid,
+                previous_state,
+                state,
+                source or "unknown",
+                f", reason={reason}" if reason else "",
+            )
         self.emit_provider_status_snapshot()
 
     def emit_provider_status_snapshot(self):
@@ -795,6 +838,10 @@ class AIEngine(QObject):
         Control flow managed by the App Master Loop.
         """
         self.provider_selected.emit("AUTO")
+        # Failure exclusion is request-scoped only.  The previous implementation
+        # accidentally kept this set for the entire process, which made every
+        # provider tried once look permanently exhausted.
+        self.reset_session_failures()
         cancel_token = 0
         if not bg_mode:
             cancel_token = self._begin_foreground_generation()
@@ -1521,6 +1568,7 @@ class AIEngine(QObject):
                     if not (full_response or "").strip():
                         raise RuntimeError(f"Empty response from {current_provider.name}")
                     generation_succeeded = True
+                    self._mark_provider_success(current_provider.name)
                     _finalize_successful_response(full_response, current_provider.name)
                     return  # Stream completed successfully
 
@@ -2164,10 +2212,6 @@ class AIEngine(QObject):
             if enabled_ok and rate_ok and vision_ok:
                 candidates.append(provider)
 
-        if not candidates:
-            logger.error(f"[AnalyzeScreen] FATAL: No vision-capable provider found! preferred={preferred}, providers={list(self._providers.keys())}")
-            raise Exception("No vision-capable provider available for screenshot analysis.")
-
         last_error = None
         providers_tried = []
 
@@ -2413,6 +2457,26 @@ class AIEngine(QObject):
             # sequentially; bubble up the last error to the caller for OCR fallback.
             raise Exception(str(last_error) if last_error else "Vision analysis failed.")
 
+        # A provider can have been marked down by the last request after the
+        # candidate list was built.  The normal health loop will recover it,
+        # but an interactive vision request should get one immediate,
+        # non-blocking probe pass before failing with "no provider".
+        if not candidates:
+            await self.validate_loaded_providers(provider_ids=preferred)
+            for name in preferred:
+                provider = self._providers.get(name)
+                if (
+                    provider
+                    and getattr(provider, "is_available", lambda: provider.enabled)()
+                    and provider.check_rate()
+                    and getattr(provider, "supports_vision", lambda: False)()
+                ):
+                    candidates.append(provider)
+
+        if not candidates:
+            logger.error(f"[AnalyzeScreen] No vision-capable provider found after recovery probe: preferred={preferred}, providers={list(self._providers.keys())}")
+            raise Exception("No vision-capable provider available for screenshot analysis.")
+
         for provider in candidates:
             emitted_partial = False
             providers_tried.append(provider.name)
@@ -2464,6 +2528,7 @@ class AIEngine(QObject):
                     },
                 )
                 self.response_complete.emit(response)
+                self._mark_provider_success(provider.name)
                 return response
             except Exception as exc:
                 if emitted_partial:
@@ -2840,6 +2905,47 @@ class AIEngine(QObject):
 
     async def poll_provider_health(self):
         """Polls providers and emits status to UI badges."""
+        # Active recovery: request failures are circuit-breaker events, not
+        # permanent removals.  Probe them with a bounded cadence so a provider
+        # that recovers (network, Ollama daemon, rate bucket, or repaired key)
+        # is re-admitted without a Settings > Test click.
+        recovery_interval = max(
+            5.0,
+            float(self.config.get("ai.providers.recovery_probe_interval_s", 30) or 30),
+        )
+        now = time.time()
+        recovery_targets = []
+        # Startup validation is already in flight during warmup.  Do not race
+        # it with the health loop; concurrent probes can overwrite a fresh
+        # success with a transient failure and create false DOWN states.
+        validation_in_flight = bool(
+            self._provider_validation_task
+            and not self._provider_validation_task.done()
+        )
+        if not validation_in_flight:
+            for pid, cached in list(self._provider_health_cache.items()):
+                if pid not in self._providers:
+                    continue
+                if cached.get("source") not in {
+                    "request_failure", "startup_probe", "settings_test",
+                    "onboarding_test", "recovery_probe",
+                }:
+                    continue
+                if now < float(self._recovery_probe_at.get(pid, 0.0) or 0.0):
+                    continue
+                updated_at = float(cached.get("updated_at", 0.0) or 0.0)
+                if updated_at and now - updated_at < recovery_interval:
+                    continue
+                self._recovery_probe_at[pid] = now + recovery_interval
+                recovery_targets.append(pid)
+        if recovery_targets:
+            logger.info(
+                "Provider recovery probe starting: %s (interval=%ss)",
+                ", ".join(recovery_targets),
+                int(recovery_interval),
+            )
+            await self.validate_loaded_providers(provider_ids=recovery_targets)
+
         results = {}
         results["_meta"] = {
             "text_local_only": bool(self.config.get("ai.text.local_only", False)),

@@ -106,6 +106,25 @@ class ProviderStub:
 
 
 class AudioCaptureLifecycleTests(unittest.TestCase):
+    def test_cloud_stt_readiness_does_not_wait_for_local_whisper(self):
+        audio = AudioCapture(
+            ConfigStub({
+                "capture.audio.enabled": True,
+                "capture.audio.transcription_provider": "groq",
+                "api_key.groq": "gsk_test_key_1234567890",
+            })
+        )
+        audio._running = True
+        audio._capture_ready_event.set()
+        audio._model_loaded = False
+        audio._whisper_ready_event.clear()
+
+        with patch.object(audio, "_effective_transcription_provider", return_value="groq"), \
+             patch.object(audio, "_ensure_whisper_loaded_async") as preload:
+            self.assertTrue(audio.wait_until_ready(timeout_s=0.01))
+
+        preload.assert_not_called()
+
     def test_toggle_returns_mute_state_and_updates_pause(self):
         audio = AudioCapture(ConfigStub({"capture.audio.mode": "system"}))
 
@@ -2371,6 +2390,20 @@ class ScreenCaptureContextTests(unittest.TestCase):
 
 
 class OllamaProviderTests(unittest.TestCase):
+    def test_stopped_daemon_does_not_disable_provider_for_recovery(self):
+        provider = OllamaProvider(ConfigStub({}))
+
+        async def fail_session():
+            raise RuntimeError("connection refused")
+
+        with patch.object(provider, "_get_session", side_effect=fail_session):
+            ok = asyncio.run(provider.check_availability())
+
+        self.assertFalse(ok)
+        self.assertTrue(provider.enabled)
+        self.assertEqual(provider.state, provider.STATE_UNAVAILABLE)
+        self.assertFalse(provider.is_available())
+
     def test_blank_model_uses_first_available_local_model(self):
         provider = OllamaProvider(ConfigStub({}))
         provider._available_models = ["qwen2.5:7b", "llama3.2:latest"]

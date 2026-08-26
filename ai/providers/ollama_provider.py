@@ -44,7 +44,11 @@ class OllamaProvider(BaseProvider):
         super().__init__("ollama", config)
         # Initialize all instance attributes BEFORE calling _validated_endpoint
         # so that no attribute is ever missing regardless of call order.
-        self.enabled = True  # Assume available until proven otherwise
+        # `enabled` is configuration state, not daemon reachability.  Keep it
+        # true while Ollama is stopped so the health monitor can re-probe it;
+        # runtime availability is represented by `_state` and BaseProvider's
+        # health circuit instead.
+        self.enabled = bool(self.pcfg.get("enabled", True))
         self._state = self.STATE_UNKNOWN
         self._available_models = []
         self._connect_timeout = aiohttp.ClientTimeout(total=5)
@@ -221,6 +225,7 @@ class OllamaProvider(BaseProvider):
 
         Returns True if ready to serve requests.
         """
+        previous_state = self._state
         self._state = self.STATE_CHECKING
 
         try:
@@ -231,8 +236,7 @@ class OllamaProvider(BaseProvider):
             ) as resp:
                 if resp.status != 200:
                     self._state = self.STATE_UNAVAILABLE
-                    self.enabled = False
-                    logger.warning("  Ollama: Server returned non-200")
+                    logger.warning("  Ollama unavailable: HTTP %s (previous_state=%s)", resp.status, previous_state)
                     return False
 
                 data = await resp.json()
@@ -257,10 +261,9 @@ class OllamaProvider(BaseProvider):
                 return True
 
             self._state = self.STATE_MISSING
-            self.enabled = False
             available_str = ", ".join(self._available_models[:5]) or "none"
             logger.warning(
-                f"  Ollama: Model '{configured_target or self.get_model()}' not found. "
+                f"  Ollama model missing: '{configured_target or self.get_model()}'. "
                 f"Available: {available_str}. "
                 f"Run: ollama pull {configured_target or self.get_model()}"
             )
@@ -268,17 +271,14 @@ class OllamaProvider(BaseProvider):
 
         except aiohttp.ClientConnectorError:
             self._state = self.STATE_UNAVAILABLE
-            self.enabled = False
-            logger.info("  Ollama: Not running (install: https://ollama.com)")
+            logger.warning("  Ollama daemon unavailable: connection refused/not running (previous_state=%s)", previous_state)
             return False
         except asyncio.TimeoutError:
             self._state = self.STATE_UNAVAILABLE
-            self.enabled = False
-            logger.warning("  Ollama: Connection timeout")
+            logger.warning("  Ollama daemon timeout after %ss (previous_state=%s)", self._connect_timeout.total, previous_state)
             return False
         except Exception as exc:
             self._state = self.STATE_UNAVAILABLE
-            self.enabled = False
             logger.warning(f"  Ollama: {exc}")
             return False
 
@@ -336,7 +336,6 @@ class OllamaProvider(BaseProvider):
 
         except Exception as exc:
             self._state = self.STATE_MISSING
-            self.enabled = False
             logger.error(f"  Pull failed: {exc}")
             return False
 
@@ -351,6 +350,20 @@ class OllamaProvider(BaseProvider):
     @property
     def is_ready(self) -> bool:
         return self._state == self.STATE_READY
+
+    def is_available(self) -> bool:
+        """Return routability without confusing a stopped daemon with config off.
+
+        UNKNOWN remains routable so the first request can trigger the bounded
+        lazy probe.  UNAVAILABLE/MISSING are temporarily removed from routing,
+        while the engine's active health monitor keeps probing this same object.
+        """
+        return bool(
+            self.enabled
+            and self._state not in {self.STATE_UNAVAILABLE, self.STATE_MISSING, self.STATE_PULLING}
+            and not self.is_disabled()
+            and self.health_state() != "down"
+        )
 
     @staticmethod
     def _looks_like_vision_model(model: str) -> bool:

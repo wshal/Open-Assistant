@@ -457,6 +457,7 @@ class AudioCapture(QObject):
         self._submitted_final_seq = 0
         self._cloud_stt_session_blocked = False
         self._cloud_stt_failed_key = ""
+        self._cloud_stt_retry_after = 0.0
         self._groq_http_session = None
         self._groq_http_session_lock = threading.Lock()
         self._whisper_device = "cpu"
@@ -773,6 +774,7 @@ class AudioCapture(QObject):
                 self._session_transcript_part_providers = []
             # Reset Groq STT session block so a fresh start can retry the key
             self._cloud_stt_session_blocked = False
+            self._cloud_stt_retry_after = 0.0
             self._capture_thread = threading.Thread(
                 target=self._capture_loop, daemon=True, name="audio-cap"
             )
@@ -918,7 +920,13 @@ class AudioCapture(QObject):
             if healthy:
                 self._drain_queue()
                 self._clear_capture_chunk_buffer()
-                self._ensure_whisper_loaded_async(force=True)
+                # Cloud STT does not need to wait for local Whisper at session
+                # start.  Local Whisper is preloaded during app warmup as a
+                # fallback, so forcing another readiness gate here only delays
+                # the user's first utterance by the model-load time.
+                self._ensure_whisper_loaded_async(
+                    force=self._effective_transcription_provider(is_final=True) == "local"
+                )
             else:
                 logger.warning(
                     "Audio: Restarting unhealthy pipeline in-place for mode '%s'",
@@ -932,9 +940,11 @@ class AudioCapture(QObject):
         return True
 
     def wait_until_ready(self, timeout_s: float = 10.0) -> bool:
-        """Wait until capture is synchronized and Whisper is ready.
+        """Wait until capture is synchronized and the selected STT path is ready.
 
-        Returns True only after the live audio pipeline is actually active.
+        Cloud STT only requires the capture workers and audio source.  Waiting
+        for local Whisper in that case made the first utterance appear lost
+        while the fallback model loaded unnecessarily.
         """
         if not self._running:
             return False
@@ -944,6 +954,13 @@ class AudioCapture(QObject):
         remaining = max(0.0, deadline - time.time())
         if not self._capture_ready_event.wait(timeout=remaining):
             return False
+
+        selected = self._effective_transcription_provider(is_final=True)
+        if selected == "groq":
+            logger.info(
+                "Audio readiness complete: cloud STT selected; local Whisper remains background fallback"
+            )
+            return True
 
         if self._model_loaded or self._whisper_ready_event.is_set():
             return True
@@ -1846,14 +1863,21 @@ class AudioCapture(QObject):
         # M-A6: If a session block was raised due to a bad/missing key but the
         # user has since configured a *different* key, allow the cloud provider
         # to be retried instead of permanently downgrading the session.
+        retry_after = float(getattr(self, "_cloud_stt_retry_after", 0.0) or 0.0)
         if getattr(self, "_cloud_stt_session_blocked", False):
             if groq_key and groq_key != failed_key:
                 self._cloud_stt_session_blocked = False
+                self._cloud_stt_retry_after = 0.0
                 self._cloud_stt_unavailable_logged = False
                 logger.info("[Groq STT] API key changed since last failure; re-enabling cloud STT.")
-            else:
+            elif retry_after <= 0.0 or time.time() < retry_after:
                 return "local"
-        if failed_key and groq_key and failed_key == groq_key:
+            else:
+                self._cloud_stt_session_blocked = False
+                logger.info("[Groq STT] Automatic recovery window opened; retrying cloud STT.")
+        if failed_key and groq_key and failed_key == groq_key and (
+            retry_after <= 0.0 or time.time() < retry_after
+        ):
             return "local"
         if not groq_key:
             if not getattr(self, "_cloud_stt_unavailable_logged", False):
@@ -1861,6 +1885,12 @@ class AudioCapture(QObject):
                 self._cloud_stt_unavailable_logged = True
             return "local"
         return "groq"
+
+    def _cooldown_cloud_stt(self, *, auth: bool = False) -> None:
+        """Use local Whisper now, then automatically retry cloud STT later."""
+        self._cloud_stt_session_blocked = True
+        self._cloud_stt_failed_key = self._groq_api_key()
+        self._cloud_stt_retry_after = time.time() + (300.0 if auth else 30.0)
 
     def _groq_api_key_available(self) -> bool:
         return bool(self._groq_api_key())
@@ -2746,8 +2776,7 @@ class AudioCapture(QObject):
                     vad_meta=vad_meta,
                 )
                 if auth_failed:
-                    self._cloud_stt_session_blocked = True
-                    self._cloud_stt_failed_key = self._groq_api_key()
+                    self._cooldown_cloud_stt(auth=True)
                     logger.warning(
                         "[Groq STT] Disabled for this session after pending auth failure; future utterances will use local Whisper"
                     )
@@ -2901,8 +2930,7 @@ class AudioCapture(QObject):
                 _fallback_local_part(buffer, speech_started_at)
 
             if auth_failed:
-                self._cloud_stt_session_blocked = True
-                self._cloud_stt_failed_key = groq_key
+                self._cooldown_cloud_stt(auth=True)
                 logger.warning(
                     "[Groq STT] Disabled for this session after auth failure; future utterances will use local Whisper"
                 )
@@ -2949,14 +2977,14 @@ class AudioCapture(QObject):
                         e,
                         f" | response={detail}" if detail else "",
                     )
-                    self._cloud_stt_session_blocked = True
-                    self._cloud_stt_failed_key = groq_key
+                    self._cooldown_cloud_stt(auth=True)
             else:
                 logger.warning(
                     "[Groq STT] API error (%s)%s - falling back to local Whisper for this chunk; Groq remains enabled",
                     e,
                     f" | response={detail}" if detail else "",
                 )
+                self._cooldown_cloud_stt(auth=False)
             self._groq_chunk_futures = []
             self._transcribe_local(buffer, speech_started_at, is_final, vad_meta=vad_meta)
 
